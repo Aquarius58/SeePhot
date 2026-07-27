@@ -1,0 +1,37 @@
+# Python bytecode and caches
+__pycache__/
+*.py[codz]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Coverage and test output
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Editors and operating systems
+.DS_Store
+.idea/
+*.code-workspace
+
+# Local configuration, logs, databases, and generated results
+.env
+.env.*
+*.log
+*.sqlite
+*.sqlite3
+*.db
+results/
+siril_lightcurve_tmp/
