@@ -1726,7 +1726,21 @@ def create_bav_tab(context: dict[str, object]) -> object:
 
     from PyQt6.QtCore import Qt, QUrl
     from PyQt6.QtGui import QDesktopServices
-    from PyQt6.QtWidgets import QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget
+    from PyQt6.QtWidgets import (
+        QApplication,
+        QComboBox,
+        QDoubleSpinBox,
+        QFormLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMessageBox,
+        QPushButton,
+        QSpinBox,
+        QVBoxLayout,
+        QWidget,
+    )
 
     tab = QWidget()
     layout = QVBoxLayout(tab)
@@ -2186,18 +2200,42 @@ def create_bav_tab(context: dict[str, object]) -> object:
         output_path = last_output["path"]
         folder = output_path.parent if output_path is not None else _current_output_directory(context)
         if folder is None:
-            status_label.setText("Kein Ordner verfuegbar.")
+            status_label.setText("Kein BAV-Ausgabeordner verfügbar.")
             append_log("WARNING: No BAV output folder available.")
+            QMessageBox.warning(
+                tab,
+                "BAV Export",
+                "Bitte zuerst ein Ergebnis erzeugen oder öffnen.",
+            )
             return
-        folder.mkdir(parents=True, exist_ok=True)
+        if not folder.is_dir():
+            status_label.setText("Kein BAV-Ausgabeordner gefunden.")
+            append_log(f"WARNING: BAV output folder not found: {folder}")
+            QMessageBox.warning(
+                tab,
+                "BAV Export",
+                "Für das aktuelle Ergebnis wurden noch keine BAV-Dateien erzeugt.",
+            )
+            return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
-            status_label.setText("Ordner konnte nicht geoeffnet werden.")
+            status_label.setText("Ordner konnte nicht geöffnet werden.")
             append_log(f"WARNING: Could not open BAV output folder: {folder}")
             return
-        status_label.setText(f"Ordner geoeffnet: {folder.name}")
+        status_label.setText(f"Ordner geöffnet: {folder.name}")
         append_log(f"BAV output folder opened: {folder}")
 
     def open_bav_website() -> None:
+        output_path = last_output["path"]
+        folder = output_path.parent if output_path is not None else _current_output_directory(context)
+        if folder is None:
+            append_log("WARNING: No BAV path available for clipboard.")
+        else:
+            try:
+                QApplication.clipboard().setText(os.fspath(folder))
+            except Exception as exc:
+                append_log(f"WARNING: Could not copy BAV path to clipboard: {exc}")
+            else:
+                append_log("BAV path copied to clipboard.")
         url = QUrl("https://www.bav-astro.eu/")
         if not QDesktopServices.openUrl(url):
             status_label.setText("BAV-Webseite konnte nicht geöffnet werden.")

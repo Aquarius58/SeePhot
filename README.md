@@ -3,7 +3,7 @@
 Private prerelease repository for SeePhot, a Siril Python application for
 Seestar variable-star photometry.
 
-> **Development status:** internal prerelease (`0.3-pre`). Interfaces, file
+> **Development status:** internal prerelease (`0.4-pre`). Interfaces, file
 > formats, photometry rules, and installation steps may still change.
 
 ## Planned Prerelease Bundle

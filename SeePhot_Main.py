@@ -38,7 +38,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.3-pre"
+SCRIPT_VERSION = "0.4-pre"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
@@ -428,6 +428,7 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QLineEdit,
     QMessageBox,
     QCheckBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -1434,10 +1435,10 @@ class ExtremumFitCalculation:
 EXTREMUM_MINIMUM_FIT_POINTS = 5
 EXTREMUM_MINIMUM_SIDE_POINTS = 2
 EXTREMUM_MINIMUM_SIDE_COVERAGE_FRACTION = 0.12
-EXTREMUM_MINIMUM_TIME_BALANCE = 0.45
+EXTREMUM_MINIMUM_TIME_BALANCE = 0.35
 EXTREMUM_MINIMUM_PROMINENCE_BALANCE = 0.20
 EXTREMUM_MINIMUM_PROMINENCE_FLOOR = 0.01
-EXTREMUM_MINIMUM_PROMINENCE_RMS_FACTOR = 0.35
+EXTREMUM_MINIMUM_PROMINENCE_RMS_FACTOR = 0.50
 EXTREMUM_SMALL_WINDOW_MAX_POINTS = 10
 EXTREMUM_SMALL_WINDOW_MAX_CADENCE_SPAN = 10.0
 EXTREMUM_CONTEXT_WIDTH_FACTOR = 1.0
@@ -1445,18 +1446,26 @@ EXTREMUM_CONTEXT_MAX_LOCAL_POINTS = 30
 EXTREMUM_CONTEXT_MIN_PROMINENCE_TO_SCATTER = 0.90
 EXTREMUM_CONTEXT_RELAXED_MIN_POINTS = 16
 EXTREMUM_CONTEXT_RELAXED_MIN_PROMINENCE_TO_SCATTER = 0.70
-EXTREMUM_ANCHOR_MISS_MIN_PROMINENCE_FACTOR = 1.50
 EXTREMUM_VERTEX_EXTREME_MAG_TOLERANCE_FLOOR = 0.02
 EXTREMUM_VERTEX_EXTREME_ERROR_FACTOR = 1.5
 EXTREMUM_SPLINE_SMOOTHING_PER_POINT = 2.00
 EXTREMUM_SPLINE_DENSE_SAMPLES = 1200
 EXTREMUM_SPLINE_ERROR_SAMPLES = 200
 EXTREMUM_SPLINE_ERROR_RANDOM_SEED = 20260701
-EXTREMUM_SPLINE_MIN_WEIGHTED_RMS_IMPROVEMENT = 0.25
-EXTREMUM_SPLINE_MAX_ANCHOR_TIME_RATIO = 0.50
 EXTREMUM_SPLINE_WRONG_DIRECTION_MIN_POINTS = 20
 EXTREMUM_SPLINE_MAX_WRONG_DIRECTION_FRACTION = 0.43
 EXTREMUM_SPLINE_REQUIRED_EXTREMUM_COUNT = 1
+EXTREMUM_ASYMPTOTIC_PARABOLA_MIN_POINTS = 7
+EXTREMUM_PARABOLIC_SPLINE_MIN_POINTS = 15
+EXTREMUM_MODEL_MIN_OUTER_POINTS = 2
+EXTREMUM_PARABOLIC_SPLINE_MIN_OUTER_POINTS = 3
+EXTREMUM_MODEL_SELECTION_EPSILON = 1e-12
+EXTREMUM_MODEL_INVALID_OBJECTIVE_PENALTY = 1e100
+EXTREMUM_MODEL_BOOTSTRAP_SAMPLES = 120
+EXTREMUM_MODEL_BOOTSTRAP_MIN_SUCCESS_FRACTION = 0.70
+EXTREMUM_MODEL_BOOTSTRAP_EQUIVALENCE_RATIO = 1.10
+EXTREMUM_MODEL_BOOTSTRAP_RANDOM_SEED = 20260729
+EXTREMUM_MODEL_BOOTSTRAP_KNOT_MAX_ITERATIONS = 60
 EXTREMUM_ERROR_FALLBACK_RANGE_FRACTION = 0.25
 EXTREMUM_REJECT_HARD = "hard"
 EXTREMUM_REJECT_GEOMETRY = "geometry"
@@ -1511,6 +1520,22 @@ class ExtremumFitQualityMetrics:
 
 
 @dataclass(frozen=True)
+class ExtremumSupportAssessment:
+    """Decision about whether the selected measurements support an extremum."""
+
+    accepted: bool
+    reason: str
+    message: str
+    reject_category: str
+    metrics: dict[str, object]
+    fit_input: ExtremumFitInput
+    parabola: ExtremumParabolaFit | None = None
+    quality: ExtremumFitQualityMetrics | None = None
+    anchor: "ExtremumPchipAnchor | None" = None
+    show_attempt: bool = False
+
+
+@dataclass(frozen=True)
 class ExtremumFitContextQuality:
     """Context metrics around an otherwise accepted fit."""
 
@@ -1526,6 +1551,7 @@ class ExtremumFitContextQuality:
 class ExtremumSplineFit:
     """Automatic smoothed spline candidate for asymmetric extrema."""
 
+    parameter_count: int
     vertex_jd: float
     vertex_mag: float
     vertex_jd_error: float
@@ -1539,6 +1565,27 @@ class ExtremumSplineFit:
     right_points: int
     left_coverage: float
     right_coverage: float
+
+
+@dataclass(frozen=True)
+class ExtremumCurveCandidate:
+    """One fitted curve model considered for the final extremum result."""
+
+    model_name: str
+    parameter_count: int
+    vertex_jd: float
+    vertex_mag: float
+    vertex_jd_error: float
+    vertex_mag_error: float
+    fit_plot_jd: tuple[float, ...]
+    fit_plot_mag: tuple[float, ...]
+    rms: float
+    weighted_rms: float
+    left_points: int
+    right_points: int
+    left_coverage: float
+    right_coverage: float
+    metadata: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -1860,6 +1907,8 @@ def accepted_extremum_fit(
     vertex_mag: float | None = None,
     vertex_jd_error: float | None = None,
     vertex_mag_error: float | None = None,
+    bootstrap_vertex_jd_error: float | None = None,
+    bootstrap_vertex_mag_error: float | None = None,
     fit_plot_jd: tuple[float, ...] | None = None,
     fit_plot_mag: tuple[float, ...] | None = None,
     rms: float | None = None,
@@ -1913,6 +1962,17 @@ def accepted_extremum_fit(
     result_rms = float(quality.rms if rms is None else rms)
     result_weighted_rms = float(quality.weighted_rms if weighted_rms is None else weighted_rms)
     formal_vertex_jd_error = float(fit_vertex_jd_error)
+    formal_vertex_mag_error = float(fit_vertex_mag_error)
+    bootstrap_jd_error = (
+        float(bootstrap_vertex_jd_error)
+        if bootstrap_vertex_jd_error is not None
+        else float("nan")
+    )
+    bootstrap_mag_error = (
+        float(bootstrap_vertex_mag_error)
+        if bootstrap_vertex_mag_error is not None
+        else float("nan")
+    )
     shape_error = extremum_shape_based_jd_error(
         fit_input=fit_input,
         parabola=parabola,
@@ -1925,6 +1985,7 @@ def accepted_extremum_fit(
         value
         for value in (
             formal_vertex_jd_error,
+            bootstrap_jd_error,
             shape_error["jd_error_shape"],
             shape_error["jd_error_time_resolution"],
             shape_error["jd_error_fallback"],
@@ -1933,9 +1994,16 @@ def accepted_extremum_fit(
     ]
     if candidate_jd_errors:
         fit_vertex_jd_error = max(candidate_jd_errors)
+    candidate_mag_errors = [
+        value
+        for value in (formal_vertex_mag_error, bootstrap_mag_error)
+        if np.isfinite(value) and value > 0
+    ]
+    if candidate_mag_errors:
+        fit_vertex_mag_error = max(candidate_mag_errors)
     if np.isfinite(fit_vertex_jd_error) and np.isfinite(formal_vertex_jd_error):
         if fit_vertex_jd_error > formal_vertex_jd_error:
-            warnings_text.append("JD error includes curve-shape uncertainty")
+            warnings_text.append("JD error includes bootstrap/curve-shape uncertainty")
     elif np.isfinite(fit_vertex_jd_error):
         warnings_text.append("JD error estimated from curve shape")
     else:
@@ -1945,9 +2013,12 @@ def accepted_extremum_fit(
         "jd": fit_vertex_jd,
         "jd_error": float(fit_vertex_jd_error),
         "jd_error_formal": formal_vertex_jd_error,
+        "jd_error_bootstrap": bootstrap_jd_error,
         **shape_error,
         "mag": fit_vertex_mag,
         "mag_error": float(fit_vertex_mag_error),
+        "mag_error_formal": formal_vertex_mag_error,
+        "mag_error_bootstrap": bootstrap_mag_error,
         "point_count": inlier_count,
         "selected_point_count": int(len(x)),
         "rms": result_rms,
@@ -1990,9 +2061,12 @@ def accepted_extremum_fit(
         ),
         "prominence_balance": quality.prominence_balance,
         "jd_error_formal": formal_vertex_jd_error,
+        "jd_error_bootstrap": bootstrap_jd_error,
         "jd_error_shape": shape_error["jd_error_shape"],
         "jd_error_shape_sigma_mag": shape_error["jd_error_shape_sigma_mag"],
         "jd_error_time_resolution": shape_error["jd_error_time_resolution"],
+        "mag_error_formal": formal_vertex_mag_error,
+        "mag_error_bootstrap": bootstrap_mag_error,
     }
     if model_metrics:
         metrics.update(model_metrics)
@@ -2115,6 +2189,559 @@ def fit_extremum_parabola_with_current_clipping(
         vertex_centered=float(vertex_centered),
         vertex_jd=float(vertex_jd),
         vertex_mag=float(vertex_mag),
+    )
+
+
+def _weighted_linear_curve_fit(
+    design: object,
+    values: object,
+    sigma: object,
+) -> tuple[object, object, object, float, float]:
+    """Solve one weighted linear subproblem used by the piecewise models."""
+
+    design_array = np.asarray(design, dtype=np.float64)
+    values_array = np.asarray(values, dtype=np.float64)
+    sigma_array = np.asarray(sigma, dtype=np.float64)
+    weighted_design = design_array / sigma_array[:, None]
+    weighted_values = values_array / sigma_array
+    coefficients, _residuals, rank, _singular = np.linalg.lstsq(
+        weighted_design,
+        weighted_values,
+        rcond=None,
+    )
+    if int(rank) != design_array.shape[1]:
+        raise ValueError("rank-deficient piecewise fit")
+    fitted = design_array @ coefficients
+    residuals = values_array - fitted
+    chi_square = float(np.sum((residuals / sigma_array) ** 2))
+    degrees_of_freedom = max(len(values_array) - design_array.shape[1], 1)
+    covariance = np.linalg.pinv(weighted_design.T @ weighted_design)
+    covariance = covariance * (chi_square / degrees_of_freedom)
+    rms = float(np.sqrt(np.mean(residuals**2)))
+    weighted_rms = float(
+        np.sqrt(np.average(residuals**2, weights=1.0 / sigma_array**2))
+    )
+    return coefficients, covariance, fitted, rms, weighted_rms
+
+
+def _candidate_side_support(
+    x: object,
+    vertex_jd: float,
+) -> tuple[int, int, float, float] | None:
+    """Return point counts and coverage on both sides of a candidate vertex."""
+
+    x_array = np.asarray(x, dtype=np.float64)
+    left_x = x_array[x_array < vertex_jd]
+    right_x = x_array[x_array > vertex_jd]
+    if len(left_x) == 0 or len(right_x) == 0:
+        return None
+    return (
+        int(len(left_x)),
+        int(len(right_x)),
+        float(vertex_jd - np.min(left_x)),
+        float(np.max(right_x) - vertex_jd),
+    )
+
+
+def _refine_piecewise_knots(
+    objective,
+    initial_knots: tuple[float, float],
+    bounds: tuple[tuple[float, float], tuple[float, float]],
+    *,
+    max_iterations: int = 100,
+) -> tuple[float, float]:
+    """Refine the best discrete knot pair without requiring SciPy at import."""
+
+    try:
+        from scipy.optimize import minimize
+
+        def finite_objective(values: object) -> float:
+            objective_value = float(objective(values))
+            return (
+                objective_value
+                if np.isfinite(objective_value)
+                else EXTREMUM_MODEL_INVALID_OBJECTIVE_PENALTY
+            )
+
+        result = minimize(
+            finite_objective,
+            np.asarray(initial_knots, dtype=np.float64),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": max_iterations, "ftol": 1e-12},
+        )
+    except Exception:
+        return initial_knots
+    if not result.success or len(result.x) != 2 or not np.all(np.isfinite(result.x)):
+        return initial_knots
+    return float(result.x[0]), float(result.x[1])
+
+
+def _asymptotic_parabola_design(
+    centered_minutes: object,
+    left_knot: float,
+    right_knot: float,
+) -> object:
+    """Return the published 1-2-1 asymptotic-parabola design matrix."""
+
+    time_values = np.asarray(centered_minutes, dtype=np.float64)
+    half_width = 0.5 * (right_knot - left_knot)
+    midpoint = 0.5 * (right_knot + left_knot)
+    relative_time = time_values - midpoint
+    quadratic_basis = np.where(
+        time_values < left_knot,
+        (-2.0 * relative_time - half_width) * half_width,
+        np.where(
+            time_values <= right_knot,
+            relative_time**2,
+            (2.0 * relative_time - half_width) * half_width,
+        ),
+    )
+    return np.column_stack(
+        (
+            np.ones(len(time_values), dtype=np.float64),
+            quadratic_basis,
+            relative_time,
+        )
+    )
+
+
+def fit_extremum_asymptotic_parabola_candidate(
+    fit_input: ExtremumFitInput,
+    parabola: ExtremumParabolaFit,
+) -> ExtremumCurveCandidate | None:
+    """Fit the established line-parabola-line model for asymmetric extrema."""
+
+    inlier_x = np.asarray(fit_input.x[parabola.inlier_mask], dtype=np.float64)
+    inlier_y = np.asarray(fit_input.y[parabola.inlier_mask], dtype=np.float64)
+    sigma = np.asarray(parabola.sigma[parabola.inlier_mask], dtype=np.float64)
+    if len(inlier_x) < EXTREMUM_ASYMPTOTIC_PARABOLA_MIN_POINTS:
+        return None
+    sort_order = np.argsort(inlier_x)
+    inlier_x = inlier_x[sort_order]
+    inlier_y = inlier_y[sort_order]
+    sigma = sigma[sort_order]
+    if len(np.unique(inlier_x)) != len(inlier_x):
+        return None
+
+    x0 = float(np.mean(inlier_x))
+    centered_minutes = (inlier_x - x0) * 1440.0
+    expected_sign = 1.0 if parabola.coefficients[0] > 0 else -1.0
+    point_count = len(inlier_x)
+    best: tuple[
+        float,
+        int,
+        int,
+        float,
+        float,
+        object,
+        object,
+        float,
+        float,
+    ] | None = None
+
+    def solve_knots(left_knot: float, right_knot: float):
+        if not np.isfinite(left_knot) or not np.isfinite(right_knot) or left_knot >= right_knot:
+            return None
+        try:
+            design = _asymptotic_parabola_design(
+                centered_minutes,
+                left_knot,
+                right_knot,
+            )
+            coefficients, covariance, _fitted, rms, weighted_rms = _weighted_linear_curve_fit(
+                design,
+                inlier_y,
+                sigma,
+            )
+        except Exception:
+            return None
+        curvature = float(coefficients[1])
+        slope = float(coefficients[2])
+        if not np.isfinite(curvature) or expected_sign * curvature <= 0:
+            return None
+        half_width = 0.5 * (right_knot - left_knot)
+        vertex_relative = -slope / (2.0 * curvature)
+        if not np.isfinite(vertex_relative) or not -half_width <= vertex_relative <= half_width:
+            return None
+        chi_square = float(
+            np.sum(
+                (
+                    (
+                        inlier_y
+                        - design @ coefficients
+                    )
+                    / sigma
+                )
+                ** 2
+            )
+        )
+        return (
+            chi_square,
+            coefficients,
+            covariance,
+            rms,
+            weighted_rms,
+        )
+
+    minimum_outer = EXTREMUM_MODEL_MIN_OUTER_POINTS
+    for left_index in range(minimum_outer, point_count - minimum_outer - 2):
+        for right_index in range(left_index + 2, point_count - minimum_outer):
+            left_knot = float(centered_minutes[left_index])
+            right_knot = float(centered_minutes[right_index])
+            solved = solve_knots(left_knot, right_knot)
+            if solved is None:
+                continue
+            chi_square, coefficients, covariance, rms, weighted_rms = solved
+            if best is None or chi_square < best[0]:
+                best = (
+                    chi_square,
+                    left_index,
+                    right_index,
+                    left_knot,
+                    right_knot,
+                    coefficients,
+                    covariance,
+                    rms,
+                    weighted_rms,
+                )
+    if best is None:
+        return None
+
+    (
+        _chi_square,
+        left_index,
+        right_index,
+        left_knot,
+        right_knot,
+        _coefficients,
+        _covariance,
+        _rms,
+        _weighted_rms,
+    ) = best
+    left_bounds = (
+        0.5 * float(centered_minutes[left_index - 1] + centered_minutes[left_index]),
+        0.5 * float(centered_minutes[left_index] + centered_minutes[left_index + 1]),
+    )
+    right_bounds = (
+        0.5 * float(centered_minutes[right_index - 1] + centered_minutes[right_index]),
+        0.5 * float(centered_minutes[right_index] + centered_minutes[right_index + 1]),
+    )
+
+    def knot_objective(values: object) -> float:
+        knots = np.asarray(values, dtype=np.float64)
+        solved = solve_knots(float(knots[0]), float(knots[1]))
+        return float("inf") if solved is None else float(solved[0])
+
+    refined_left, refined_right = _refine_piecewise_knots(
+        knot_objective,
+        (left_knot, right_knot),
+        (left_bounds, right_bounds),
+    )
+    refined = solve_knots(refined_left, refined_right)
+    if refined is None or refined[0] > best[0]:
+        refined_left, refined_right = left_knot, right_knot
+        refined = solve_knots(refined_left, refined_right)
+    if refined is None:
+        return None
+    chi_square, coefficients, covariance, rms, weighted_rms = refined
+    curvature = float(coefficients[1])
+    slope = float(coefficients[2])
+    midpoint = 0.5 * (refined_left + refined_right)
+    vertex_relative = -slope / (2.0 * curvature)
+    vertex_minutes = midpoint + vertex_relative
+    vertex_jd = float(x0 + vertex_minutes / 1440.0)
+    vertex_mag = float(coefficients[0] - slope * slope / (4.0 * curvature))
+    side_support = _candidate_side_support(inlier_x, vertex_jd)
+    if side_support is None:
+        return None
+    left_points, right_points, left_coverage, right_coverage = side_support
+
+    vertex_jd_error = float("nan")
+    vertex_mag_error = float("nan")
+    try:
+        vertex_gradient = np.array(
+            [
+                0.0,
+                slope / (2.0 * curvature * curvature),
+                -1.0 / (2.0 * curvature),
+            ],
+            dtype=np.float64,
+        )
+        vertex_variance = float(vertex_gradient @ covariance @ vertex_gradient)
+        if vertex_variance >= 0:
+            vertex_jd_error = float(np.sqrt(vertex_variance) / 1440.0)
+        magnitude_gradient = np.array(
+            [
+                1.0,
+                slope * slope / (4.0 * curvature * curvature),
+                -slope / (2.0 * curvature),
+            ],
+            dtype=np.float64,
+        )
+        magnitude_variance = float(magnitude_gradient @ covariance @ magnitude_gradient)
+        if magnitude_variance >= 0:
+            vertex_mag_error = float(np.sqrt(magnitude_variance))
+    except Exception:
+        pass
+
+    dense_minutes = np.linspace(
+        float(np.min(centered_minutes)),
+        float(np.max(centered_minutes)),
+        EXTREMUM_SPLINE_DENSE_SAMPLES,
+    )
+    dense_design = _asymptotic_parabola_design(
+        dense_minutes,
+        refined_left,
+        refined_right,
+    )
+    dense_mag = dense_design @ coefficients
+    return ExtremumCurveCandidate(
+        model_name="asymptotic_parabola",
+        parameter_count=5,
+        vertex_jd=vertex_jd,
+        vertex_mag=vertex_mag,
+        vertex_jd_error=vertex_jd_error,
+        vertex_mag_error=vertex_mag_error,
+        fit_plot_jd=tuple(float(x0 + value / 1440.0) for value in dense_minutes),
+        fit_plot_mag=tuple(float(value) for value in dense_mag),
+        rms=float(rms),
+        weighted_rms=float(weighted_rms),
+        left_points=left_points,
+        right_points=right_points,
+        left_coverage=left_coverage,
+        right_coverage=right_coverage,
+        metadata={
+            "left_knot_jd": float(x0 + refined_left / 1440.0),
+            "right_knot_jd": float(x0 + refined_right / 1440.0),
+            "chi_square": float(chi_square),
+            "linear_coefficients": tuple(float(value) for value in coefficients),
+            "formal_error_conditioning": "fixed optimized knots",
+        },
+    )
+
+
+def _parabolic_spline_design(
+    centered_minutes: object,
+    left_knot: float,
+    right_knot: float,
+) -> object:
+    """Return the published three-parabola, defect-one spline design."""
+
+    time_values = np.asarray(centered_minutes, dtype=np.float64)
+    return np.column_stack(
+        (
+            np.ones(len(time_values), dtype=np.float64),
+            time_values,
+            time_values**2,
+            np.where(time_values < left_knot, (left_knot - time_values) ** 2, 0.0),
+            np.where(time_values > right_knot, (time_values - right_knot) ** 2, 0.0),
+        )
+    )
+
+
+def fit_extremum_parabolic_spline_candidate(
+    fit_input: ExtremumFitInput,
+    parabola: ExtremumParabolaFit,
+) -> ExtremumCurveCandidate | None:
+    """Fit the published quadratic C1 spline with two optimized knots."""
+
+    inlier_x = np.asarray(fit_input.x[parabola.inlier_mask], dtype=np.float64)
+    inlier_y = np.asarray(fit_input.y[parabola.inlier_mask], dtype=np.float64)
+    sigma = np.asarray(parabola.sigma[parabola.inlier_mask], dtype=np.float64)
+    if len(inlier_x) < EXTREMUM_PARABOLIC_SPLINE_MIN_POINTS:
+        return None
+    sort_order = np.argsort(inlier_x)
+    inlier_x = inlier_x[sort_order]
+    inlier_y = inlier_y[sort_order]
+    sigma = sigma[sort_order]
+    if len(np.unique(inlier_x)) != len(inlier_x):
+        return None
+
+    x0 = float(np.mean(inlier_x))
+    centered_minutes = (inlier_x - x0) * 1440.0
+    expected_sign = 1.0 if parabola.coefficients[0] > 0 else -1.0
+    point_count = len(inlier_x)
+    best: tuple[
+        float,
+        int,
+        int,
+        float,
+        float,
+        object,
+        object,
+        float,
+        float,
+    ] | None = None
+
+    def solve_knots(left_knot: float, right_knot: float):
+        if not np.isfinite(left_knot) or not np.isfinite(right_knot) or left_knot >= right_knot:
+            return None
+        try:
+            design = _parabolic_spline_design(
+                centered_minutes,
+                left_knot,
+                right_knot,
+            )
+            coefficients, covariance, _fitted, rms, weighted_rms = _weighted_linear_curve_fit(
+                design,
+                inlier_y,
+                sigma,
+            )
+        except Exception:
+            return None
+        curvature = float(coefficients[2])
+        linear = float(coefficients[1])
+        if not np.isfinite(curvature) or expected_sign * curvature <= 0:
+            return None
+        vertex_minutes = -linear / (2.0 * curvature)
+        if not np.isfinite(vertex_minutes) or not left_knot <= vertex_minutes <= right_knot:
+            return None
+        chi_square = float(np.sum(((inlier_y - design @ coefficients) / sigma) ** 2))
+        return (
+            chi_square,
+            coefficients,
+            covariance,
+            rms,
+            weighted_rms,
+        )
+
+    minimum_outer = EXTREMUM_PARABOLIC_SPLINE_MIN_OUTER_POINTS
+    for left_index in range(minimum_outer, point_count - minimum_outer - 2):
+        for right_index in range(left_index + 2, point_count - minimum_outer):
+            left_knot = float(centered_minutes[left_index])
+            right_knot = float(centered_minutes[right_index])
+            solved = solve_knots(left_knot, right_knot)
+            if solved is None:
+                continue
+            chi_square, coefficients, covariance, rms, weighted_rms = solved
+            if best is None or chi_square < best[0]:
+                best = (
+                    chi_square,
+                    left_index,
+                    right_index,
+                    left_knot,
+                    right_knot,
+                    coefficients,
+                    covariance,
+                    rms,
+                    weighted_rms,
+                )
+    if best is None:
+        return None
+
+    (
+        _chi_square,
+        left_index,
+        right_index,
+        left_knot,
+        right_knot,
+        _coefficients,
+        _covariance,
+        _rms,
+        _weighted_rms,
+    ) = best
+    left_bounds = (
+        0.5 * float(centered_minutes[left_index - 1] + centered_minutes[left_index]),
+        0.5 * float(centered_minutes[left_index] + centered_minutes[left_index + 1]),
+    )
+    right_bounds = (
+        0.5 * float(centered_minutes[right_index - 1] + centered_minutes[right_index]),
+        0.5 * float(centered_minutes[right_index] + centered_minutes[right_index + 1]),
+    )
+
+    def knot_objective(values: object) -> float:
+        knots = np.asarray(values, dtype=np.float64)
+        solved = solve_knots(float(knots[0]), float(knots[1]))
+        return float("inf") if solved is None else float(solved[0])
+
+    refined_left, refined_right = _refine_piecewise_knots(
+        knot_objective,
+        (left_knot, right_knot),
+        (left_bounds, right_bounds),
+    )
+    refined = solve_knots(refined_left, refined_right)
+    if refined is None or refined[0] > best[0]:
+        refined_left, refined_right = left_knot, right_knot
+        refined = solve_knots(refined_left, refined_right)
+    if refined is None:
+        return None
+    chi_square, coefficients, covariance, rms, weighted_rms = refined
+    linear = float(coefficients[1])
+    curvature = float(coefficients[2])
+    vertex_minutes = -linear / (2.0 * curvature)
+    vertex_jd = float(x0 + vertex_minutes / 1440.0)
+    vertex_mag = float(coefficients[0] - linear * linear / (4.0 * curvature))
+    side_support = _candidate_side_support(inlier_x, vertex_jd)
+    if side_support is None:
+        return None
+    left_points, right_points, left_coverage, right_coverage = side_support
+
+    vertex_jd_error = float("nan")
+    vertex_mag_error = float("nan")
+    try:
+        vertex_gradient = np.array(
+            [
+                0.0,
+                -1.0 / (2.0 * curvature),
+                linear / (2.0 * curvature * curvature),
+                0.0,
+                0.0,
+            ],
+            dtype=np.float64,
+        )
+        vertex_variance = float(vertex_gradient @ covariance @ vertex_gradient)
+        if vertex_variance >= 0:
+            vertex_jd_error = float(np.sqrt(vertex_variance) / 1440.0)
+        magnitude_gradient = np.array(
+            [
+                1.0,
+                -linear / (2.0 * curvature),
+                linear * linear / (4.0 * curvature * curvature),
+                0.0,
+                0.0,
+            ],
+            dtype=np.float64,
+        )
+        magnitude_variance = float(magnitude_gradient @ covariance @ magnitude_gradient)
+        if magnitude_variance >= 0:
+            vertex_mag_error = float(np.sqrt(magnitude_variance))
+    except Exception:
+        pass
+
+    dense_minutes = np.linspace(
+        float(np.min(centered_minutes)),
+        float(np.max(centered_minutes)),
+        EXTREMUM_SPLINE_DENSE_SAMPLES,
+    )
+    dense_design = _parabolic_spline_design(
+        dense_minutes,
+        refined_left,
+        refined_right,
+    )
+    dense_mag = dense_design @ coefficients
+    return ExtremumCurveCandidate(
+        model_name="parabolic_spline",
+        parameter_count=7,
+        vertex_jd=vertex_jd,
+        vertex_mag=vertex_mag,
+        vertex_jd_error=vertex_jd_error,
+        vertex_mag_error=vertex_mag_error,
+        fit_plot_jd=tuple(float(x0 + value / 1440.0) for value in dense_minutes),
+        fit_plot_mag=tuple(float(value) for value in dense_mag),
+        rms=float(rms),
+        weighted_rms=float(weighted_rms),
+        left_points=left_points,
+        right_points=right_points,
+        left_coverage=left_coverage,
+        right_coverage=right_coverage,
+        metadata={
+            "left_knot_jd": float(x0 + refined_left / 1440.0),
+            "right_knot_jd": float(x0 + refined_right / 1440.0),
+            "chi_square": float(chi_square),
+            "linear_coefficients": tuple(float(value) for value in coefficients),
+            "formal_error_conditioning": "fixed optimized knots",
+        },
     )
 
 
@@ -2262,6 +2889,7 @@ def fit_extremum_spline_candidate(
     fit_jd = tuple(float(x0 + value / 1440.0) for value in dense_minutes)
     fit_mag = tuple(float(value) for value in dense_mag)
     return ExtremumSplineFit(
+        parameter_count=int(len(spline.get_coeffs())),
         vertex_jd=float(vertex_jd),
         vertex_mag=vertex_mag,
         vertex_jd_error=vertex_jd_error,
@@ -2315,35 +2943,81 @@ def spline_wrong_direction_metrics(
     }
 
 
-def spline_shape_metrics(spline: ExtremumSplineFit) -> dict[str, object]:
-    """Count meaningful turning points in the drawn spline curve."""
+def spline_shape_metrics(
+    spline: ExtremumSplineFit,
+    edge_excursion_minimum: float,
+) -> dict[str, object]:
+    """Count significant turning points while ignoring sub-noise edge hooks."""
 
     fit_mag = np.array(spline.fit_plot_mag, dtype=np.float64)
     finite_mag = fit_mag[np.isfinite(fit_mag)]
     if len(finite_mag) < 3:
         return {
             "spline_extremum_count": 0,
+            "spline_raw_extremum_count": 0,
+            "spline_ignored_edge_extremum_count": 0,
+            "spline_ignored_edge_excursion_max": 0.0,
+            "spline_edge_excursion_minimum": float(edge_excursion_minimum),
             "spline_shape_epsilon": float("nan"),
         }
-    mag_span = float(np.max(finite_mag) - np.min(finite_mag))
-    epsilon = max(1e-6, 1e-4 * mag_span)
+    magnitude_scale = max(1.0, float(np.max(np.abs(finite_mag))))
+    epsilon = max(1e-12, np.finfo(np.float64).eps * magnitude_scale * 32.0)
     deltas = np.diff(fit_mag)
-    signs: list[int] = []
-    for delta in deltas:
+    signed_steps: list[tuple[int, int]] = []
+    for index, delta in enumerate(deltas):
         if not np.isfinite(delta) or abs(float(delta)) <= epsilon:
             continue
-        signs.append(1 if delta > 0 else -1)
-    if len(signs) < 2:
+        signed_steps.append((index, 1 if delta > 0 else -1))
+    if len(signed_steps) < 2:
         return {
             "spline_extremum_count": 0,
+            "spline_raw_extremum_count": 0,
+            "spline_ignored_edge_extremum_count": 0,
+            "spline_ignored_edge_excursion_max": 0.0,
+            "spline_edge_excursion_minimum": float(edge_excursion_minimum),
             "spline_shape_epsilon": epsilon,
         }
-    extremum_count = 0
-    for previous, current in zip(signs, signs[1:], strict=False):
-        if previous != current:
-            extremum_count += 1
+    turning_indices = [
+        current_index
+        for (_previous_index, previous_sign), (current_index, current_sign) in zip(
+            signed_steps,
+            signed_steps[1:],
+            strict=False,
+        )
+        if previous_sign != current_sign
+    ]
+    meaningful_turning_indices = set(turning_indices)
+    ignored_edge_excursions: list[float] = []
+    if len(turning_indices) > 1:
+        first_index = turning_indices[0]
+        left_edge_excursion = abs(float(fit_mag[first_index] - fit_mag[0]))
+        if (
+            np.isfinite(left_edge_excursion)
+            and left_edge_excursion < edge_excursion_minimum
+        ):
+            meaningful_turning_indices.discard(first_index)
+            ignored_edge_excursions.append(left_edge_excursion)
+
+        last_index = turning_indices[-1]
+        right_edge_excursion = abs(float(fit_mag[-1] - fit_mag[last_index]))
+        if (
+            last_index in meaningful_turning_indices
+            and np.isfinite(right_edge_excursion)
+            and right_edge_excursion < edge_excursion_minimum
+        ):
+            meaningful_turning_indices.discard(last_index)
+            ignored_edge_excursions.append(right_edge_excursion)
+
     return {
-        "spline_extremum_count": extremum_count,
+        "spline_extremum_count": len(meaningful_turning_indices),
+        "spline_raw_extremum_count": len(turning_indices),
+        "spline_ignored_edge_extremum_count": len(ignored_edge_excursions),
+        "spline_ignored_edge_excursion_max": (
+            max(ignored_edge_excursions)
+            if ignored_edge_excursions
+            else 0.0
+        ),
+        "spline_edge_excursion_minimum": float(edge_excursion_minimum),
         "spline_shape_epsilon": epsilon,
     }
 
@@ -2371,13 +3045,6 @@ def fit_extremum_pchip_anchor(
 
     a, _b, _c = parabola.coefficients
     extremum_type = "Maximum" if a > 0 else "Minimum"
-    if extremum_type == "Maximum":
-        observed_index = int(np.argmin(y))
-    else:
-        observed_index = int(np.argmax(y))
-    observed_extreme_jd = float(x[observed_index])
-    observed_extreme_mag = float(y[observed_index])
-
     x0 = float(np.mean(x))
     centered_minutes = (x - x0) * 1440.0
     try:
@@ -2390,12 +3057,51 @@ def fit_extremum_pchip_anchor(
         dense_mag = pchip(dense_minutes)
     except Exception:
         return None
-    if extremum_type == "Maximum":
+    dense_deltas = np.diff(dense_mag)
+    magnitude_scale = (
+        max(1.0, float(np.max(np.abs(dense_mag[np.isfinite(dense_mag)]))))
+        if np.isfinite(dense_mag).any()
+        else 1.0
+    )
+    epsilon = max(1e-12, np.finfo(np.float64).eps * magnitude_scale * 32.0)
+    signed_steps = np.zeros(len(dense_deltas), dtype=np.int8)
+    signed_steps[dense_deltas > epsilon] = 1
+    signed_steps[dense_deltas < -epsilon] = -1
+    turning_candidates: list[int] = []
+    previous_sign = 0
+    for index, sign in enumerate(signed_steps):
+        current_sign = int(sign)
+        if current_sign == 0:
+            continue
+        if extremum_type == "Maximum":
+            is_matching_turn = previous_sign < 0 and current_sign > 0
+        else:
+            is_matching_turn = previous_sign > 0 and current_sign < 0
+        if is_matching_turn:
+            candidate_jd = float(x0 + float(dense_minutes[index]) / 1440.0)
+            if (
+                np.count_nonzero(x < candidate_jd) >= EXTREMUM_MINIMUM_SIDE_POINTS
+                and np.count_nonzero(x > candidate_jd) >= EXTREMUM_MINIMUM_SIDE_POINTS
+            ):
+                turning_candidates.append(index)
+        previous_sign = current_sign
+    if turning_candidates:
+        dense_index = min(
+            turning_candidates,
+            key=lambda index: abs(
+                float(x0 + float(dense_minutes[index]) / 1440.0)
+                - parabola.vertex_jd
+            ),
+        )
+    elif extremum_type == "Maximum":
         dense_index = int(np.nanargmin(dense_mag))
     else:
         dense_index = int(np.nanargmax(dense_mag))
     anchor_jd = float(x0 + float(dense_minutes[dense_index]) / 1440.0)
     anchor_mag = float(dense_mag[dense_index])
+    observed_index = int(np.argmin(np.abs(x - anchor_jd)))
+    observed_extreme_jd = float(x[observed_index])
+    observed_extreme_mag = float(y[observed_index])
 
     left_points = int(np.count_nonzero(x < anchor_jd))
     right_points = int(np.count_nonzero(x > anchor_jd))
@@ -2427,239 +3133,1311 @@ def quality_vertex_mag_tolerance(
     y_span = float(np.max(y) - np.min(y))
     return max(EXTREMUM_VERTEX_EXTREME_MAG_TOLERANCE_FLOOR, 0.25 * y_span)
 
-
-def choose_extremum_model(
+def _parabola_curve_candidate(
     fit_input: ExtremumFitInput,
     parabola: ExtremumParabolaFit,
     quality: ExtremumFitQualityMetrics,
-) -> tuple[str, ExtremumSplineFit | None, tuple[dict[str, object], ...], ExtremumPchipAnchor | None]:
-    """Choose the automatic fit model, preferring spline for asymmetric peaks."""
+) -> ExtremumCurveCandidate:
+    """Expose the reference parabola through the common candidate contract."""
 
-    extremum_type = "Maximum" if parabola.coefficients[0] > 0 else "Minimum"
-    pchip_anchor = fit_extremum_pchip_anchor(fit_input, parabola)
-    parabola_extreme = observed_extreme_metrics(
-        fit_input,
-        parabola.inlier_mask,
-        extremum_type,
-        parabola.vertex_mag,
+    vertex_jd_error = float("nan")
+    vertex_mag_error = float("nan")
+    a, b, c = parabola.coefficients
+    try:
+        vertex_gradient = np.array(
+            [b / (2.0 * a * a), -1.0 / (2.0 * a), 0.0],
+            dtype=np.float64,
+        )
+        vertex_variance = float(vertex_gradient @ parabola.covariance @ vertex_gradient)
+        if vertex_variance >= 0:
+            vertex_jd_error = float(np.sqrt(vertex_variance))
+        magnitude_gradient = np.array(
+            [parabola.vertex_centered**2, parabola.vertex_centered, 1.0],
+            dtype=np.float64,
+        )
+        magnitude_variance = float(
+            magnitude_gradient @ parabola.covariance @ magnitude_gradient
+        )
+        if magnitude_variance >= 0:
+            vertex_mag_error = float(np.sqrt(magnitude_variance))
+    except Exception:
+        pass
+    fit_jd = np.linspace(
+        float(np.min(fit_input.x)),
+        float(np.max(fit_input.x)),
+        EXTREMUM_SPLINE_DENSE_SAMPLES,
     )
-    parabola_mag_misses_extreme = (
-        float(parabola_extreme["vertex_extreme_delta"])
-        > float(parabola_extreme["vertex_extreme_tolerance"])
+    centered = fit_jd - parabola.x0
+    fit_mag = a * centered**2 + b * centered + c
+    return ExtremumCurveCandidate(
+        model_name="parabola",
+        parameter_count=3,
+        vertex_jd=float(parabola.vertex_jd),
+        vertex_mag=float(parabola.vertex_mag),
+        vertex_jd_error=vertex_jd_error,
+        vertex_mag_error=vertex_mag_error,
+        fit_plot_jd=tuple(float(value) for value in fit_jd),
+        fit_plot_mag=tuple(float(value) for value in fit_mag),
+        rms=float(quality.rms),
+        weighted_rms=float(quality.weighted_rms),
+        left_points=int(len(quality.left_x)),
+        right_points=int(len(quality.right_x)),
+        left_coverage=float(quality.left_coverage),
+        right_coverage=float(quality.right_coverage),
+        metadata={},
     )
-    if pchip_anchor is None:
-        anchor_jd = float(parabola_extreme["observed_extreme_jd"])
-        anchor_mag = float(parabola_extreme["observed_extreme_mag"])
-        sorted_x = np.sort(fit_input.x)
-        positive_cadence = np.diff(sorted_x)
-        positive_cadence = positive_cadence[positive_cadence > 0]
-        median_cadence = float(np.median(positive_cadence)) if len(positive_cadence) else 0.0
-        selected_width = float(fit_input.xmax - fit_input.xmin)
-        anchor_time_tolerance = max(2.5 * median_cadence, 0.15 * selected_width)
-        anchor_mag_tolerance = quality.vertex_mag_tolerance
+
+
+def _smoothing_spline_curve_candidate(
+    spline: ExtremumSplineFit,
+) -> ExtremumCurveCandidate:
+    """Expose the legacy smoothed cubic spline as a fallback candidate."""
+
+    return ExtremumCurveCandidate(
+        model_name="smoothing_spline",
+        parameter_count=int(spline.parameter_count),
+        vertex_jd=float(spline.vertex_jd),
+        vertex_mag=float(spline.vertex_mag),
+        vertex_jd_error=float(spline.vertex_jd_error),
+        vertex_mag_error=float(spline.vertex_mag_error),
+        fit_plot_jd=spline.fit_plot_jd,
+        fit_plot_mag=spline.fit_plot_mag,
+        rms=float(spline.rms),
+        weighted_rms=float(spline.weighted_rms),
+        left_points=int(spline.left_points),
+        right_points=int(spline.right_points),
+        left_coverage=float(spline.left_coverage),
+        right_coverage=float(spline.right_coverage),
+        metadata={"smoothing": float(spline.smoothing)},
+    )
+
+
+def _bootstrap_weighted_linear_solution(
+    design: object,
+    values: object,
+    sigma: object,
+) -> tuple[object, float] | None:
+    """Solve a lightweight weighted linear fit for one bootstrap replicate."""
+
+    design_array = np.asarray(design, dtype=np.float64)
+    values_array = np.asarray(values, dtype=np.float64)
+    sigma_array = np.asarray(sigma, dtype=np.float64)
+    try:
+        weighted_design = design_array / sigma_array[:, None]
+        weighted_values = values_array / sigma_array
+        coefficients, _residuals, rank, _singular = np.linalg.lstsq(
+            weighted_design,
+            weighted_values,
+            rcond=None,
+        )
+    except Exception:
+        return None
+    if int(rank) != design_array.shape[1]:
+        return None
+    residuals = values_array - design_array @ coefficients
+    chi_square = float(np.sum((residuals / sigma_array) ** 2))
+    if not np.isfinite(chi_square):
+        return None
+    return coefficients, chi_square
+
+
+def _bootstrap_piecewise_extremum(
+    model_name: str,
+    centered_minutes: object,
+    values: object,
+    sigma: object,
+    candidate: ExtremumCurveCandidate,
+    expected_sign: float,
+) -> tuple[float, float] | None:
+    """Refit AP or PS, including both knot positions, for one bootstrap sample."""
+
+    time_values = np.asarray(centered_minutes, dtype=np.float64)
+    sample_values = np.asarray(values, dtype=np.float64)
+    sigma_values = np.asarray(sigma, dtype=np.float64)
+    left_knot_jd = candidate.metadata.get("left_knot_jd")
+    right_knot_jd = candidate.metadata.get("right_knot_jd")
+    if left_knot_jd is None or right_knot_jd is None:
+        return None
+    x0 = float(candidate.metadata.get("bootstrap_x0_jd", float("nan")))
+    if not np.isfinite(x0):
+        return None
+    initial_left = (float(left_knot_jd) - x0) * 1440.0
+    initial_right = (float(right_knot_jd) - x0) * 1440.0
+
+    if model_name == "asymptotic_parabola":
+        design_function = _asymptotic_parabola_design
+        minimum_outer = EXTREMUM_MODEL_MIN_OUTER_POINTS
+    elif model_name == "parabolic_spline":
+        design_function = _parabolic_spline_design
+        minimum_outer = EXTREMUM_PARABOLIC_SPLINE_MIN_OUTER_POINTS
     else:
-        anchor_jd = pchip_anchor.anchor_jd
-        anchor_mag = pchip_anchor.anchor_mag
-        anchor_time_tolerance = pchip_anchor.time_tolerance
-        anchor_mag_tolerance = pchip_anchor.mag_tolerance
-    parabola_anchor_time_delta = abs(float(parabola.vertex_jd) - anchor_jd)
-    parabola_anchor_mag_delta = abs(float(parabola.vertex_mag) - anchor_mag)
-    parabola_misses_anchor = (
-        parabola_mag_misses_extreme
-        or parabola_anchor_time_delta > anchor_time_tolerance
-        or parabola_anchor_mag_delta > anchor_mag_tolerance
+        return None
+    if len(time_values) < 2 * minimum_outer + 3:
+        return None
+
+    def solve_knots(left_knot: float, right_knot: float):
+        if (
+            not np.isfinite(left_knot)
+            or not np.isfinite(right_knot)
+            or left_knot >= right_knot
+            or int(np.count_nonzero(time_values < left_knot)) < minimum_outer
+            or int(np.count_nonzero(time_values > right_knot)) < minimum_outer
+            or int(
+                np.count_nonzero(
+                    (time_values >= left_knot) & (time_values <= right_knot)
+                )
+            )
+            < 1
+        ):
+            return None
+        solved = _bootstrap_weighted_linear_solution(
+            design_function(time_values, left_knot, right_knot),
+            sample_values,
+            sigma_values,
+        )
+        if solved is None:
+            return None
+        coefficients, chi_square = solved
+        if model_name == "asymptotic_parabola":
+            curvature = float(coefficients[1])
+            linear = float(coefficients[2])
+            midpoint = 0.5 * (left_knot + right_knot)
+            vertex_minutes = midpoint - linear / (2.0 * curvature)
+            vertex_mag = float(
+                coefficients[0] - linear * linear / (4.0 * curvature)
+            )
+        else:
+            curvature = float(coefficients[2])
+            linear = float(coefficients[1])
+            vertex_minutes = -linear / (2.0 * curvature)
+            vertex_mag = float(
+                coefficients[0] - linear * linear / (4.0 * curvature)
+            )
+        if (
+            not np.isfinite(curvature)
+            or expected_sign * curvature <= 0
+            or not np.isfinite(vertex_minutes)
+            or not left_knot <= vertex_minutes <= right_knot
+            or not np.isfinite(vertex_mag)
+        ):
+            return None
+        return chi_square, float(vertex_minutes), vertex_mag
+
+    left_bounds = (
+        float(time_values[minimum_outer - 1]),
+        float(time_values[-minimum_outer - 2]),
     )
-    checks: list[dict[str, object]] = [
-        {
-            "model": "parabola",
-            "accepted": True,
-            "vertex_jd": float(parabola.vertex_jd),
-            "vertex_mag": float(parabola.vertex_mag),
-            "rms": quality.rms,
-            "weighted_rms": quality.weighted_rms,
-            "observed_extreme_jd": parabola_extreme["observed_extreme_jd"],
-            "observed_extreme_mag": parabola_extreme["observed_extreme_mag"],
-            "vertex_extreme_delta": parabola_extreme["vertex_extreme_delta"],
-            "vertex_extreme_tolerance": parabola_extreme["vertex_extreme_tolerance"],
-            "anchor_time_delta": parabola_anchor_time_delta,
-            "anchor_time_tolerance": anchor_time_tolerance,
-            "anchor_mag_delta": parabola_anchor_mag_delta,
-            "anchor_mag_tolerance": anchor_mag_tolerance,
-            "decision": "candidate",
-        }
+    right_bounds = (
+        float(time_values[minimum_outer + 1]),
+        float(time_values[-minimum_outer]),
+    )
+
+    def knot_objective(values_pair: object) -> float:
+        knots = np.asarray(values_pair, dtype=np.float64)
+        solved = solve_knots(float(knots[0]), float(knots[1]))
+        return (
+            EXTREMUM_MODEL_INVALID_OBJECTIVE_PENALTY
+            if solved is None
+            else float(solved[0])
+        )
+
+    initial = solve_knots(initial_left, initial_right)
+    if initial is None:
+        return None
+    refined_left, refined_right = _refine_piecewise_knots(
+        knot_objective,
+        (initial_left, initial_right),
+        (left_bounds, right_bounds),
+        max_iterations=EXTREMUM_MODEL_BOOTSTRAP_KNOT_MAX_ITERATIONS,
+    )
+    refined = solve_knots(refined_left, refined_right)
+    if refined is None or refined[0] > initial[0]:
+        refined = initial
+    return float(refined[1]), float(refined[2])
+
+
+def _bootstrap_refit_extremum_candidate(
+    candidate: ExtremumCurveCandidate,
+    x: object,
+    values: object,
+    sigma: object,
+    expected_sign: float,
+) -> tuple[float, float] | None:
+    """Return the refitted vertex for one candidate and bootstrap sample."""
+
+    x_values = np.asarray(x, dtype=np.float64)
+    sample_values = np.asarray(values, dtype=np.float64)
+    sigma_values = np.asarray(sigma, dtype=np.float64)
+    x0 = float(np.mean(x_values))
+    if candidate.model_name == "parabola":
+        centered_days = x_values - x0
+        try:
+            coefficients = np.polyfit(
+                centered_days,
+                sample_values,
+                2,
+                w=1.0 / sigma_values,
+            )
+        except Exception:
+            return None
+        curvature, linear, constant = (
+            float(coefficients[0]),
+            float(coefficients[1]),
+            float(coefficients[2]),
+        )
+        if not np.isfinite(curvature) or expected_sign * curvature <= 0:
+            return None
+        vertex_centered = -linear / (2.0 * curvature)
+        return (
+            float(x0 + vertex_centered),
+            float(
+                curvature * vertex_centered * vertex_centered
+                + linear * vertex_centered
+                + constant
+            ),
+        )
+    if candidate.model_name in {"asymptotic_parabola", "parabolic_spline"}:
+        bootstrap_metadata = dict(candidate.metadata)
+        bootstrap_metadata["bootstrap_x0_jd"] = x0
+        bootstrap_candidate = ExtremumCurveCandidate(
+            model_name=candidate.model_name,
+            parameter_count=candidate.parameter_count,
+            vertex_jd=candidate.vertex_jd,
+            vertex_mag=candidate.vertex_mag,
+            vertex_jd_error=candidate.vertex_jd_error,
+            vertex_mag_error=candidate.vertex_mag_error,
+            fit_plot_jd=candidate.fit_plot_jd,
+            fit_plot_mag=candidate.fit_plot_mag,
+            rms=candidate.rms,
+            weighted_rms=candidate.weighted_rms,
+            left_points=candidate.left_points,
+            right_points=candidate.right_points,
+            left_coverage=candidate.left_coverage,
+            right_coverage=candidate.right_coverage,
+            metadata=bootstrap_metadata,
+        )
+        centered_minutes = (x_values - x0) * 1440.0
+        piecewise = _bootstrap_piecewise_extremum(
+            candidate.model_name,
+            centered_minutes,
+            sample_values,
+            sigma_values,
+            bootstrap_candidate,
+            expected_sign,
+        )
+        if piecewise is None:
+            return None
+        return float(x0 + piecewise[0] / 1440.0), float(piecewise[1])
+    if candidate.model_name == "smoothing_spline":
+        try:
+            from scipy.interpolate import UnivariateSpline
+
+            centered_minutes = (x_values - x0) * 1440.0
+            spline = UnivariateSpline(
+                centered_minutes,
+                sample_values,
+                w=1.0 / sigma_values,
+                k=3,
+                s=float(candidate.metadata["smoothing"]),
+            )
+            dense_minutes = np.linspace(
+                float(np.min(centered_minutes)),
+                float(np.max(centered_minutes)),
+                EXTREMUM_SPLINE_DENSE_SAMPLES,
+            )
+            dense_mag = spline(dense_minutes)
+        except Exception:
+            return None
+        dense_index = (
+            int(np.argmin(dense_mag))
+            if expected_sign > 0
+            else int(np.argmax(dense_mag))
+        )
+        return (
+            float(x0 + float(dense_minutes[dense_index]) / 1440.0),
+            float(dense_mag[dense_index]),
+        )
+    return None
+
+
+def estimate_extremum_candidate_bootstrap(
+    fit_input: ExtremumFitInput,
+    parabola: ExtremumParabolaFit,
+    candidate: ExtremumCurveCandidate,
+) -> dict[str, object]:
+    """Estimate extremum accuracy by deterministic full-refit bootstrap."""
+
+    inlier_mask = np.asarray(parabola.inlier_mask, dtype=bool)
+    inlier_x = np.asarray(fit_input.x[inlier_mask], dtype=np.float64)
+    inlier_y = np.asarray(fit_input.y[inlier_mask], dtype=np.float64)
+    sigma = np.asarray(parabola.sigma[inlier_mask], dtype=np.float64)
+    inlier_yerr = np.asarray(fit_input.yerr[inlier_mask], dtype=np.float64)
+    sort_order = np.argsort(inlier_x)
+    inlier_x = inlier_x[sort_order]
+    inlier_y = inlier_y[sort_order]
+    sigma = sigma[sort_order]
+    inlier_yerr = inlier_yerr[sort_order]
+    model_values = np.interp(
+        inlier_x,
+        np.asarray(candidate.fit_plot_jd, dtype=np.float64),
+        np.asarray(candidate.fit_plot_mag, dtype=np.float64),
+    )
+    residuals = inlier_y - model_values
+    degrees_of_freedom = max(len(inlier_x) - candidate.parameter_count, 1)
+    has_reported_errors = bool(
+        np.any(np.isfinite(inlier_yerr) & (inlier_yerr > 0))
+    )
+    reduced_chi_square = float("nan")
+    if has_reported_errors:
+        reduced_chi_square = float(
+            np.sum((residuals / sigma) ** 2) / degrees_of_freedom
+        )
+        noise_multiplier = max(
+            1.0,
+            float(np.sqrt(reduced_chi_square))
+            if np.isfinite(reduced_chi_square) and reduced_chi_square > 0
+            else 1.0,
+        )
+        noise_sigma = sigma * noise_multiplier
+        noise_method = "reported_errors_scaled_by_reduced_chi_square"
+    else:
+        centered_residuals = residuals - float(np.median(residuals))
+        residual_rms = float(np.sqrt(np.mean(centered_residuals**2)))
+        residual_mad_sigma = 1.4826 * float(
+            np.median(np.abs(centered_residuals))
+        )
+        noise_scale = max(
+            residual_rms if np.isfinite(residual_rms) else 0.0,
+            residual_mad_sigma if np.isfinite(residual_mad_sigma) else 0.0,
+            1e-4,
+        )
+        noise_sigma = np.full(len(inlier_x), noise_scale, dtype=np.float64)
+        noise_multiplier = 1.0
+        noise_method = "residual_scatter"
+
+    expected_sign = 1.0 if parabola.coefficients[0] > 0 else -1.0
+    rng = np.random.default_rng(EXTREMUM_MODEL_BOOTSTRAP_RANDOM_SEED)
+    sample_jd: list[float] = []
+    sample_mag: list[float] = []
+    selected_width = float(fit_input.xmax - fit_input.xmin)
+    minimum_side_coverage = (
+        EXTREMUM_MINIMUM_SIDE_COVERAGE_FRACTION * selected_width
+    )
+    for _sample_index in range(EXTREMUM_MODEL_BOOTSTRAP_SAMPLES):
+        sampled_y = model_values + rng.normal(0.0, noise_sigma)
+        refitted = _bootstrap_refit_extremum_candidate(
+            candidate,
+            inlier_x,
+            sampled_y,
+            sigma,
+            expected_sign,
+        )
+        if refitted is None:
+            continue
+        vertex_jd, vertex_mag = refitted
+        side_support = _candidate_side_support(inlier_x, vertex_jd)
+        if (
+            side_support is None
+            or not fit_input.xmin <= vertex_jd <= fit_input.xmax
+            or side_support[0] < EXTREMUM_MINIMUM_SIDE_POINTS
+            or side_support[1] < EXTREMUM_MINIMUM_SIDE_POINTS
+            or side_support[2] < minimum_side_coverage
+            or side_support[3] < minimum_side_coverage
+            or not np.isfinite(vertex_mag)
+        ):
+            continue
+        sample_jd.append(float(vertex_jd))
+        sample_mag.append(float(vertex_mag))
+
+    success_count = len(sample_jd)
+    success_fraction = success_count / EXTREMUM_MODEL_BOOTSTRAP_SAMPLES
+    minimum_success_count = max(
+        2,
+        int(
+            np.ceil(
+                EXTREMUM_MODEL_BOOTSTRAP_MIN_SUCCESS_FRACTION
+                * EXTREMUM_MODEL_BOOTSTRAP_SAMPLES
+            )
+        ),
+    )
+    stable = success_count >= minimum_success_count
+    if success_count:
+        jd_array = np.asarray(sample_jd, dtype=np.float64)
+        mag_array = np.asarray(sample_mag, dtype=np.float64)
+        jd_deltas = jd_array - candidate.vertex_jd
+        mag_deltas = mag_array - candidate.vertex_mag
+        timing_error = float(np.sqrt(np.mean(jd_deltas**2)))
+        magnitude_error = float(np.sqrt(np.mean(mag_deltas**2)))
+        timing_bias = float(np.mean(jd_deltas))
+        magnitude_bias = float(np.mean(mag_deltas))
+        jd_low, jd_high = (
+            float(value) for value in np.percentile(jd_array, [16.0, 84.0])
+        )
+    else:
+        timing_error = float("nan")
+        magnitude_error = float("nan")
+        timing_bias = float("nan")
+        magnitude_bias = float("nan")
+        jd_low = float("nan")
+        jd_high = float("nan")
+    return {
+        "bootstrap_method": "parametric_full_refit",
+        "bootstrap_samples": EXTREMUM_MODEL_BOOTSTRAP_SAMPLES,
+        "bootstrap_successes": success_count,
+        "bootstrap_success_fraction": success_fraction,
+        "bootstrap_stable": stable,
+        "bootstrap_timing_error": timing_error,
+        "bootstrap_timing_error_seconds": timing_error * 86400.0,
+        "bootstrap_timing_bias": timing_bias,
+        "bootstrap_magnitude_error": magnitude_error,
+        "bootstrap_magnitude_bias": magnitude_bias,
+        "bootstrap_jd_p16": jd_low,
+        "bootstrap_jd_p84": jd_high,
+        "bootstrap_noise_method": noise_method,
+        "bootstrap_noise_multiplier": noise_multiplier,
+        "bootstrap_noise_sigma_median": float(np.median(noise_sigma)),
+        "bootstrap_reduced_chi_square": reduced_chi_square,
+    }
+
+
+def fit_extremum_curve_candidates(
+    fit_input: ExtremumFitInput,
+    parabola: ExtremumParabolaFit,
+    quality: ExtremumFitQualityMetrics,
+) -> tuple[tuple[ExtremumCurveCandidate, ...], tuple[dict[str, object], ...]]:
+    """Calculate models without deciding whether the selected data are usable."""
+
+    candidates: list[ExtremumCurveCandidate] = [
+        _parabola_curve_candidate(fit_input, parabola, quality)
     ]
-    if pchip_anchor is None:
-        checks.append(
-            {
-                "model": "pchip_anchor",
-                "accepted": False,
-                "decision": "unavailable",
-                "reason": "PCHIP anchor unavailable; observed extreme is used as fallback",
-            }
-        )
-    else:
-        checks.append(
-            {
-                "model": "pchip_anchor",
-                "accepted": True,
-                "anchor_jd": pchip_anchor.anchor_jd,
-                "anchor_mag": pchip_anchor.anchor_mag,
-                "observed_extreme_jd": pchip_anchor.observed_extreme_jd,
-                "observed_extreme_mag": pchip_anchor.observed_extreme_mag,
-                "time_tolerance": pchip_anchor.time_tolerance,
-                "mag_tolerance": pchip_anchor.mag_tolerance,
-                "left_points": pchip_anchor.left_points,
-                "right_points": pchip_anchor.right_points,
-                "decision": "anchor",
-                "reason": "shape-preserving plausibility anchor",
-            }
-        )
+    availability: list[dict[str, object]] = []
+    model_fitters = (
+        (
+            "asymptotic_parabola",
+            fit_extremum_asymptotic_parabola_candidate,
+            EXTREMUM_ASYMPTOTIC_PARABOLA_MIN_POINTS,
+        ),
+        (
+            "parabolic_spline",
+            fit_extremum_parabolic_spline_candidate,
+            EXTREMUM_PARABOLIC_SPLINE_MIN_POINTS,
+        ),
+    )
+    for model_name, fitter, minimum_points in model_fitters:
+        candidate = fitter(fit_input, parabola)
+        if candidate is None:
+            availability.append(
+                {
+                    "model": model_name,
+                    "accepted": False,
+                    "decision": "unavailable",
+                    "reason": (
+                        "model fit unavailable or insufficiently supported "
+                        f"(minimum points: {minimum_points})"
+                    ),
+                }
+            )
+        else:
+            candidates.append(candidate)
 
     spline = fit_extremum_spline_candidate(fit_input, parabola)
     if spline is None:
-        checks.append(
+        availability.append(
             {
-                "model": "spline",
+                "model": "smoothing_spline",
                 "accepted": False,
                 "decision": "unavailable",
-                "reason": "spline candidate unavailable or unsupported by selected points",
+                "reason": "smoothed spline unavailable or unsupported",
             }
         )
-        return "parabola", None, tuple(checks), pchip_anchor
+    else:
+        candidates.append(_smoothing_spline_curve_candidate(spline))
+    return tuple(candidates), tuple(availability)
 
-    spline_extreme = observed_extreme_metrics(
+
+def _extremum_candidate_information_score(
+    candidate: ExtremumCurveCandidate,
+    point_count: int,
+) -> float:
+    """Return a BIC-style score that penalizes unnecessary flexibility."""
+
+    if (
+        point_count <= 0
+        or not np.isfinite(candidate.weighted_rms)
+        or candidate.weighted_rms < 0
+    ):
+        return float("inf")
+    residual_variance = max(
+        candidate.weighted_rms * candidate.weighted_rms,
+        EXTREMUM_MODEL_SELECTION_EPSILON,
+    )
+    return float(
+        point_count * np.log(residual_variance)
+        + candidate.parameter_count * np.log(point_count)
+    )
+
+
+def validate_extremum_candidate(
+    fit_input: ExtremumFitInput,
+    parabola: ExtremumParabolaFit,
+    quality: ExtremumFitQualityMetrics,
+    candidate: ExtremumCurveCandidate,
+    anchor: ExtremumPchipAnchor | None,
+) -> dict[str, object]:
+    """Apply the same mathematical plausibility rules to every curve model."""
+
+    extremum_type = "Maximum" if parabola.coefficients[0] > 0 else "Minimum"
+    observed = observed_extreme_metrics(
         fit_input,
         parabola.inlier_mask,
         extremum_type,
-        spline.vertex_mag,
+        candidate.vertex_mag,
     )
-    spline_delta = float(spline_extreme["vertex_extreme_delta"])
-    spline_tolerance = float(spline_extreme["vertex_extreme_tolerance"])
-    spline_underfits_depth = spline_delta > spline_tolerance
-    spline_extreme_time_delta = abs(float(spline.vertex_jd) - anchor_jd)
-    spline_extreme_time_tolerance = anchor_time_tolerance
-    spline_too_far = (
-        not np.isfinite(spline_extreme_time_delta)
-        or not np.isfinite(spline_extreme_time_tolerance)
-        or spline_extreme_time_delta > spline_extreme_time_tolerance
-    )
-    observed_mag = anchor_mag
-    if extremum_type == "Maximum":
-        spline_too_bright = spline.vertex_mag < observed_mag - anchor_mag_tolerance
-    else:
-        spline_too_bright = spline.vertex_mag > observed_mag + anchor_mag_tolerance
-    spline_direction = spline_wrong_direction_metrics(spline, extremum_type)
-    spline_shape = spline_shape_metrics(spline)
-    spline_too_wiggly = (
-        len(fit_input.x) >= EXTREMUM_SPLINE_WRONG_DIRECTION_MIN_POINTS
-        and (
-            float(spline_direction["spline_wrong_direction_fraction"])
-            > EXTREMUM_SPLINE_MAX_WRONG_DIRECTION_FRACTION
+    if anchor is not None:
+        inlier_x = np.asarray(fit_input.x[parabola.inlier_mask], dtype=np.float64)
+        inlier_yerr = np.asarray(
+            fit_input.yerr[parabola.inlier_mask],
+            dtype=np.float64,
         )
+        observed_index = int(np.argmin(np.abs(inlier_x - anchor.observed_extreme_jd)))
+        observed_error = float(inlier_yerr[observed_index])
+        if not np.isfinite(observed_error) or observed_error <= 0:
+            observed_error = 0.0
+        if extremum_type == "Maximum":
+            vertex_extreme_delta = (
+                candidate.vertex_mag - anchor.observed_extreme_mag
+            )
+            extreme_kind = "brightest local"
+        else:
+            vertex_extreme_delta = (
+                anchor.observed_extreme_mag - candidate.vertex_mag
+            )
+            extreme_kind = "faintest local"
+        observed = {
+            "observed_extreme_jd": anchor.observed_extreme_jd,
+            "observed_extreme_mag": anchor.observed_extreme_mag,
+            "observed_extreme_error": observed_error,
+            "vertex_extreme_delta": float(vertex_extreme_delta),
+            "vertex_extreme_tolerance": max(
+                EXTREMUM_VERTEX_EXTREME_MAG_TOLERANCE_FLOOR,
+                EXTREMUM_VERTEX_EXTREME_ERROR_FACTOR * observed_error,
+            ),
+            "extreme_kind": extreme_kind,
+        }
+    if anchor is None:
+        anchor_jd = float(observed["observed_extreme_jd"])
+        anchor_mag = float(observed["observed_extreme_mag"])
+        sorted_x = np.sort(np.asarray(fit_input.x, dtype=np.float64))
+        positive_cadence = np.diff(sorted_x)
+        positive_cadence = positive_cadence[positive_cadence > 0]
+        median_cadence = (
+            float(np.median(positive_cadence))
+            if len(positive_cadence)
+            else 0.0
+        )
+        anchor_time_tolerance = max(
+            2.5 * median_cadence,
+            0.15 * float(fit_input.xmax - fit_input.xmin),
+        )
+        anchor_mag_tolerance = quality.vertex_mag_tolerance
+    else:
+        anchor_jd = float(anchor.anchor_jd)
+        anchor_mag = float(anchor.anchor_mag)
+        anchor_time_tolerance = float(anchor.time_tolerance)
+        anchor_mag_tolerance = float(anchor.mag_tolerance)
+    if np.isfinite(candidate.rms):
+        anchor_mag_tolerance = max(
+            anchor_mag_tolerance,
+            3.0 * float(candidate.rms),
+        )
+
+    anchor_time_delta = abs(candidate.vertex_jd - anchor_jd)
+    anchor_mag_delta = abs(candidate.vertex_mag - anchor_mag)
+    underfits_observed_extreme = (
+        float(observed["vertex_extreme_delta"])
+        > float(observed["vertex_extreme_tolerance"])
     )
-    spline_has_single_extremum = (
-        int(spline_shape["spline_extremum_count"])
+    if extremum_type == "Maximum":
+        overshoots_observed_extreme = (
+            candidate.vertex_mag < anchor_mag - anchor_mag_tolerance
+        )
+    else:
+        overshoots_observed_extreme = (
+            candidate.vertex_mag > anchor_mag + anchor_mag_tolerance
+        )
+    vertex_in_range = bool(
+        np.isfinite(candidate.vertex_jd)
+        and fit_input.xmin <= candidate.vertex_jd <= fit_input.xmax
+    )
+    magnitude_in_range = bool(
+        np.isfinite(candidate.vertex_mag)
+        and candidate.vertex_mag >= quality.inlier_y_min - quality.vertex_mag_tolerance
+        and candidate.vertex_mag <= quality.inlier_y_max + quality.vertex_mag_tolerance
+    )
+    selected_width = float(fit_input.xmax - fit_input.xmin)
+    minimum_side_coverage = EXTREMUM_MINIMUM_SIDE_COVERAGE_FRACTION * selected_width
+    side_support_ok = bool(
+        candidate.left_points >= EXTREMUM_MINIMUM_SIDE_POINTS
+        and candidate.right_points >= EXTREMUM_MINIMUM_SIDE_POINTS
+        and candidate.left_coverage >= minimum_side_coverage
+        and candidate.right_coverage >= minimum_side_coverage
+    )
+    valid_shape_errors = parabola.sigma[
+        parabola.inlier_mask
+        & np.isfinite(parabola.sigma)
+        & (parabola.sigma > 0)
+    ]
+    median_shape_error = (
+        float(np.median(valid_shape_errors))
+        if len(valid_shape_errors)
+        else 0.0
+    )
+    edge_excursion_minimum = max(
+        EXTREMUM_MINIMUM_PROMINENCE_FLOOR,
+        candidate.rms if np.isfinite(candidate.rms) else 0.0,
+        median_shape_error,
+    )
+    shape = spline_shape_metrics(candidate, edge_excursion_minimum)
+    direction = spline_wrong_direction_metrics(candidate, extremum_type)
+    single_extremum = bool(
+        int(shape["spline_extremum_count"])
         == EXTREMUM_SPLINE_REQUIRED_EXTREMUM_COUNT
     )
-    spline_valid = (
-        not spline_too_bright
-        and not spline_too_far
-        and not spline_too_wiggly
-        and spline_has_single_extremum
+    direction_ok = bool(
+        len(fit_input.x) < EXTREMUM_SPLINE_WRONG_DIRECTION_MIN_POINTS
+        or float(direction["spline_wrong_direction_fraction"])
+        <= EXTREMUM_SPLINE_MAX_WRONG_DIRECTION_FRACTION
     )
-    spline_rejected_for_wiggle_only = (
-        (spline_too_wiggly or not spline_has_single_extremum)
-        and not spline_too_bright
-        and not spline_too_far
+    anchor_time_ok = bool(
+        np.isfinite(anchor_time_delta)
+        and np.isfinite(anchor_time_tolerance)
+        and anchor_time_delta <= anchor_time_tolerance
     )
-    weighted_rms_improvement = float("nan")
-    if (
-        np.isfinite(quality.weighted_rms)
-        and quality.weighted_rms > 0
-        and np.isfinite(spline.weighted_rms)
-    ):
-        weighted_rms_improvement = (quality.weighted_rms - spline.weighted_rms) / quality.weighted_rms
-    anchor_time_ratio = float("nan")
-    if np.isfinite(parabola_anchor_time_delta) and parabola_anchor_time_delta > 0:
-        anchor_time_ratio = spline_extreme_time_delta / parabola_anchor_time_delta
-    spline_significantly_better = (
-        spline_valid
-        and np.isfinite(weighted_rms_improvement)
-        and weighted_rms_improvement >= EXTREMUM_SPLINE_MIN_WEIGHTED_RMS_IMPROVEMENT
-        and np.isfinite(anchor_time_ratio)
-        and anchor_time_ratio <= EXTREMUM_SPLINE_MAX_ANCHOR_TIME_RATIO
+    anchor_mag_ok = bool(
+        np.isfinite(anchor_mag_delta)
+        and np.isfinite(anchor_mag_tolerance)
+        and anchor_mag_delta <= anchor_mag_tolerance
     )
-    use_spline = False
-    decision = "candidate"
-    if spline_valid and parabola_misses_anchor:
-        use_spline = True
-        decision = "selected"
-    elif spline_significantly_better:
-        use_spline = True
-        decision = "selected"
-    elif not spline_valid:
-        decision = "rejected"
+    accepted = bool(
+        vertex_in_range
+        and magnitude_in_range
+        and side_support_ok
+        and single_extremum
+        and direction_ok
+        and anchor_time_ok
+        and anchor_mag_ok
+    )
+    reasons: list[str] = []
+    if not vertex_in_range:
+        reasons.append("vertex outside selected range")
+    if not magnitude_in_range:
+        reasons.append("vertex magnitude outside measured range")
+    if not side_support_ok:
+        reasons.append("insufficient flank support")
+    if not single_extremum:
+        reasons.append("not exactly one significant extremum")
+    if not direction_ok:
+        reasons.append("wrong-direction flank structure")
+    if not anchor_time_ok:
+        reasons.append("extremum too far from shape-preserving anchor")
+    if not anchor_mag_ok:
+        reasons.append("extremum magnitude too far from shape-preserving anchor")
+    information_score = _extremum_candidate_information_score(
+        candidate,
+        int(np.count_nonzero(parabola.inlier_mask)),
+    )
+    return {
+        "model": candidate.model_name,
+        "accepted": accepted,
+        "decision": "candidate" if accepted else "rejected",
+        "reason": "valid candidate" if accepted else "; ".join(reasons),
+        "parameter_count": candidate.parameter_count,
+        "information_score": information_score,
+        "vertex_jd": candidate.vertex_jd,
+        "vertex_mag": candidate.vertex_mag,
+        "vertex_jd_error": candidate.vertex_jd_error,
+        "vertex_mag_error": candidate.vertex_mag_error,
+        "rms": candidate.rms,
+        "weighted_rms": candidate.weighted_rms,
+        "left_points": candidate.left_points,
+        "right_points": candidate.right_points,
+        "left_coverage": candidate.left_coverage,
+        "right_coverage": candidate.right_coverage,
+        "minimum_side_coverage": minimum_side_coverage,
+        "observed_extreme_jd": observed["observed_extreme_jd"],
+        "observed_extreme_mag": observed["observed_extreme_mag"],
+        "observed_point_mag_delta": observed["vertex_extreme_delta"],
+        "observed_point_noise_scale": observed["vertex_extreme_tolerance"],
+        "underfits_single_observed_point": underfits_observed_extreme,
+        "overshoots_single_observed_point": overshoots_observed_extreme,
+        "anchor_jd": anchor_jd,
+        "anchor_mag": anchor_mag,
+        "anchor_time_delta": anchor_time_delta,
+        "anchor_time_tolerance": anchor_time_tolerance,
+        "anchor_mag_delta": anchor_mag_delta,
+        "anchor_mag_tolerance": anchor_mag_tolerance,
+        "anchor_mag_ok": anchor_mag_ok,
+        "vertex_in_range": vertex_in_range,
+        "magnitude_in_range": magnitude_in_range,
+        "side_support_ok": side_support_ok,
+        "single_extremum": single_extremum,
+        "direction_ok": direction_ok,
+        **shape,
+        **direction,
+        **candidate.metadata,
+    }
 
-    checks.append(
-        {
-            "model": "spline",
-            "accepted": bool(spline_valid),
-            "vertex_jd": float(spline.vertex_jd),
-            "vertex_mag": float(spline.vertex_mag),
-            "vertex_jd_error": spline.vertex_jd_error,
-            "vertex_mag_error": spline.vertex_mag_error,
-            "rms": spline.rms,
-            "weighted_rms": spline.weighted_rms,
-            "smoothing": spline.smoothing,
-            "left_points": spline.left_points,
-            "right_points": spline.right_points,
-            "left_coverage": spline.left_coverage,
-            "right_coverage": spline.right_coverage,
-            "observed_extreme_jd": spline_extreme["observed_extreme_jd"],
-            "observed_extreme_mag": spline_extreme["observed_extreme_mag"],
-            "vertex_extreme_delta": spline_delta,
-            "vertex_extreme_tolerance": spline_tolerance,
-            "underfits_observed_depth": spline_underfits_depth,
-            "anchor_time_delta": spline_extreme_time_delta,
-            "anchor_time_tolerance": spline_extreme_time_tolerance,
-            "weighted_rms_improvement": weighted_rms_improvement,
-            "anchor_time_ratio": anchor_time_ratio,
-            **spline_direction,
-            **spline_shape,
-            "required_spline_extremum_count": EXTREMUM_SPLINE_REQUIRED_EXTREMUM_COUNT,
-            "wrong_direction_min_points": EXTREMUM_SPLINE_WRONG_DIRECTION_MIN_POINTS,
-            "max_wrong_direction_fraction": EXTREMUM_SPLINE_MAX_WRONG_DIRECTION_FRACTION,
-            "min_weighted_rms_improvement": EXTREMUM_SPLINE_MIN_WEIGHTED_RMS_IMPROVEMENT,
-            "max_anchor_time_ratio": EXTREMUM_SPLINE_MAX_ANCHOR_TIME_RATIO,
-            "decision": decision,
-            "reason": (
-                "selected because parabola misses PCHIP anchor"
-                if use_spline and parabola_misses_anchor
-                else "selected because spline improves anchor agreement and weighted RMS"
-                if use_spline and spline_significantly_better
-                else "spline fit is too wiggly for a stable extremum curve"
-                if spline_too_wiggly
-                else "spline curve does not have exactly one extremum"
-                if not spline_has_single_extremum
-                else "spline extremum too far from observed extreme"
-                if spline_too_far
-                else "spline extremum overshoots observed depth"
-                if spline_too_bright
-                else "spline extremum is not plausible"
-                if not spline_valid
-                else "parabola retained"
-            ),
-        }
+
+def select_extremum_candidate(
+    fit_input: ExtremumFitInput,
+    parabola: ExtremumParabolaFit,
+    quality: ExtremumFitQualityMetrics,
+) -> tuple[
+    ExtremumCurveCandidate | None,
+    tuple[dict[str, object], ...],
+    ExtremumPchipAnchor | None,
+]:
+    """Validate all fitted models uniformly, then select the best valid one."""
+
+    anchor = fit_extremum_pchip_anchor(fit_input, parabola)
+    candidates, unavailable_checks = fit_extremum_curve_candidates(
+        fit_input,
+        parabola,
+        quality,
     )
-    if use_spline:
-        checks[0]["decision"] = "replaced"
-        return "spline", spline, tuple(checks), pchip_anchor
-    if parabola_misses_anchor and spline_rejected_for_wiggle_only:
-        checks[0]["decision"] = "selected"
-        checks[0]["reason"] = "parabola retained because spline replacement is not a single-extremum curve"
-        return "parabola", None, tuple(checks), pchip_anchor
-    checks[0]["decision"] = "selected"
-    return "parabola", None, tuple(checks), pchip_anchor
+    checks: list[dict[str, object]] = []
+    valid: list[
+        tuple[float, int, int, ExtremumCurveCandidate, dict[str, object]]
+    ] = []
+    for order, candidate in enumerate(candidates):
+        check = validate_extremum_candidate(
+            fit_input,
+            parabola,
+            quality,
+            candidate,
+            anchor,
+        )
+        checks.append(check)
+        if bool(check["accepted"]):
+            bootstrap = estimate_extremum_candidate_bootstrap(
+                fit_input,
+                parabola,
+                candidate,
+            )
+            check.update(bootstrap)
+            timing_error = float(
+                bootstrap.get("bootstrap_timing_error", float("nan"))
+            )
+            anchor_time_delta = float(
+                check.get("anchor_time_delta", float("nan"))
+            )
+            timing_accuracy = (
+                float(np.hypot(timing_error, anchor_time_delta))
+                if np.isfinite(timing_error) and np.isfinite(anchor_time_delta)
+                else float("nan")
+            )
+            check["bootstrap_timing_accuracy"] = timing_accuracy
+            check["bootstrap_timing_accuracy_seconds"] = (
+                timing_accuracy * 86400.0
+            )
+            selection_eligible = bool(
+                bootstrap.get("bootstrap_stable")
+                and np.isfinite(timing_accuracy)
+                and timing_accuracy >= 0
+            )
+            check["selection_eligible"] = selection_eligible
+            if selection_eligible:
+                valid.append(
+                    (
+                        max(timing_accuracy, EXTREMUM_MODEL_SELECTION_EPSILON),
+                        candidate.parameter_count,
+                        order,
+                        candidate,
+                        check,
+                    )
+                )
+            else:
+                check["decision"] = "uncertainty_unavailable"
+                check["reason"] = (
+                    "valid curve but bootstrap timing uncertainty is unstable"
+                )
+    checks.extend(unavailable_checks)
+    if not valid:
+        return None, tuple(checks), anchor
+    best_timing_error = min(item[0] for item in valid)
+    equivalent_limit = max(
+        best_timing_error * EXTREMUM_MODEL_BOOTSTRAP_EQUIVALENCE_RATIO,
+        best_timing_error + EXTREMUM_MODEL_SELECTION_EPSILON,
+    )
+    equivalent = [item for item in valid if item[0] <= equivalent_limit]
+    (
+        selected_timing_error,
+        _parameter_count,
+        _order,
+        selected,
+        selected_check,
+    ) = min(
+        equivalent,
+        key=lambda item: (item[1], item[0], item[2]),
+    )
+    for check in checks:
+        check["selection_metric"] = "bootstrap_timing_accuracy"
+        check["best_bootstrap_timing_accuracy"] = best_timing_error
+        check["bootstrap_equivalence_limit"] = equivalent_limit
+        if check is selected_check:
+            check["decision"] = "selected"
+            if selected_timing_error <= best_timing_error:
+                check["reason"] = "smallest stable bootstrap timing accuracy"
+            else:
+                check["reason"] = (
+                    "simplest model within the bootstrap timing-accuracy "
+                    "equivalence range"
+                )
+        elif check.get("selection_eligible"):
+            check["decision"] = "not_selected"
+            check["reason"] = (
+                "valid but outside the selected bootstrap timing-accuracy "
+                "rule"
+            )
+    return selected, tuple(checks), anchor
+
+
+def measure_extremum_support_quality(
+    fit_input: ExtremumFitInput,
+    parabola: ExtremumParabolaFit,
+    reference_jd: float,
+    reference_mag: float,
+) -> ExtremumFitQualityMetrics:
+    """Measure selection support around a shape anchor, before model choice."""
+
+    x = np.asarray(fit_input.x, dtype=np.float64)
+    y = np.asarray(fit_input.y, dtype=np.float64)
+    inlier_mask = np.asarray(parabola.inlier_mask, dtype=bool)
+    inlier_x = x[inlier_mask]
+    left_x = inlier_x[inlier_x < reference_jd]
+    right_x = inlier_x[inlier_x > reference_jd]
+    if len(left_x) == 0 or len(right_x) == 0:
+        raise ValueError("reference extremum lacks one flank")
+    left_coverage = float(reference_jd - np.min(left_x))
+    right_coverage = float(np.max(right_x) - reference_jd)
+    time_balance = (
+        min(left_coverage, right_coverage) / max(left_coverage, right_coverage)
+        if max(left_coverage, right_coverage) > 0
+        else 0.0
+    )
+    a, b, c = parabola.coefficients
+    centered_x = x - parabola.x0
+    fitted_y = a * centered_x**2 + b * centered_x + c
+    residuals = y[inlier_mask] - fitted_y[inlier_mask]
+    rms = float(np.sqrt(np.mean(residuals**2)))
+    weighted_rms = float(
+        np.sqrt(
+            np.average(
+                residuals**2,
+                weights=1.0 / parabola.sigma[inlier_mask] ** 2,
+            )
+        )
+    )
+
+    def fitted_mag_at(jd_value: float) -> float:
+        centered = jd_value - parabola.x0
+        return float(a * centered**2 + b * centered + c)
+
+    left_edge_mag = fitted_mag_at(float(np.min(left_x)))
+    right_edge_mag = fitted_mag_at(float(np.max(right_x)))
+    if a > 0:
+        left_prominence = left_edge_mag - reference_mag
+        right_prominence = right_edge_mag - reference_mag
+    else:
+        left_prominence = reference_mag - left_edge_mag
+        right_prominence = reference_mag - right_edge_mag
+    left_prominence = max(0.0, float(left_prominence))
+    right_prominence = max(0.0, float(right_prominence))
+    minimum_prominence = max(
+        EXTREMUM_MINIMUM_PROMINENCE_FLOOR,
+        EXTREMUM_MINIMUM_PROMINENCE_RMS_FACTOR * rms,
+    )
+    maximum_prominence = max(left_prominence, right_prominence)
+    prominence_balance = (
+        min(left_prominence, right_prominence) / maximum_prominence
+        if maximum_prominence > 0
+        else 0.0
+    )
+    inlier_y = y[inlier_mask]
+    inlier_y_min = float(np.min(inlier_y))
+    inlier_y_max = float(np.max(inlier_y))
+    inlier_y_span = inlier_y_max - inlier_y_min
+    vertex_mag_tolerance = max(0.05, 2.0 * rms, 0.25 * inlier_y_span)
+    return ExtremumFitQualityMetrics(
+        left_x=left_x,
+        right_x=right_x,
+        left_coverage=left_coverage,
+        right_coverage=right_coverage,
+        time_balance=float(time_balance),
+        rms=rms,
+        weighted_rms=weighted_rms,
+        left_prominence=left_prominence,
+        right_prominence=right_prominence,
+        minimum_prominence=minimum_prominence,
+        prominence_balance=float(prominence_balance),
+        inlier_y_min=inlier_y_min,
+        inlier_y_max=inlier_y_max,
+        inlier_y_span=inlier_y_span,
+        vertex_mag_tolerance=vertex_mag_tolerance,
+    )
+
+
+def assess_extremum_support(
+    jd_values: object,
+    mag_values: object,
+    mag_errors: object,
+    xmin: float,
+    xmax: float,
+) -> ExtremumSupportAssessment:
+    """Reject unsupported selections without choosing or preferring a model."""
+
+    fit_input = select_extremum_fit_points(
+        jd_values,
+        mag_values,
+        mag_errors,
+        xmin,
+        xmax,
+    )
+    x = np.asarray(fit_input.x, dtype=np.float64)
+
+    def rejected(
+        message: str,
+        reason: str,
+        metrics: dict[str, object],
+        category: str,
+        *,
+        parabola: ExtremumParabolaFit | None = None,
+        quality: ExtremumFitQualityMetrics | None = None,
+        anchor: ExtremumPchipAnchor | None = None,
+        show_attempt: bool = False,
+    ) -> ExtremumSupportAssessment:
+        return ExtremumSupportAssessment(
+            accepted=False,
+            reason=reason,
+            message=message,
+            reject_category=category,
+            metrics=metrics,
+            fit_input=fit_input,
+            parabola=parabola,
+            quality=quality,
+            anchor=anchor,
+            show_attempt=show_attempt,
+        )
+
+    if len(x) < EXTREMUM_MINIMUM_FIT_POINTS:
+        return rejected(
+            (
+                f"Too few points. Select at least {EXTREMUM_MINIMUM_FIT_POINTS}; "
+                f"current: {len(x)}."
+            ),
+            f"too few points ({len(x)}/{EXTREMUM_MINIMUM_FIT_POINTS})",
+            {
+                "selected_points": int(len(x)),
+                "minimum_points": EXTREMUM_MINIMUM_FIT_POINTS,
+            },
+            EXTREMUM_REJECT_HARD,
+        )
+    try:
+        parabola = fit_extremum_parabola_with_current_clipping(fit_input)
+    except Exception as exc:
+        return rejected(
+            f"Reference fit failed: {exc}",
+            f"reference fit failed: {exc}",
+            {"selected_points": int(len(x))},
+            EXTREMUM_REJECT_HARD,
+        )
+    a = float(parabola.coefficients[0])
+    inlier_count = int(np.count_nonzero(parabola.inlier_mask))
+    if not np.isfinite(a) or abs(a) < 1e-8:
+        return rejected(
+            "Curve too linear. Select a clear minimum or maximum.",
+            "selected points too close to linear",
+            {
+                "selected_points": int(len(x)),
+                "inliers": inlier_count,
+                "quadratic_coefficient": a,
+            },
+            EXTREMUM_REJECT_HARD,
+            parabola=parabola,
+        )
+
+    anchor = fit_extremum_pchip_anchor(fit_input, parabola)
+    if anchor is not None and xmin <= anchor.anchor_jd <= xmax:
+        reference_jd = float(anchor.anchor_jd)
+        reference_mag = float(anchor.anchor_mag)
+        reference_source = "pchip_local_extremum"
+    else:
+        reference_jd = float(parabola.vertex_jd)
+        reference_mag = float(parabola.vertex_mag)
+        reference_source = "reference_parabola"
+    if not np.isfinite(reference_jd) or not xmin <= reference_jd <= xmax:
+        return rejected(
+            "No supported extremum inside the selection.",
+            "reference extremum outside selected range",
+            {
+                "selected_points": int(len(x)),
+                "inliers": inlier_count,
+                "reference_jd": reference_jd,
+                "reference_source": reference_source,
+                "parabola_vertex_jd": float(parabola.vertex_jd),
+            },
+            EXTREMUM_REJECT_GEOMETRY,
+            parabola=parabola,
+            anchor=anchor,
+            show_attempt=True,
+        )
+    try:
+        centered_reference = reference_jd - parabola.x0
+        a, b, c = parabola.coefficients
+        support_curve_mag = float(
+            a * centered_reference**2 + b * centered_reference + c
+        )
+        quality = measure_extremum_support_quality(
+            fit_input,
+            parabola,
+            reference_jd,
+            support_curve_mag,
+        )
+    except Exception:
+        return rejected(
+            "Too few points on one flank. Include both sides of the extremum.",
+            "reference extremum lacks one flank",
+            {
+                "selected_points": int(len(x)),
+                "inliers": inlier_count,
+                "reference_jd": reference_jd,
+                "reference_source": reference_source,
+            },
+            EXTREMUM_REJECT_GEOMETRY,
+            parabola=parabola,
+            anchor=anchor,
+            show_attempt=True,
+        )
+    metrics: dict[str, object] = {
+        "selected_points": int(len(x)),
+        "inliers": inlier_count,
+        "reference_jd": reference_jd,
+        "reference_mag": reference_mag,
+        "reference_source": reference_source,
+        "left_points": int(len(quality.left_x)),
+        "right_points": int(len(quality.right_x)),
+        "left_coverage": quality.left_coverage,
+        "right_coverage": quality.right_coverage,
+        "time_balance": quality.time_balance,
+        "rms": quality.rms,
+        "weighted_rms": quality.weighted_rms,
+        "left_prominence": quality.left_prominence,
+        "right_prominence": quality.right_prominence,
+        "minimum_prominence": quality.minimum_prominence,
+        "prominence_balance": quality.prominence_balance,
+    }
+    if (
+        len(quality.left_x) < EXTREMUM_MINIMUM_SIDE_POINTS
+        or len(quality.right_x) < EXTREMUM_MINIMUM_SIDE_POINTS
+    ):
+        return rejected(
+            "Too few points on one flank. Include both sides of the extremum.",
+            (
+                "insufficient side points "
+                f"(left={len(quality.left_x)}, right={len(quality.right_x)})"
+            ),
+            metrics,
+            EXTREMUM_REJECT_GEOMETRY,
+            parabola=parabola,
+            quality=quality,
+            anchor=anchor,
+            show_attempt=True,
+        )
+    selected_width = float(xmax - xmin)
+    minimum_side_coverage = (
+        EXTREMUM_MINIMUM_SIDE_COVERAGE_FRACTION * selected_width
+    )
+    metrics["minimum_side_coverage"] = minimum_side_coverage
+    if (
+        selected_width <= 0
+        or quality.left_coverage < minimum_side_coverage
+        or quality.right_coverage < minimum_side_coverage
+    ):
+        return rejected(
+            "One flank too short. Include both sides of the extremum.",
+            (
+                "insufficient side coverage "
+                f"(left={quality.left_coverage:.8f}, "
+                f"right={quality.right_coverage:.8f}, "
+                f"required={minimum_side_coverage:.8f})"
+            ),
+            metrics,
+            EXTREMUM_REJECT_GEOMETRY,
+            parabola=parabola,
+            quality=quality,
+            anchor=anchor,
+            show_attempt=True,
+        )
+    if quality.time_balance < EXTREMUM_MINIMUM_TIME_BALANCE:
+        return rejected(
+            "Time coverage unbalanced. Select comparable coverage on both sides.",
+            (
+                "unbalanced time coverage "
+                f"(ratio={quality.time_balance:.2f}, "
+                f"required={EXTREMUM_MINIMUM_TIME_BALANCE:.2f})"
+            ),
+            metrics,
+            EXTREMUM_REJECT_GEOMETRY,
+            parabola=parabola,
+            quality=quality,
+            anchor=anchor,
+            show_attempt=True,
+        )
+    if (
+        min(quality.left_prominence, quality.right_prominence)
+        < 0.98 * quality.minimum_prominence
+    ):
+        return rejected(
+            "Extremum too weak. Include both flanks clearly.",
+            (
+                "insufficient prominence "
+                f"(left={quality.left_prominence:.4f}, "
+                f"right={quality.right_prominence:.4f}, "
+                f"required={quality.minimum_prominence:.4f})"
+            ),
+            metrics,
+            EXTREMUM_REJECT_PROMINENCE,
+            parabola=parabola,
+            quality=quality,
+            anchor=anchor,
+            show_attempt=True,
+        )
+    if quality.prominence_balance < EXTREMUM_MINIMUM_PROMINENCE_BALANCE:
+        return rejected(
+            "One flank has no clear prominence. Include both flanks.",
+            (
+                "unbalanced prominence "
+                f"(ratio={quality.prominence_balance:.2f}, "
+                f"required={EXTREMUM_MINIMUM_PROMINENCE_BALANCE:.2f})"
+            ),
+            metrics,
+            EXTREMUM_REJECT_PROMINENCE,
+            parabola=parabola,
+            quality=quality,
+            anchor=anchor,
+            show_attempt=True,
+        )
+
+    sorted_x = np.sort(x)
+    positive_cadence = np.diff(sorted_x)
+    positive_cadence = positive_cadence[positive_cadence > 0]
+    if len(positive_cadence):
+        selected_span = float(np.max(sorted_x) - np.min(sorted_x))
+        median_cadence = float(np.median(positive_cadence))
+        cadence_span = (
+            float("inf")
+            if median_cadence <= 0
+            else selected_span / median_cadence
+        )
+        metrics.update(
+            {
+                "selected_span": selected_span,
+                "median_cadence": median_cadence,
+                "cadence_span": cadence_span,
+            }
+        )
+        if (
+            len(x) <= EXTREMUM_SMALL_WINDOW_MAX_POINTS
+            and np.isfinite(cadence_span)
+            and cadence_span <= EXTREMUM_SMALL_WINDOW_MAX_CADENCE_SPAN
+        ):
+            return rejected(
+                "Fit range too small. Select a wider range with clear flanks.",
+                (
+                    "small unstable fit window "
+                    f"(points={len(x)}, cadence_span={cadence_span:.2f})"
+                ),
+                metrics,
+                EXTREMUM_REJECT_PLAUSIBILITY,
+                parabola=parabola,
+                quality=quality,
+                anchor=anchor,
+                show_attempt=True,
+            )
+
+    context_calculation = ExtremumFitCalculation(
+        accepted=True,
+        reason="support",
+        message="",
+        metrics=metrics,
+    )
+    context_quality = measure_extremum_fit_context_quality(
+        jd_values,
+        mag_values,
+        xmin,
+        xmax,
+        context_calculation,
+    )
+    marginal_asymmetric_prominence = (
+        min(quality.left_prominence, quality.right_prominence)
+        < quality.minimum_prominence
+        <= max(quality.left_prominence, quality.right_prominence)
+        <= 1.25 * quality.minimum_prominence
+    )
+    if (
+        context_quality is not None
+        and not marginal_asymmetric_prominence
+        and len(x) <= EXTREMUM_CONTEXT_MAX_LOCAL_POINTS
+        and context_quality.prominence_to_scatter
+        < (
+            EXTREMUM_CONTEXT_RELAXED_MIN_PROMINENCE_TO_SCATTER
+            if len(x) >= EXTREMUM_CONTEXT_RELAXED_MIN_POINTS
+            else EXTREMUM_CONTEXT_MIN_PROMINENCE_TO_SCATTER
+        )
+    ):
+        required_ratio = (
+            EXTREMUM_CONTEXT_RELAXED_MIN_PROMINENCE_TO_SCATTER
+            if len(x) >= EXTREMUM_CONTEXT_RELAXED_MIN_POINTS
+            else EXTREMUM_CONTEXT_MIN_PROMINENCE_TO_SCATTER
+        )
+        metrics.update(
+            {
+                "context_points": context_quality.context_points,
+                "context_point_to_point_scatter": (
+                    context_quality.point_to_point_scatter
+                ),
+                "context_prominence_to_scatter": (
+                    context_quality.prominence_to_scatter
+                ),
+                "minimum_context_prominence_to_scatter": required_ratio,
+            }
+        )
+        return rejected(
+            "Extremum weak against local scatter. Select a wider range.",
+            (
+                "weak context prominence "
+                f"(ratio={context_quality.prominence_to_scatter:.2f}, "
+                f"required={required_ratio:.2f})"
+            ),
+            metrics,
+            EXTREMUM_REJECT_PLAUSIBILITY,
+            parabola=parabola,
+            quality=quality,
+            anchor=anchor,
+            show_attempt=True,
+        )
+
+    return ExtremumSupportAssessment(
+        accepted=True,
+        reason="supported",
+        message="",
+        reject_category="",
+        metrics=metrics,
+        fit_input=fit_input,
+        parabola=parabola,
+        quality=quality,
+        anchor=anchor,
+    )
 
 
 def calculate_extremum_fit(
@@ -2669,479 +4447,191 @@ def calculate_extremum_fit(
     xmin: float,
     xmax: float,
 ) -> ExtremumFitCalculation:
-    """Run the current extremum-fit calculation without GUI side effects."""
+    """Run extremum support assessment, model fitting, and model selection."""
 
-    fit_input = select_extremum_fit_points(jd_values, mag_values, mag_errors, xmin, xmax)
-    x = fit_input.x
-
-    if len(x) < EXTREMUM_MINIMUM_FIT_POINTS:
-        return rejected_extremum_fit(
-            fit_input,
-            (
-                f"Too few points. Select at least {EXTREMUM_MINIMUM_FIT_POINTS}; "
-                f"current: {len(x)}."
-            ),
-            f"too few points ({len(x)}/{EXTREMUM_MINIMUM_FIT_POINTS})",
-            {
-                "selected_points": len(x),
-                "minimum_points": EXTREMUM_MINIMUM_FIT_POINTS,
-            },
-            reject_category=EXTREMUM_REJECT_HARD,
-        )
-
-    try:
-        parabola = fit_extremum_parabola_with_current_clipping(fit_input)
-    except Exception as exc:
-        return rejected_extremum_fit(
-            fit_input,
-            f"Parabola fit failed: {exc}",
-            f"parabola fit failed: {exc}",
-            {
-                "selected_points": len(x),
-                "minimum_points": EXTREMUM_MINIMUM_FIT_POINTS,
-            },
-            reject_category=EXTREMUM_REJECT_HARD,
-        )
-
-    a, _b, _c = parabola.coefficients
-    inlier_mask = parabola.inlier_mask
-    vertex_jd = parabola.vertex_jd
-    vertex_mag = parabola.vertex_mag
-    if abs(a) < 1e-8:
-        return rejected_extremum_fit(
-            fit_input,
-            "Curve too linear. Select a clear minimum or maximum.",
-            "selected points too close to linear",
-            {
-                "selected_points": len(x),
-                "inliers": int(np.count_nonzero(inlier_mask)),
-                "quadratic_coefficient": float(a),
-            },
-            reject_category=EXTREMUM_REJECT_HARD,
-            parabola=parabola,
-        )
-
-    if vertex_jd < xmin or vertex_jd > xmax:
-        return rejected_extremum_fit(
-            fit_input,
-            "Parabola vertex outside selection. Re-select around the visible extremum.",
-            "vertex outside selected range",
-            {
-                "selected_points": len(x),
-                "inliers": int(np.count_nonzero(inlier_mask)),
-                "vertex_jd": float(vertex_jd),
-                "vertex_mag": float(vertex_mag),
-            },
-            reject_category=EXTREMUM_REJECT_HARD,
-            show_attempt=True,
-            parabola=parabola,
-        )
-
-    inlier_x = x[inlier_mask]
-    left_x = inlier_x[inlier_x < vertex_jd]
-    right_x = inlier_x[inlier_x > vertex_jd]
-    if len(left_x) < EXTREMUM_MINIMUM_SIDE_POINTS or len(right_x) < EXTREMUM_MINIMUM_SIDE_POINTS:
-        return rejected_extremum_fit(
-            fit_input,
-            (
-                f"Too few points on one flank. Need {EXTREMUM_MINIMUM_SIDE_POINTS} per side "
-                f"(left: {len(left_x)}, right: {len(right_x)})."
-            ),
-            f"insufficient side points (left={len(left_x)}, right={len(right_x)})",
-            {
-                "selected_points": len(x),
-                "inliers": int(np.count_nonzero(inlier_mask)),
-                "vertex_jd": float(vertex_jd),
-                "vertex_mag": float(vertex_mag),
-                "left_points": len(left_x),
-                "right_points": len(right_x),
-                "minimum_side_points": EXTREMUM_MINIMUM_SIDE_POINTS,
-            },
-            reject_category=EXTREMUM_REJECT_GEOMETRY,
-            show_attempt=True,
-            parabola=parabola,
-        )
-
-    selected_width = float(xmax - xmin)
-    quality = measure_current_extremum_fit_quality(fit_input, parabola)
-    left_coverage = quality.left_coverage
-    right_coverage = quality.right_coverage
-    minimum_side_coverage = EXTREMUM_MINIMUM_SIDE_COVERAGE_FRACTION * selected_width
-    if (
-        selected_width <= 0
-        or left_coverage < minimum_side_coverage
-        or right_coverage < minimum_side_coverage
-    ):
-        return rejected_extremum_fit(
-            fit_input,
-            (
-                "One flank too short. Include both sides of the extremum."
-            ),
-            (
-                "insufficient side coverage "
-                f"(left={left_coverage:.8f}, right={right_coverage:.8f}, "
-                f"required={minimum_side_coverage:.8f})"
-            ),
-            {
-                "selected_points": len(x),
-                "inliers": int(np.count_nonzero(inlier_mask)),
-                "vertex_jd": float(vertex_jd),
-                "vertex_mag": float(vertex_mag),
-                "left_points": len(left_x),
-                "right_points": len(right_x),
-                "left_coverage": left_coverage,
-                "right_coverage": right_coverage,
-                "minimum_side_coverage": minimum_side_coverage,
-            },
-            reject_category=EXTREMUM_REJECT_GEOMETRY,
-            show_attempt=True,
-            parabola=parabola,
-        )
-
-    time_balance = quality.time_balance
-    if time_balance < EXTREMUM_MINIMUM_TIME_BALANCE:
-        return rejected_extremum_fit(
-            fit_input,
-            (
-                "Time coverage unbalanced. Select comparable coverage on both sides."
-            ),
-            (
-                "unbalanced time coverage "
-                f"(left={left_coverage:.8f}, right={right_coverage:.8f}, "
-                f"required_ratio={EXTREMUM_MINIMUM_TIME_BALANCE:.2f})"
-            ),
-            {
-                "selected_points": len(x),
-                "inliers": int(np.count_nonzero(inlier_mask)),
-                "vertex_jd": float(vertex_jd),
-                "vertex_mag": float(vertex_mag),
-                "left_points": len(left_x),
-                "right_points": len(right_x),
-                "left_coverage": left_coverage,
-                "right_coverage": right_coverage,
-                "time_balance": time_balance,
-                "minimum_time_balance": EXTREMUM_MINIMUM_TIME_BALANCE,
-            },
-            reject_category=EXTREMUM_REJECT_GEOMETRY,
-            show_attempt=True,
-            parabola=parabola,
-        )
-
-    left_prominence = quality.left_prominence
-    right_prominence = quality.right_prominence
-    minimum_prominence = quality.minimum_prominence
-    if max(left_prominence, right_prominence) < 0.98 * minimum_prominence:
-        return rejected_extremum_fit(
-            fit_input,
-            (
-                "Extremum too weak. Include both flanks clearly."
-            ),
-            (
-                "insufficient fit prominence "
-                f"(left={left_prominence:.4f}, right={right_prominence:.4f}, "
-                f"required_one_side={minimum_prominence:.4f})"
-            ),
-            {
-                "selected_points": len(x),
-                "inliers": int(np.count_nonzero(inlier_mask)),
-                "vertex_jd": float(vertex_jd),
-                "vertex_mag": float(vertex_mag),
-                "left_coverage": left_coverage,
-                "right_coverage": right_coverage,
-                "time_balance": time_balance,
-                "rms": quality.rms,
-                "left_prominence": left_prominence,
-                "right_prominence": right_prominence,
-                "minimum_prominence": minimum_prominence,
-            },
-            reject_category=EXTREMUM_REJECT_PROMINENCE,
-            show_attempt=True,
-            parabola=parabola,
-        )
-
-    prominence_balance = quality.prominence_balance
-    if prominence_balance < EXTREMUM_MINIMUM_PROMINENCE_BALANCE:
-        return rejected_extremum_fit(
-            fit_input,
-            (
-                "Flank prominence unbalanced. Select both flanks clearly."
-            ),
-            (
-                "unbalanced fit prominence "
-                f"(left={left_prominence:.4f}, right={right_prominence:.4f}, "
-                f"required_ratio={EXTREMUM_MINIMUM_PROMINENCE_BALANCE:.2f})"
-            ),
-            {
-                "selected_points": len(x),
-                "inliers": int(np.count_nonzero(inlier_mask)),
-                "vertex_jd": float(vertex_jd),
-                "vertex_mag": float(vertex_mag),
-                "left_coverage": left_coverage,
-                "right_coverage": right_coverage,
-                "time_balance": time_balance,
-                "rms": quality.rms,
-                "left_prominence": left_prominence,
-                "right_prominence": right_prominence,
-                "prominence_balance": prominence_balance,
-                "minimum_prominence_balance": EXTREMUM_MINIMUM_PROMINENCE_BALANCE,
-            },
-            reject_category=EXTREMUM_REJECT_PROMINENCE,
-            show_attempt=True,
-            parabola=parabola,
-        )
-
-    vertex_mag_tolerance = quality.vertex_mag_tolerance
-    if (
-        not np.isfinite(vertex_mag)
-        or vertex_mag < quality.inlier_y_min - vertex_mag_tolerance
-        or vertex_mag > quality.inlier_y_max + vertex_mag_tolerance
-    ):
-        return rejected_extremum_fit(
-            fit_input,
-            (
-                "Fitted extremum outside measured magnitude range. "
-                "Select a tighter range around the visible extremum."
-            ),
-            (
-                "vertex magnitude outside selected data range "
-                f"(mag={vertex_mag:.4f}, range={quality.inlier_y_min:.4f}-"
-                f"{quality.inlier_y_max:.4f}, tolerance={vertex_mag_tolerance:.4f})"
-            ),
-            {
-                "selected_points": len(x),
-                "inliers": int(np.count_nonzero(inlier_mask)),
-                "vertex_jd": float(vertex_jd),
-                "vertex_mag": float(vertex_mag),
-                "left_coverage": left_coverage,
-                "right_coverage": right_coverage,
-                "time_balance": time_balance,
-                "rms": quality.rms,
-                "left_prominence": left_prominence,
-                "right_prominence": right_prominence,
-                "prominence_balance": prominence_balance,
-                "inlier_mag_min": quality.inlier_y_min,
-                "inlier_mag_max": quality.inlier_y_max,
-                "vertex_mag_tolerance": vertex_mag_tolerance,
-            },
-            reject_category=EXTREMUM_REJECT_PLAUSIBILITY,
-            show_attempt=True,
-            parabola=parabola,
-        )
-
-    selected_model, spline, model_checks, pchip_anchor = choose_extremum_model(fit_input, parabola, quality)
-    anchor_result_metadata: dict[str, object] = {}
-    if pchip_anchor is not None:
-        anchor_result_metadata = {
-            "fit_anchor_jd": pchip_anchor.anchor_jd,
-            "fit_anchor_mag": pchip_anchor.anchor_mag,
-            "fit_anchor_observed_jd": pchip_anchor.observed_extreme_jd,
-            "fit_anchor_observed_mag": pchip_anchor.observed_extreme_mag,
-            "fit_anchor_time_tolerance": pchip_anchor.time_tolerance,
-            "fit_anchor_mag_tolerance": pchip_anchor.mag_tolerance,
-        }
-    if selected_model == "spline" and spline is not None:
-        current = accepted_extremum_fit(
-            fit_input,
-            parabola,
-            quality,
-            model_name="spline",
-            vertex_jd=spline.vertex_jd,
-            vertex_mag=spline.vertex_mag,
-            vertex_jd_error=spline.vertex_jd_error,
-            vertex_mag_error=spline.vertex_mag_error,
-            fit_plot_jd=spline.fit_plot_jd,
-            fit_plot_mag=spline.fit_plot_mag,
-            rms=spline.rms,
-            weighted_rms=spline.weighted_rms,
-            model_metrics={
-                "spline_smoothing": spline.smoothing,
-                "spline_left_points": spline.left_points,
-                "spline_right_points": spline.right_points,
-                "spline_left_coverage": spline.left_coverage,
-                "spline_right_coverage": spline.right_coverage,
-                "spline_jd_error": spline.vertex_jd_error,
-                "spline_mag_error": spline.vertex_mag_error,
-            },
-            result_model_metadata=anchor_result_metadata,
-            model_checks=model_checks,
-        )
-    else:
-        current = accepted_extremum_fit(
-            fit_input,
-            parabola,
-            quality,
-            model_name="parabola",
-            result_model_metadata=anchor_result_metadata,
-            model_checks=model_checks,
-        )
-    if selected_model != "spline":
-        parabola_check = next(
-            (check for check in model_checks if check.get("model") == "parabola"),
-            {},
-        )
-        spline_check = next(
-            (check for check in model_checks if check.get("model") == "spline"),
-            {},
-        )
-        parabola_misses_anchor_after_model_check = (
-            float(parabola_check.get("vertex_extreme_delta", 0.0))
-            > float(parabola_check.get("vertex_extreme_tolerance", float("inf")))
-            or float(parabola_check.get("anchor_mag_delta", 0.0))
-            > float(parabola_check.get("anchor_mag_tolerance", float("inf")))
-            or float(parabola_check.get("anchor_time_delta", 0.0))
-            > float(parabola_check.get("anchor_time_tolerance", float("inf")))
-        )
-        spline_is_not_clean_replacement = (
-            spline_check.get("accepted") is False
-            and spline_check.get("decision") in {"rejected", "unavailable"}
-        )
-        weak_flank_prominence = min(left_prominence, right_prominence)
-        required_anchor_miss_prominence = (
-            EXTREMUM_ANCHOR_MISS_MIN_PROMINENCE_FACTOR * minimum_prominence
-        )
-        if (
-            parabola_misses_anchor_after_model_check
-            and spline_is_not_clean_replacement
-            and weak_flank_prominence < required_anchor_miss_prominence
-        ):
-            metrics = dict(current.metrics)
-            metrics.update(
-                {
-                    "weak_flank_prominence": weak_flank_prominence,
-                    "required_anchor_miss_prominence": required_anchor_miss_prominence,
-                    "anchor_miss_min_prominence_factor": EXTREMUM_ANCHOR_MISS_MIN_PROMINENCE_FACTOR,
-                    "parabola_anchor_mag_delta": parabola_check.get("anchor_mag_delta", float("nan")),
-                    "parabola_anchor_mag_tolerance": parabola_check.get("anchor_mag_tolerance", float("nan")),
-                    "parabola_vertex_extreme_delta": parabola_check.get("vertex_extreme_delta", float("nan")),
-                    "parabola_vertex_extreme_tolerance": parabola_check.get("vertex_extreme_tolerance", float("nan")),
-                    "spline_decision": spline_check.get("decision", ""),
-                    "spline_reason": spline_check.get("reason", ""),
-                }
-            )
-            return rejected_extremum_fit(
-                fit_input,
-                (
-                    "Parabola misses local extremum; one flank weak; no clean "
-                    "single-extremum spline. Select a wider or better-centered range."
-                ),
-                (
-                    "anchor miss with weak flank prominence "
-                    f"(weak={weak_flank_prominence:.4f}, "
-                    f"required={required_anchor_miss_prominence:.4f})"
-                ),
-                metrics,
-                reject_category=EXTREMUM_REJECT_PLAUSIBILITY,
-                show_attempt=True,
-                parabola=parabola,
-                model_checks=model_checks,
-            )
-    if len(x) < 2:
-        return current
-    sorted_x = np.sort(x)
-    cadence = np.diff(sorted_x)
-    positive_cadence = cadence[cadence > 0]
-    if len(positive_cadence) == 0:
-        return current
-
-    selected_span = float(np.max(sorted_x) - np.min(sorted_x))
-    median_cadence = float(np.median(positive_cadence))
-    cadence_span = float("inf") if median_cadence <= 0 else selected_span / median_cadence
-    if (
-        len(x) <= EXTREMUM_SMALL_WINDOW_MAX_POINTS
-        and np.isfinite(cadence_span)
-        and cadence_span <= EXTREMUM_SMALL_WINDOW_MAX_CADENCE_SPAN
-    ):
-        try:
-            parabola = fit_extremum_parabola_with_current_clipping(fit_input)
-        except Exception:
-            parabola = None
-        metrics = dict(current.metrics)
-        metrics.update(
-            {
-                "selected_span": selected_span,
-                "median_cadence": median_cadence,
-                "cadence_span": cadence_span,
-                "small_window_max_points": EXTREMUM_SMALL_WINDOW_MAX_POINTS,
-                "small_window_max_cadence_span": EXTREMUM_SMALL_WINDOW_MAX_CADENCE_SPAN,
-            }
-        )
-        return rejected_extremum_fit(
-            fit_input,
-            (
-                "Fit range too small. Select a wider range with clear flanks."
-            ),
-            (
-                "small unstable fit window "
-                f"(points={len(x)}, cadence_span={cadence_span:.2f}, "
-                f"required_points>{EXTREMUM_SMALL_WINDOW_MAX_POINTS} or "
-                f"cadence_span>{EXTREMUM_SMALL_WINDOW_MAX_CADENCE_SPAN:.1f})"
-            ),
-            metrics,
-            reject_category=EXTREMUM_REJECT_PLAUSIBILITY,
-            show_attempt=True,
-            parabola=parabola,
-        )
-
-    context_quality = measure_extremum_fit_context_quality(
+    support = assess_extremum_support(
         jd_values,
         mag_values,
+        mag_errors,
         xmin,
         xmax,
-        current,
     )
-    if (
-        context_quality is not None
-        and current.model_name != "spline"
-        and not current.metrics.get("marginal_asymmetric_prominence", False)
-        and len(x) <= EXTREMUM_CONTEXT_MAX_LOCAL_POINTS
-        and context_quality.prominence_to_scatter
-        < (
-            EXTREMUM_CONTEXT_RELAXED_MIN_PROMINENCE_TO_SCATTER
-            if len(x) >= EXTREMUM_CONTEXT_RELAXED_MIN_POINTS
-            else EXTREMUM_CONTEXT_MIN_PROMINENCE_TO_SCATTER
+    if not support.accepted:
+        return rejected_extremum_fit(
+            support.fit_input,
+            support.message,
+            support.reason,
+            support.metrics,
+            reject_category=support.reject_category,
+            show_attempt=support.show_attempt,
+            parabola=support.parabola,
         )
-    ):
-        try:
-            parabola = fit_extremum_parabola_with_current_clipping(fit_input)
-        except Exception:
-            parabola = None
-        metrics = dict(current.metrics)
+    parabola = support.parabola
+    quality = support.quality
+    if parabola is None or quality is None:
+        return rejected_extremum_fit(
+            support.fit_input,
+            "Extremum support assessment is incomplete.",
+            "incomplete support assessment",
+            support.metrics,
+            reject_category=EXTREMUM_REJECT_HARD,
+        )
+    selected, model_checks, anchor = select_extremum_candidate(
+        support.fit_input,
+        parabola,
+        quality,
+    )
+    if selected is None:
+        has_valid_curve = any(
+            bool(check.get("accepted"))
+            for check in model_checks
+        )
+        candidate_reasons = tuple(
+            str(check.get("reason", ""))
+            for check in model_checks
+            if check.get("decision") in {"rejected", "uncertainty_unavailable"}
+        )
+        metrics = dict(support.metrics)
         metrics.update(
             {
-                "context_points": context_quality.context_points,
-                "context_min_jd": context_quality.context_min_jd,
-                "context_max_jd": context_quality.context_max_jd,
-                "context_point_to_point_scatter": context_quality.point_to_point_scatter,
-                "context_minimum_fit_prominence": context_quality.minimum_fit_prominence,
-                "context_prominence_to_scatter": context_quality.prominence_to_scatter,
-                "minimum_context_prominence_to_scatter": (
-                    EXTREMUM_CONTEXT_RELAXED_MIN_PROMINENCE_TO_SCATTER
-                    if len(x) >= EXTREMUM_CONTEXT_RELAXED_MIN_POINTS
-                    else EXTREMUM_CONTEXT_MIN_PROMINENCE_TO_SCATTER
+                "candidate_count": sum(
+                    1
+                    for check in model_checks
+                    if check.get("decision") != "unavailable"
                 ),
-                "context_max_local_points": EXTREMUM_CONTEXT_MAX_LOCAL_POINTS,
-                "context_relaxed_min_points": EXTREMUM_CONTEXT_RELAXED_MIN_POINTS,
+                "candidate_reasons": candidate_reasons,
             }
         )
-        required_context_prominence = metrics["minimum_context_prominence_to_scatter"]
         return rejected_extremum_fit(
-            fit_input,
+            support.fit_input,
             (
-                "Extremum weak against local scatter. "
-                "Select a wider range with clear curve shape."
+                "No curve model yields a stable extremum time for this selection."
+                if has_valid_curve
+                else "No curve model yields a plausible extremum for this selection."
             ),
             (
-                "weak context prominence "
-                f"(prominence_to_scatter={context_quality.prominence_to_scatter:.2f}, "
-                f"required={required_context_prominence:.2f})"
+                "no model with stable bootstrap timing accuracy"
+                if has_valid_curve
+                else "no valid extremum model"
             ),
             metrics,
             reject_category=EXTREMUM_REJECT_PLAUSIBILITY,
             show_attempt=True,
             parabola=parabola,
+            model_checks=model_checks,
         )
 
-    return current
+    candidate_names = tuple(
+        str(check["model"])
+        for check in model_checks
+        if check.get("decision") != "unavailable"
+    )
+    result_metadata: dict[str, object] = {
+        "fit_model_candidates": candidate_names,
+        "fit_model_parameter_count": selected.parameter_count,
+        "fit_model_selection": "minimum_stable_bootstrap_timing_accuracy",
+        "fit_model_bootstrap_samples": EXTREMUM_MODEL_BOOTSTRAP_SAMPLES,
+        "fit_model_bootstrap_equivalence_ratio": (
+            EXTREMUM_MODEL_BOOTSTRAP_EQUIVALENCE_RATIO
+        ),
+        "fit_coefficients": selected.metadata.get(
+            "linear_coefficients",
+            parabola.coefficients,
+        ),
+        "fit_support_reference_jd": support.metrics["reference_jd"],
+        "fit_support_reference_mag": support.metrics["reference_mag"],
+        "fit_support_reference_source": support.metrics["reference_source"],
+    }
+    if anchor is not None:
+        result_metadata.update(
+            {
+                "fit_anchor_jd": anchor.anchor_jd,
+                "fit_anchor_mag": anchor.anchor_mag,
+                "fit_anchor_observed_jd": anchor.observed_extreme_jd,
+                "fit_anchor_observed_mag": anchor.observed_extreme_mag,
+                "fit_anchor_time_tolerance": anchor.time_tolerance,
+                "fit_anchor_mag_tolerance": anchor.mag_tolerance,
+            }
+        )
+    selected_check = next(
+        (
+            check
+            for check in model_checks
+            if check.get("model") == selected.model_name
+            and check.get("decision") == "selected"
+        ),
+        {},
+    )
+    result_metadata.update(
+        {
+            "fit_model_bootstrap_timing_error": selected_check.get(
+                "bootstrap_timing_error",
+                float("nan"),
+            ),
+            "fit_model_bootstrap_timing_accuracy": selected_check.get(
+                "bootstrap_timing_accuracy",
+                float("nan"),
+            ),
+            "fit_model_bootstrap_success_fraction": selected_check.get(
+                "bootstrap_success_fraction",
+                float("nan"),
+            ),
+        }
+    )
+    model_metrics = {
+        **support.metrics,
+        "model": selected.model_name,
+        "model_parameter_count": selected.parameter_count,
+        "model_information_score": selected_check.get(
+            "information_score",
+            float("nan"),
+        ),
+        "model_bootstrap_timing_error": selected_check.get(
+            "bootstrap_timing_error",
+            float("nan"),
+        ),
+        "model_bootstrap_timing_error_seconds": selected_check.get(
+            "bootstrap_timing_error_seconds",
+            float("nan"),
+        ),
+        "model_bootstrap_timing_accuracy": selected_check.get(
+            "bootstrap_timing_accuracy",
+            float("nan"),
+        ),
+        "model_bootstrap_timing_accuracy_seconds": selected_check.get(
+            "bootstrap_timing_accuracy_seconds",
+            float("nan"),
+        ),
+        "model_bootstrap_success_fraction": selected_check.get(
+            "bootstrap_success_fraction",
+            float("nan"),
+        ),
+        "model_selection_metric": "bootstrap_timing_accuracy",
+        **selected.metadata,
+    }
+    return accepted_extremum_fit(
+        support.fit_input,
+        parabola,
+        quality,
+        model_name=selected.model_name,
+        vertex_jd=selected.vertex_jd,
+        vertex_mag=selected.vertex_mag,
+        vertex_jd_error=selected.vertex_jd_error,
+        vertex_mag_error=selected.vertex_mag_error,
+        bootstrap_vertex_jd_error=float(
+            selected_check.get("bootstrap_timing_accuracy", float("nan"))
+        ),
+        bootstrap_vertex_mag_error=float(
+            selected_check.get("bootstrap_magnitude_error", float("nan"))
+        ),
+        fit_plot_jd=selected.fit_plot_jd,
+        fit_plot_mag=selected.fit_plot_mag,
+        rms=selected.rms,
+        weighted_rms=selected.weighted_rms,
+        model_metrics=model_metrics,
+        result_model_metadata=result_metadata,
+        model_checks=model_checks,
+    )
 
 
 def read_result_metadata_header(path: Path) -> dict[str, str]:
@@ -10070,6 +11560,7 @@ class LightCurveWindow(QWidget):
         self.automatic_module: object | None = None
         self.lightcurve_results_module: object | None = None
         self.result_browser_dialog: QDialog | None = None
+        self.bav_result_browser_dialog: QDialog | None = None
         self.batch_tab: QWidget | None = None
 
         self._build_ui()
@@ -10104,7 +11595,7 @@ class LightCurveWindow(QWidget):
 
         cfa_stack_script = Path(__file__).with_name("SeePhot_CFA.py")
         if cfa_stack_script.exists():
-            cfa_group = QGroupBox("1. Original Seestar CFA")
+            cfa_group = QGroupBox("1. Prepare Seestar FITS")
             cfa_layout = QVBoxLayout(cfa_group)
             self.cfa_stack_button = QPushButton("CFA Channels / Stack")
             self.cfa_stack_button.clicked.connect(
@@ -10116,9 +11607,9 @@ class LightCurveWindow(QWidget):
             )
             cfa_layout.addWidget(self.cfa_stack_button, alignment=Qt.AlignmentFlag.AlignLeft)
             input_layout.addWidget(cfa_group)
-            self.append_log(f"Optional CFA stack script available: {cfa_stack_script.name}.")
+            self.append_log(f"CFA stack script available: {cfa_stack_script.name}.")
 
-        source_group = QGroupBox("2. Prepared FITS Folder")
+        source_group = QGroupBox("2. Detect Variables")
         self.source_group = source_group
         source_layout = QFormLayout(source_group)
         source_layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -10138,10 +11629,8 @@ class LightCurveWindow(QWidget):
         self.source_path_label = QLabel("FITS directory:")
         source_layout.addRow(self.source_path_label, source_row)
         source_layout.addRow("Status:", self.scan_label)
-        input_layout.addWidget(source_group)
 
-        detect_group = QGroupBox("3. Detect Variables")
-        detect_layout = QHBoxLayout(detect_group)
+        detect_layout = QHBoxLayout()
         self.prepare_button = QPushButton("Run")
         self.prepare_button.setEnabled(False)
         self.prepare_button.clicked.connect(self.prepare_sequence)
@@ -10155,18 +11644,19 @@ class LightCurveWindow(QWidget):
             QSizePolicy.Policy.Preferred,
         )
         detect_layout.addWidget(self.prepare_description_label, stretch=1)
-        input_layout.addWidget(detect_group)
+        source_layout.addRow(detect_layout)
+        input_layout.addWidget(source_group)
 
         automatic_script = Path(__file__).with_name("sp_mod_auto.py")
         if automatic_script.exists():
-            automatic_group = QGroupBox("Automatic Assistant")
+            automatic_group = QGroupBox("CFA/Stack Batch")
             automatic_layout = QHBoxLayout(automatic_group)
-            self.automatic_button = QPushButton("Automatic Run...")
+            self.automatic_button = QPushButton("Configure...")
             self.automatic_button.clicked.connect(self.open_automatic_runner)
             automatic_layout.addWidget(self.automatic_button)
             automatic_layout.addStretch(1)
             input_layout.insertWidget(0, automatic_group)
-            self.append_log(f"Optional Automatic script available: {automatic_script.name}.")
+            self.append_log(f"Optional CFA/Stack Batch module available: {automatic_script.name}.")
 
         input_layout.addStretch(1)
 
@@ -10475,12 +11965,12 @@ class LightCurveWindow(QWidget):
 
         tabs.addTab(input_tab, "Prepare")
         tabs.addTab(varstar_tab, "Variables")
+        self.add_optional_batch_tab()
         tabs.addTab(lightcurve_tab, "Photometry")
         tabs.addTab(export_tab, "Export")
         self.add_optional_qc_tab()
         self.add_optional_bav_tab()
         self.add_optional_archive_tab()
-        self.add_optional_batch_tab()
 
     def add_optional_qc_tab(self) -> None:
         """Load an optional QC tab from sp_mod_qc.py if present."""
@@ -10682,6 +12172,7 @@ class LightCurveWindow(QWidget):
             "get_photometry_mode": lambda: self.photometry_mode,
             "get_current_lightcurve": self.current_export_lightcurve,
             "set_current_lightcurve": self.set_current_lightcurve_from_plugin,
+            "open_bav_results_folder": self.open_bav_result_browser,
             "get_diagnostic_result_csv": self.diagnostic_result_csv,
             "instrumental_csv_for_result_csv": self.instrumental_csv_for_result_csv,
             "frame_search_directories_for_result_csv": self.frame_search_directories_for_result_csv,
@@ -10840,7 +12331,7 @@ class LightCurveWindow(QWidget):
             self.finish_busy_action(state)
 
     def load_cfa_stack_module(self) -> object:
-        """Load the optional SeePhot_CFA.py module once for manual and automatic use."""
+        """Load the optional SeePhot_CFA.py module once for manual and batch use."""
 
         script_path = Path(__file__).with_name("SeePhot_CFA.py")
         if not script_path.exists():
@@ -10899,11 +12390,11 @@ class LightCurveWindow(QWidget):
             QMessageBox.warning(self, "CFA Channels / Stack", message)
 
     def open_automatic_runner(self) -> None:
-        """Open sp_mod_auto.py when the optional assistant module is available."""
+        """Open the optional CFA/Stack Batch dialog from sp_mod_auto.py."""
 
         script_path = Path(__file__).with_name("sp_mod_auto.py")
         if not script_path.exists():
-            QMessageBox.warning(self, "Automatic Run", f"Script not found:\n{script_path}")
+            QMessageBox.warning(self, "CFA/Stack Batch", f"Script not found:\n{script_path}")
             return
 
         try:
@@ -10926,9 +12417,9 @@ class LightCurveWindow(QWidget):
 
             open_dialog(self.qc_plugin_context(), self)
         except Exception as exc:
-            message = f"Could not open Automatic Run.\n\n{exc}"
+            message = f"Could not open CFA/Stack Batch.\n\n{exc}"
             self.append_log(f"WARNING: {message.replace(chr(10), ' ')}")
-            QMessageBox.warning(self, "Automatic Run", message)
+            QMessageBox.warning(self, "CFA/Stack Batch", message)
 
     def on_cfa_stack_result_ready(self, result_dir: str) -> None:
         """Use a completed CFA/stack result as the selected FITS directory."""
@@ -10959,10 +12450,10 @@ class LightCurveWindow(QWidget):
         selected_plan_suffixes: Iterable[str],
         allow_overwrite: bool = False,
     ) -> bool:
-        """Start CFA/stack preprocessing for the optional Automatic assistant."""
+        """Start CFA/stack preprocessing for the optional multi-folder batch."""
 
         if self.automatic_stack_worker is not None and self.automatic_stack_worker.isRunning():
-            message = "Automatic CFA Channels / Stack is already running."
+            message = "CFA/Stack Batch is already running."
             self.append_log(f"ERROR: {message}")
             self.automatic_stack_finished.emit(False, message, {})
             return False
@@ -10991,7 +12482,7 @@ class LightCurveWindow(QWidget):
 
             values = tuple(int(value) for value in plan_values)
             if len(values) != 2:
-                raise ValueError("Automatic stack plan values must contain exactly two numbers.")
+                raise ValueError("CFA/Stack Batch plan values must contain exactly two numbers.")
             available_plans = build_stack_plans(str(plan_mode), values)
             requested_suffixes = {str(suffix) for suffix in selected_plan_suffixes}
             selected_plans = tuple(
@@ -11009,7 +12500,7 @@ class LightCurveWindow(QWidget):
             needs_cfa_split = frames_need_cfa_split(source_frames)
             if not needs_cfa_split:
                 self.append_log(
-                    "WARNING: Automatic CFA Channels / Stack source does not look like CFA/Bayer input; "
+                    "WARNING: CFA/Stack Batch source does not look like CFA/Bayer input; "
                     "stack result will not use a channel suffix."
                 )
             existing_dirs = existing_result_dirs_for_run(
@@ -11029,7 +12520,7 @@ class LightCurveWindow(QWidget):
 
             if not self.begin_busy_action(
                 "STACK_RUNNING",
-                "Automatic Run: running CFA Channels / Stack.",
+                "CFA/Stack Batch is running.",
             ):
                 message = "Main app is busy."
                 self.automatic_stack_finished.emit(False, message, {})
@@ -11043,10 +12534,10 @@ class LightCurveWindow(QWidget):
                 True,
             )
             self.automatic_stack_worker = worker
-            worker.log.connect(lambda message: self.append_log(f"Automatic CFA Channels / Stack: {message}"))
+            worker.log.connect(lambda message: self.append_log(f"CFA/Stack Batch: {message}"))
             worker.finished.connect(self.on_automatic_stack_finished)
             self.append_log(
-                "Automatic CFA Channels / Stack selected: "
+                "CFA/Stack Batch selected: "
                 f"channels={', '.join(channels)}, "
                 f"groups={', '.join(plan.name for plan in selected_plans)}."
             )
@@ -11054,12 +12545,12 @@ class LightCurveWindow(QWidget):
             return True
         except Exception as exc:
             message = str(exc)
-            self.append_log(f"ERROR: Automatic CFA Channels / Stack could not start: {message}")
+            self.append_log(f"ERROR: CFA/Stack Batch could not start: {message}")
             self.automatic_stack_finished.emit(False, message, {})
             return False
 
     def on_automatic_stack_finished(self, success: bool, message: str, latest_result_dir: str = "") -> None:
-        """Report completion of an Automatic CFA/stack run."""
+        """Report completion of a CFA/Stack Batch run."""
 
         self.automatic_stack_worker = None
         self.finish_busy_action("STACK_RUNNING")
@@ -11068,13 +12559,13 @@ class LightCurveWindow(QWidget):
         result_dir = Path(latest_result_dir).expanduser() if latest_result_dir else None
         if success and result_dir is not None and result_dir.is_dir():
             payload["result_dir"] = str(result_dir)
-            self.append_log(f"Automatic CFA Channels / Stack finished: {result_dir}")
+            self.append_log(f"CFA/Stack Batch finished: {result_dir}")
             self.automatic_stack_finished.emit(True, str(result_dir), payload)
             return
 
         if success:
             message = "CFA Channels / Stack finished, but no result folder was found."
-        self.append_log(f"ERROR: Automatic CFA Channels / Stack failed: {message}")
+        self.append_log(f"ERROR: CFA/Stack Batch failed: {message}")
         self.automatic_stack_finished.emit(False, message, payload)
 
     def current_extremum_fit(self) -> dict[str, object] | None:
@@ -11709,7 +13200,6 @@ class LightCurveWindow(QWidget):
         self.reset_scan_state()
         self.source_dir_edit.clear()
         if self.photometry_mode == MODE_SINGLE_MEASUREMENT:
-            self.source_group.setTitle("2. Prepared FITS File")
             self.source_path_label.setText("FITS file:")
             self.source_dir_edit.setPlaceholderText("Select one plate-solved or solvable FITS image")
             self.scan_label.setText("No FITS file selected.")
@@ -11723,7 +13213,6 @@ class LightCurveWindow(QWidget):
             else:
                 self.append_log("Mode changed: Single Measurement.")
         else:
-            self.source_group.setTitle("2. Prepared FITS Folder")
             self.source_path_label.setText("FITS directory:")
             self.source_dir_edit.setPlaceholderText("Select the folder containing FITS images")
             self.scan_label.setText("No input directory selected.")
@@ -12098,13 +13587,13 @@ class LightCurveWindow(QWidget):
         self.scan_selected_directory()
 
     def set_source_directory_for_automation(self, directory: str | Path) -> bool:
-        """Set a prepared light-curve source directory for the optional Automatic assistant."""
+        """Select the last successful CFA/Stack Batch result as input."""
 
         if self.busy_context_change_message("load another source") is not None:
             return False
         path = Path(directory).expanduser()
         if not path.is_dir():
-            self.append_log(f"ERROR: Automatic source directory not found: {path}")
+            self.append_log(f"ERROR: CFA/Stack Batch result directory not found: {path}")
             return False
         if self.photometry_mode != MODE_LIGHTCURVE:
             index = self.mode_combo.findData(MODE_LIGHTCURVE)
@@ -12112,7 +13601,7 @@ class LightCurveWindow(QWidget):
                 self.mode_combo.setCurrentIndex(index)
         self.remember_source_dialog_directory(path)
         self.source_dir_edit.setText(str(path))
-        self.append_log(f"Automatic source directory selected: {path}")
+        self.append_log(f"CFA/Stack Batch result directory selected: {path}")
         self.scan_selected_directory(force=True)
         return self.current_scan is not None and self.current_scan.first_fits is not None
 
@@ -15077,15 +16566,35 @@ class LightCurveWindow(QWidget):
         if busy_message is not None:
             QMessageBox.information(self, "Operation Running", busy_message)
             return
-        if self.result_browser_dialog is not None and self.result_browser_dialog.isVisible():
-            self.result_browser_dialog.raise_()
-            self.result_browser_dialog.activateWindow()
+        self._open_result_browser(bav_only=False)
+
+    def open_bav_result_browser(self) -> None:
+        """Select a result CSV with existing BAV exports."""
+
+        busy_message = self.busy_context_change_message("load another result source")
+        if busy_message is not None:
+            QMessageBox.information(self, "Operation Running", busy_message)
+            return
+        self._open_result_browser(bav_only=True)
+
+    def _open_result_browser(self, *, bav_only: bool) -> None:
+        """Select a result CSV from a scanned folder, optionally requiring BAV files."""
+
+        dialog_attribute = (
+            "bav_result_browser_dialog" if bav_only else "result_browser_dialog"
+        )
+        existing_dialog = getattr(self, dialog_attribute)
+        if existing_dialog is not None and existing_dialog.isVisible():
+            existing_dialog.raise_()
+            existing_dialog.activateWindow()
             return
 
+        window_title = "BAV Results" if bav_only else "Open Result"
+        item_label = "BAV result(s)" if bav_only else "result(s)"
         start_dir = self.current_results_directory() or self.current_source_directory() or Path.home()
         selected = QFileDialog.getExistingDirectory(
             self,
-            "Open Result Folder",
+            "Open BAV Results Folder" if bav_only else "Open Result Folder",
             str(start_dir),
         )
         if not selected:
@@ -15095,29 +16604,161 @@ class LightCurveWindow(QWidget):
         try:
             if self.lightcurve_results_module is None:
                 self.lightcurve_results_module = load_lightcurve_results_module()
-            discover_results = getattr(self.lightcurve_results_module, "discover_lightcurve_results")
-            candidates = list(discover_results(results_dir))
+            discovery_name = (
+                "discover_bav_lightcurve_results"
+                if bav_only
+                else "discover_lightcurve_results"
+            )
+            discover_results = getattr(self.lightcurve_results_module, discovery_name)
         except Exception as exc:
-            QMessageBox.warning(self, "Open Result", f"Could not scan result folder:\n{exc}")
+            QMessageBox.warning(
+                self,
+                window_title,
+                f"Could not scan result folder:\n{exc}",
+            )
             self.append_log(f"WARNING: Result folder scan failed: {exc}")
             return
 
+        def scan_results_folder() -> tuple[list[object], object | None]:
+            detailed_discovery = getattr(
+                self.lightcurve_results_module,
+                "discover_lightcurve_results_with_diagnostics",
+                None,
+            )
+            if not callable(detailed_discovery):
+                return list(discover_results(results_dir)), None
+
+            progress_dialog = QProgressDialog(
+                "Scanning result folders...",
+                "Cancel",
+                0,
+                0,
+                self,
+            )
+            progress_dialog.setWindowTitle(window_title)
+            progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            progress_dialog.setMinimumDuration(400)
+            progress_dialog.setAutoClose(False)
+            progress_dialog.setAutoReset(False)
+            scan_running = {"active": True}
+
+            def show_progress_if_running() -> None:
+                if scan_running["active"]:
+                    progress_dialog.show()
+
+            def update_progress(folder_count: int, result_count: int) -> None:
+                progress_dialog.setLabelText(
+                    f"Scanning result folders: {folder_count}\n"
+                    f"Result CSVs found: {result_count}"
+                )
+                QApplication.processEvents()
+
+            QTimer.singleShot(400, show_progress_if_running)
+            try:
+                report = detailed_discovery(
+                    results_dir,
+                    bav_only=bav_only,
+                    include_archive=bav_only,
+                    progress_callback=update_progress,
+                    cancel_requested=progress_dialog.wasCanceled,
+                )
+            finally:
+                scan_running["active"] = False
+                progress_dialog.close()
+                progress_dialog.deleteLater()
+            return list(report.candidates), report
+
+        def scan_report_text(report: object | None) -> str:
+            if report is None:
+                return ""
+            details = [
+                f"{getattr(report, 'folders_scanned', 0)} folder(s) scanned",
+                f"{getattr(report, 'result_csv_found', 0)} result CSV(s) found",
+            ]
+            issue_count = len(getattr(report, "issues", ()))
+            symlink_count = int(getattr(report, "symlink_directories_skipped", 0))
+            archive_count = int(getattr(report, "archive_directories_skipped", 0))
+            if bool(getattr(report, "cancelled", False)):
+                details.append("CANCELLED: partial list")
+            if issue_count:
+                details.append(f"WARNING: {issue_count} path(s) unreadable")
+            if symlink_count:
+                details.append(f"{symlink_count} linked folder(s) skipped")
+            if archive_count:
+                details.append(f"{archive_count} archive folder(s) skipped")
+            return " | ".join(details)
+
+        def scan_report_is_incomplete(report: object | None) -> bool:
+            if report is None:
+                return False
+            return bool(
+                getattr(report, "cancelled", False)
+                or getattr(report, "issues", ())
+                or getattr(report, "symlink_directories_skipped", 0)
+            )
+
+        def log_scan_report(report: object | None) -> None:
+            if report is None:
+                return
+            self.append_log(f"{window_title} scan: {scan_report_text(report)}")
+            issues = tuple(getattr(report, "issues", ()))
+            for issue in issues[:20]:
+                self.append_log(
+                    f"WARNING: Result scan could not read {issue.path}: {issue.message}"
+                )
+            if len(issues) > 20:
+                self.append_log(
+                    f"WARNING: {len(issues) - 20} additional result scan issue(s) omitted."
+                )
+
+        try:
+            candidates, scan_report = scan_results_folder()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                window_title,
+                f"Could not scan result folder:\n{exc}",
+            )
+            self.append_log(f"WARNING: Result folder scan failed: {exc}")
+            return
+        log_scan_report(scan_report)
+
         if not candidates:
-            QMessageBox.information(self, "Open Result", "No light-curve result CSVs found.")
-            self.append_log(f"No light-curve result CSVs found in: {results_dir}")
+            message = (
+                "No light-curve result CSVs with BAV output files found."
+                if bav_only
+                else "No light-curve result CSVs found."
+            )
+            report_text = scan_report_text(scan_report)
+            if report_text:
+                message = f"{message}\n\n{report_text}"
+            message_box = QMessageBox.warning if scan_report_is_incomplete(scan_report) else QMessageBox.information
+            message_box(self, window_title, message)
+            self.append_log(f"{message} Folder: {results_dir}")
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Open Result")
+        dialog.setWindowTitle(window_title)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.resize(940, 420)
-        self.result_browser_dialog = dialog
+        setattr(self, dialog_attribute, dialog)
         layout = QVBoxLayout(dialog)
 
-        status_label = QLabel(f"{len(candidates)} result(s): {results_dir}")
+        status_label = QLabel()
         status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         status_label.setWordWrap(True)
         layout.addWidget(status_label)
+
+        def update_browser_status(loaded_text: str = "") -> None:
+            first_line = loaded_text or f"{len(candidates)} {item_label}: {results_dir}"
+            report_text = scan_report_text(scan_report)
+            status_label.setText(
+                f"{first_line}\n{report_text}" if report_text else first_line
+            )
+            warning_color = THEME_COLORS["warning"] if scan_report_is_incomplete(scan_report) else ""
+            status_label.setStyleSheet(f"color: {warning_color};" if warning_color else "")
+
+        update_browser_status()
 
         table = QTableWidget(len(candidates), 8)
         table.setHorizontalHeaderLabels(
@@ -15217,22 +16858,36 @@ class LightCurveWindow(QWidget):
                     plot_lightcurve=True,
                 )
             except Exception as exc:
-                QMessageBox.warning(dialog, "Open Result", f"Could not load result CSV:\n{exc}")
+                QMessageBox.warning(
+                    dialog,
+                    window_title,
+                    f"Could not load result CSV:\n{exc}",
+                )
                 self.append_log(f"WARNING: Result CSV could not be loaded: {exc}")
                 return
-            self.append_log(f"Result selected from folder scan: {candidate.result_csv}")
-            status_label.setText(
+            source_label = "BAV result" if bav_only else "Result"
+            self.append_log(
+                f"{source_label} selected from folder scan: {candidate.result_csv}"
+            )
+            update_browser_status(
                 f"Loaded: {candidate.target_name} ({candidate.report_date}) | "
-                f"{len(candidates)} result(s): {results_dir}"
+                f"{len(candidates)} {item_label}: {results_dir}"
             )
 
         def rescan_results() -> None:
+            nonlocal scan_report
             try:
-                refreshed = list(discover_results(results_dir))
+                refreshed, refreshed_report = scan_results_folder()
             except Exception as exc:
-                QMessageBox.warning(dialog, "Open Result", f"Could not rescan result folder:\n{exc}")
+                QMessageBox.warning(
+                    dialog,
+                    window_title,
+                    f"Could not rescan result folder:\n{exc}",
+                )
                 self.append_log(f"WARNING: Result folder rescan failed: {exc}")
                 return
+            scan_report = refreshed_report
+            log_scan_report(scan_report)
             candidates[:] = refreshed
             table.setRowCount(len(candidates))
             for row_index, candidate in enumerate(candidates):
@@ -15250,14 +16905,18 @@ class LightCurveWindow(QWidget):
                     table.setItem(row_index, column_index, QTableWidgetItem(value))
             if candidates:
                 table.selectRow(0)
-            status_label.setText(f"{len(candidates)} result(s): {results_dir}")
+            preview_button.setEnabled(bool(candidates))
+            load_button.setEnabled(bool(candidates))
+            update_browser_status()
 
         preview_button.clicked.connect(preview_selected)
         load_button.clicked.connect(load_selected)
         table.cellDoubleClicked.connect(lambda _row, _column: load_selected())
         rescan_button.clicked.connect(rescan_results)
         close_button.clicked.connect(dialog.close)
-        dialog.destroyed.connect(lambda: setattr(self, "result_browser_dialog", None))
+        dialog.destroyed.connect(
+            lambda _object=None: setattr(self, dialog_attribute, None)
+        )
         dialog.show()
 
     def set_current_lightcurve_from_plugin(
@@ -15359,6 +17018,16 @@ class LightCurveWindow(QWidget):
     def open_aavso_apps(self) -> None:
         """Open the AAVSO apps landing page."""
 
+        folder = self.current_aavso_export_directory()
+        if folder is None:
+            self.append_log("WARNING: No AAVSO path available for clipboard.")
+        else:
+            try:
+                QApplication.clipboard().setText(os.fspath(folder))
+            except Exception as exc:
+                self.append_log(f"WARNING: Could not copy AAVSO path to clipboard: {exc}")
+            else:
+                self.append_log("AAVSO path copied to clipboard.")
         if not QDesktopServices.openUrl(QUrl(AAVSO_APPS_URL)):
             self.append_log(f"WARNING: Could not open AAVSO apps URL: {AAVSO_APPS_URL}")
             QMessageBox.warning(
