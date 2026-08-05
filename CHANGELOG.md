@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.5-pre - 2026-08-05
+
+- Added post-measurement Gaia DR3 target-blend assessment for light curves
+  and single measurements, with explicit warning and rejection outcomes.
+- Applied target and annulus contamination decisions consistently, excluded
+  invalid measurements from scientific plots, extremum fitting, and AAVSO
+  export, and clearly marked rejected single measurements as diagnostic.
+- Unified AAVSO observer-code handling across the Export and BAV tabs,
+  including uppercase normalization, validation, and synchronized prefilling.
+- Derived telescope and instrument information from the current result data
+  and refreshed the read-only BAV display when the selected result changes.
+- Improved BAV reports with a visible VSX object-page link and a fallback URL
+  for older results that only contain the VSX object identifier.
+
 ## 0.4-pre - 2026-07-29
 
 - Simplified the preparation workflow into clearer FITS preparation and

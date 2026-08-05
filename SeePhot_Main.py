@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # SeePhot
-# Author: Aquarius58
+# Author: Thomas Rudolph (Aquarius58)
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # This script is intended to run inside Siril from the Python scripts menu.
@@ -38,7 +38,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.4-pre"
+SCRIPT_VERSION = "0.4.5-pre"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
@@ -78,6 +78,14 @@ THEME_COLORS = {
 # Input defaults.
 # Keep empty for normal use so a restarted app cannot accidentally plot stale results.
 DEFAULT_FITS_DIRECTORY: Path | None = None
+
+# Developer diagnostic switch. When enabled, a rejected manual Light Curve run
+# may offer a separate, non-exportable curve for a modeled contaminated target.
+# This never changes the normal measurement or quality decision and is ignored
+# by Batch mode.
+ENABLE_CONTAMINATED_TARGET_DIAGNOSTIC_CURVE = False
+CONTAMINATED_TARGET_DIAGNOSTIC_PURPOSE = "REJECTED_TARGET_CONTAMINATION_DIAGNOSTIC"
+
 FITS_SUFFIXES = {".fit", ".fits"}
 MODE_LIGHTCURVE = "lightcurve"
 MODE_SINGLE_MEASUREMENT = "single_measurement"
@@ -202,8 +210,28 @@ SINGLE_FIELD_ZP_MAX_G_MINUS_R = 1.35
 SINGLE_FIELD_ZP_NEIGHBOR_RADIUS_FACTOR = 1.25
 SINGLE_FIELD_ZP_NEIGHBOR_MAX_MAG_DELTA = 3.0
 TARGET_BLEND_SAME_SOURCE_MAX_SEPARATION_ARCSEC = 2.0
-TARGET_BLEND_APERTURE_RADIUS_FACTOR = 1.25
-TARGET_BLEND_NEIGHBOR_MAX_MAG_DELTA = 3.0
+TARGET_BLEND_ERROR_LIMIT_MAG = 0.05
+GAIA_TARGET_MATCH_SHADOW_NO_MATCH = "NO_MATCH"
+GAIA_TARGET_MATCH_SHADOW_MATCHED = "MATCHED"
+GAIA_TARGET_MATCH_SHADOW_AMBIGUOUS = "AMBIGUOUS"
+GAIA_TARGET_MATCH_SHADOW_INVALID_TARGET = "INVALID_TARGET"
+GAIA_MAGNITUDE_SHADOW_TARGET_UNAVAILABLE = "TARGET_UNAVAILABLE"
+GAIA_MAGNITUDE_SHADOW_TARGET_G_MISSING = "TARGET_G_MISSING"
+GAIA_MAGNITUDE_SHADOW_NO_NEIGHBORS = "NO_NEIGHBORS"
+GAIA_MAGNITUDE_SHADOW_NO_COMPARABLE_NEIGHBORS = "NO_COMPARABLE_NEIGHBORS"
+GAIA_MAGNITUDE_SHADOW_PARTIAL = "PARTIAL"
+GAIA_MAGNITUDE_SHADOW_COMPARABLE = "COMPARABLE"
+GAIA_NEIGHBOR_MAGNITUDE_SHADOW_COMPARABLE = "COMPARABLE_G"
+GAIA_NEIGHBOR_MAGNITUDE_SHADOW_TARGET_G_MISSING = "TARGET_G_MISSING"
+GAIA_NEIGHBOR_MAGNITUDE_SHADOW_NEIGHBOR_G_MISSING = "NEIGHBOR_G_MISSING"
+GAIA_BLEND_SHADOW_MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
+GAIA_BLEND_SHADOW_NO_COMPARABLE_NEIGHBORS = "NO_COMPARABLE_NEIGHBORS"
+GAIA_BLEND_SHADOW_PARTIAL = "PARTIAL"
+GAIA_BLEND_SHADOW_MODELED = "MODELED"
+GAIA_BLEND_CONTRIBUTION_MODELED = "MODELED"
+GAIA_BLEND_CONTRIBUTION_MAGNITUDE_UNAVAILABLE = "MAGNITUDE_UNAVAILABLE"
+GAIA_BLEND_CONTRIBUTION_GEOMETRY_UNAVAILABLE = "GEOMETRY_UNAVAILABLE"
+GAIA_BLEND_PSF_INTEGRATION_STEPS = 2048
 SINGLE_FIELD_ZP_CHECK_MIN_EXTRA_REFERENCES = 1
 SINGLE_FIELD_ZP_CHECK_PREFERRED_MAX_CATALOG_ERR_MAG = 0.08
 SINGLE_FIELD_ZP_CHECK_PREFERRED_B_MINUS_V = 0.65
@@ -244,6 +272,8 @@ APASS_DR10_QUERY_TIMEOUT_SECONDS = 90
 APASS_DR10_QUERY_RETRIES = 3
 UCAC4_QUERY_TIMEOUT_SECONDS = 60
 TARGET_BLEND_VIZIER_QUERY_TIMEOUT_SECONDS = 20
+TARGET_BLEND_VIZIER_QUERY_RETRIES = 2
+TARGET_BLEND_VIZIER_QUERY_RETRY_DELAY_SECONDS = 2.0
 COMPARISON_CATALOG_COLUMNS = (
     "id",
     "APASS_DR10_ID",
@@ -316,7 +346,7 @@ SERIES_COMP_ANNULUS_MAX_BRIGHT_ISLANDS = 0
 REFERENCE_ANNULUS_IMPACT_WARNING_MAG = 0.02
 REFERENCE_ANNULUS_IMPACT_INVALID_MAG = 0.05
 TARGET_ANNULUS_IMPACT_WARNING_MAG = 0.05
-TARGET_ANNULUS_IMPACT_INVALID_MAG = 0.20
+TARGET_ANNULUS_IMPACT_INVALID_MAG = 0.10
 
 MAX_REFERENCE_FRAME_CANDIDATES = 31
 
@@ -714,6 +744,52 @@ class CatalogObject:
             return None
         return blue - red
 
+    @property
+    def gaia_source_id(self) -> str:
+        """Return the explicit Gaia DR3 source identifier, if present."""
+
+        return self.value_for(("gaia_source_id",))
+
+    def gaia_magnitude_float(self, band: str) -> float | None:
+        """Return one explicitly named Gaia DR3 magnitude."""
+
+        keys = {
+            "g": "gaia_g_mag",
+            "bp": "gaia_bp_mag",
+            "rp": "gaia_rp_mag",
+        }
+        key = keys.get(band.strip().casefold())
+        return self.band_float(key) if key is not None else None
+
+    def gaia_duplicated_source_bool(self) -> bool | None:
+        """Return Gaia duplicated_source as a tri-state value."""
+
+        value = self.value_for(("gaia_duplicated_source",)).strip().casefold()
+        if value in {"1", "true", "yes"}:
+            return True
+        if value in {"0", "false", "no"}:
+            return False
+        return None
+
+    def gaia_ipd_fraction_float(self, metric: str) -> float | None:
+        """Return one Gaia IPD percentage without applying a quality threshold."""
+
+        keys = {
+            "multi_peak": "gaia_ipd_frac_multi_peak",
+            "odd_win": "gaia_ipd_frac_odd_win",
+        }
+        key = keys.get(metric.strip().casefold())
+        return self.band_float(key) if key is not None else None
+
+    def gaia_bp_rp_float(self) -> float | None:
+        """Return the Gaia BP-RP color index, if both bands are available."""
+
+        bp_mag = self.gaia_magnitude_float("bp")
+        rp_mag = self.gaia_magnitude_float("rp")
+        if bp_mag is None or rp_mag is None:
+            return None
+        return bp_mag - rp_mag
+
 
 VSX_CATALOG_INDEX_ROLE = 0x0100
 VSX_MAG_SORT_ROLE = 0x0101
@@ -922,6 +998,85 @@ class TargetBlendAssessment:
     separation_arcsec: float | None = None
     neighbor_mag: float | None = None
     target_mag: float | None = None
+    summed_flux_ratio: float | None = None
+    magnitude_impact_mag: float | None = None
+    evidence_complete: bool = False
+
+
+@dataclass(frozen=True)
+class GaiaTargetMatchShadowAssessment:
+    """Position-only Gaia target-source association for blend assessment."""
+
+    status: str
+    target_source: CatalogObject | None
+    target_separation_arcsec: float | None
+    match_sources: tuple[CatalogObject, ...]
+    neighbor_sources: tuple[CatalogObject, ...]
+    invalid_source_count: int
+    message: str
+
+
+@dataclass(frozen=True)
+class GaiaNeighborMagnitudeShadowComparison:
+    """One same-system Gaia-G comparison with optional color diagnostics."""
+
+    source: CatalogObject
+    status: str
+    target_g_mag: float | None
+    neighbor_g_mag: float | None
+    delta_g_mag: float | None
+    target_bp_rp: float | None
+    neighbor_bp_rp: float | None
+    delta_bp_rp: float | None
+
+
+@dataclass(frozen=True)
+class GaiaMagnitudeSystemShadowAssessment:
+    """Same-system Gaia-G inputs for quantitative blend policy."""
+
+    status: str
+    magnitude_system: str
+    target_source: CatalogObject | None
+    target_g_mag: float | None
+    comparisons: tuple[GaiaNeighborMagnitudeShadowComparison, ...]
+    comparable_count: int
+    missing_count: int
+    message: str
+
+
+@dataclass(frozen=True)
+class GaiaBlendShadowContribution:
+    """Modeled contribution of one Gaia neighbor to the target aperture."""
+
+    source: CatalogObject
+    status: str
+    separation_px: float | None
+    delta_g_mag: float | None
+    total_flux_ratio: float | None
+    neighbor_aperture_fraction: float | None
+    target_aperture_fraction: float | None
+    aperture_flux_ratio: float | None
+    duplicated_source: bool | None
+    ipd_frac_multi_peak: float | None
+    ipd_frac_odd_win: float | None
+
+
+@dataclass(frozen=True)
+class GaiaBlendShadowAssessment:
+    """Summed Gaussian-PSF blend estimate used by the quality policy."""
+
+    status: str
+    psf_model: str
+    fwhm_px: float | None
+    aperture_radius_px: float
+    target_aperture_fraction: float | None
+    contributions: tuple[GaiaBlendShadowContribution, ...]
+    modeled_count: int
+    unavailable_count: int
+    total_aperture_flux_ratio: float | None
+    magnitude_bias_mag: float | None
+    magnitude_impact_mag: float | None
+    message: str
 
 
 @dataclass(frozen=True)
@@ -4652,6 +4807,36 @@ def read_result_metadata_header(path: Path) -> dict[str, str]:
     return metadata
 
 
+def result_metadata_is_diagnostic(metadata: dict[str, str]) -> bool:
+    """Return whether result metadata marks a rejected-target diagnostic curve."""
+
+    return (
+        metadata.get("RESULT_PURPOSE", "").strip().upper()
+        == CONTAMINATED_TARGET_DIAGNOSTIC_PURPOSE
+    )
+
+
+def result_csv_is_diagnostic(path: Path) -> bool:
+    """Return whether a result CSV is explicitly diagnostic and non-scientific."""
+
+    try:
+        return result_metadata_is_diagnostic(read_result_metadata_header(path))
+    except OSError:
+        return False
+
+
+def result_metadata_allows_export(metadata: dict[str, str]) -> bool:
+    """Return whether a result is allowed to enter scientific export paths."""
+
+    if result_metadata_is_diagnostic(metadata):
+        return False
+    return metadata.get("EXPORT_ALLOWED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
 def aperture_settings_from_result_metadata(metadata: dict[str, str]) -> ApertureSettings | None:
     """Return aperture settings encoded in result CSV metadata, if present."""
 
@@ -4795,7 +4980,7 @@ def load_optional_observer_result_settings() -> dict[str, str]:
     if re.fullmatch(r"[A-Z]+", bav_code):
         settings["OBSERVER_BAV"] = bav_code
     aavso_code = str(raw_config.get("aavso_code", "") or "").strip().upper()
-    if re.fullmatch(r"[A-Z0-9]+", aavso_code):
+    if re.fullmatch(r"[A-Z0-9]{1,5}", aavso_code):
         settings["OBSERVER_AAVSO"] = aavso_code
 
     # A fully valid BAV config can also supply normalized decimal coordinates.
@@ -5614,6 +5799,9 @@ def parse_gaia_dr3_target_blend_tsv(payload: str) -> list[CatalogObject]:
         "Gmag",
         "BPmag",
         "RPmag",
+        "Dup",
+        "IPDfmp",
+        "IPDfow",
     )
     rows: list[CatalogObject] = []
     for line in payload.splitlines():
@@ -5628,21 +5816,19 @@ def parse_gaia_dr3_target_blend_tsv(payload: str) -> list[CatalogObject]:
         source_id = raw_values.get("Source", "").strip()
         if not source_id:
             continue
-        gmag = raw_values.get("Gmag", "").strip()
         values = {
             "id": source_id,
             "Name": source_id,
+            "gaia_source_id": source_id,
             "catalog_source": GAIA_DR3_SOURCE_NAME,
             "ra": raw_values.get("RA_ICRS", "").strip(),
             "dec": raw_values.get("DE_ICRS", "").strip(),
-            # Gaia G is not Johnson V; for this local blend gate it is a conservative
-            # brightness proxy used only to decide whether a neighbor is relevant.
-            "mag_v": gmag,
-            "err_mag_v": "",
-            "nobs_v": "",
-            "mag_g": gmag,
-            "mag_b": raw_values.get("BPmag", "").strip(),
-            "mag_r": raw_values.get("RPmag", "").strip(),
+            "gaia_g_mag": raw_values.get("Gmag", "").strip(),
+            "gaia_bp_mag": raw_values.get("BPmag", "").strip(),
+            "gaia_rp_mag": raw_values.get("RPmag", "").strip(),
+            "gaia_duplicated_source": raw_values.get("Dup", "").strip(),
+            "gaia_ipd_frac_multi_peak": raw_values.get("IPDfmp", "").strip(),
+            "gaia_ipd_frac_odd_win": raw_values.get("IPDfow", "").strip(),
         }
         rows.append(CatalogObject(values))
     return rows
@@ -5835,16 +6021,14 @@ def query_gaia_dr3_target_neighbors(
     """Query Gaia DR3 in a small target-centered radius for blend detection."""
 
     radius_deg = max(radius_arcsec, 1.0) / 3600.0
-    if target_mag is None:
-        min_mag = APASS_DR10_MIN_MAG
-        max_mag = 21.0
-    else:
-        min_mag = APASS_DR10_MIN_MAG
-        max_mag = min(21.0, target_mag + TARGET_BLEND_NEIGHBOR_MAX_MAG_DELTA)
-        if max_mag < min_mag:
-            max_mag = 21.0
+    # The quantitative model needs the full useful Gaia range so individually
+    # faint neighbors can be summed. target_mag remains in the public query
+    # signature for callers, but no longer truncates the neighbor population.
+    min_mag = 0.0
+    max_mag = 21.0
     query = f"""
-SELECT TOP 200 Source, RA_ICRS, DE_ICRS, Gmag, BPmag, RPmag
+SELECT TOP 200 Source, RA_ICRS, DE_ICRS, Gmag, BPmag, RPmag,
+       Dup, IPDfmp, IPDfow
 FROM "I/355/gaiadr3"
 WHERE 1=CONTAINS(
   POINT('ICRS', RA_ICRS, DE_ICRS),
@@ -5868,18 +6052,35 @@ ORDER BY Gmag
         data=payload,
         headers={"User-Agent": f"SeestarLightcurve/{SCRIPT_VERSION}"},
     )
-    if progress is not None:
-        progress(
-            "Gaia DR3 target-blend query "
-            f"(radius={radius_arcsec:.1f} arcsec, "
-            f"timeout {TARGET_BLEND_VIZIER_QUERY_TIMEOUT_SECONDS}s)."
-        )
-    with urllib.request.urlopen(
-        request,
-        timeout=TARGET_BLEND_VIZIER_QUERY_TIMEOUT_SECONDS,
-    ) as response:
-        text = response.read().decode("utf-8", "replace")
-    return parse_gaia_dr3_target_blend_tsv(text)
+    last_exc: Exception | None = None
+    for attempt in range(1, TARGET_BLEND_VIZIER_QUERY_RETRIES + 1):
+        if progress is not None:
+            progress(
+                "Gaia DR3 target-blend request "
+                f"{attempt}/{TARGET_BLEND_VIZIER_QUERY_RETRIES} "
+                f"(radius={radius_arcsec:.1f} arcsec, "
+                f"timeout {TARGET_BLEND_VIZIER_QUERY_TIMEOUT_SECONDS}s)."
+            )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=TARGET_BLEND_VIZIER_QUERY_TIMEOUT_SECONDS,
+            ) as response:
+                text = response.read().decode("utf-8", "replace")
+            return parse_gaia_dr3_target_blend_tsv(text)
+        except Exception as exc:
+            last_exc = exc
+            if progress is not None:
+                progress(
+                    "WARNING: Gaia DR3 target-blend request "
+                    f"{attempt}/{TARGET_BLEND_VIZIER_QUERY_RETRIES} failed: {exc}"
+                )
+            if attempt < TARGET_BLEND_VIZIER_QUERY_RETRIES:
+                time.sleep(TARGET_BLEND_VIZIER_QUERY_RETRY_DELAY_SECONDS)
+    raise RuntimeError(
+        "Gaia DR3 target-blend query failed after "
+        f"{TARGET_BLEND_VIZIER_QUERY_RETRIES} attempt(s): {last_exc}"
+    ) from last_exc
 
 
 def query_target_blend_catalog(
@@ -6474,118 +6675,583 @@ def catalog_object_short_label(obj: CatalogObject) -> str:
     return f"{prefix}:{ident}"
 
 
-def assess_target_catalog_blend(
+def assess_gaia_target_source_match_shadow(
     target: CatalogObject,
-    frame: ReferenceFrame,
-    aperture_settings: ApertureSettings,
-    progress: Callable[[str], None] | None = None,
-) -> TargetBlendAssessment:
-    """Check whether a catalog neighbor can dominate the target aperture."""
+    candidates: list[CatalogObject],
+    match_radius_arcsec: float = TARGET_BLEND_SAME_SOURCE_MAX_SEPARATION_ARCSEC,
+) -> GaiaTargetMatchShadowAssessment:
+    """Associate one Gaia target source by position for blend assessment."""
 
     target_coord = sky_coord_for_object(target)
-    target_mag = target.magnitude_float()
     if target_coord is None:
-        return TargetBlendAssessment(
-            QUALITY_STATUS_WARNING,
-            "TARGET_BLEND_CHECK_SKIPPED",
-            False,
-            "Target blend check skipped: target coordinates are invalid.",
-        )
-    target_x, target_y, target_problem = object_pixel_position_in_frame(target, frame)
-    if target_problem is not None or not np.isfinite(target_x) or not np.isfinite(target_y):
-        return TargetBlendAssessment(
-            QUALITY_STATUS_WARNING,
-            "TARGET_BLEND_CHECK_SKIPPED",
-            False,
-            f"Target blend check skipped: {target_problem or 'target pixel position is invalid'}.",
+        return GaiaTargetMatchShadowAssessment(
+            GAIA_TARGET_MATCH_SHADOW_INVALID_TARGET,
+            None,
+            None,
+            (),
+            (),
+            len(candidates),
+            "Gaia target match: INVALID_TARGET; target coordinates are invalid.",
         )
 
-    pixel_scale = reference_frame_pixel_scale_arcsec(frame)
-    search_radius_arcsec = max(
-        30.0,
-        aperture_settings.annulus_outer_px * pixel_scale * 1.2,
+    ranked_sources: list[tuple[float, CatalogObject]] = []
+    invalid_source_count = 0
+    for candidate in candidates:
+        candidate_coord = sky_coord_for_object(candidate)
+        if candidate_coord is None:
+            invalid_source_count += 1
+            continue
+        separation_arcsec = float(target_coord.separation(candidate_coord).arcsec)
+        if not np.isfinite(separation_arcsec):
+            invalid_source_count += 1
+            continue
+        ranked_sources.append((separation_arcsec, candidate))
+    ranked_sources.sort(key=lambda item: item[0])
+
+    matches = [
+        (separation_arcsec, source)
+        for separation_arcsec, source in ranked_sources
+        if separation_arcsec <= match_radius_arcsec
+    ]
+    if not matches:
+        nearest_text = (
+            "n/a"
+            if not ranked_sources
+            else f"{ranked_sources[0][0]:.3f} arcsec"
+        )
+        return GaiaTargetMatchShadowAssessment(
+            GAIA_TARGET_MATCH_SHADOW_NO_MATCH,
+            None,
+            None,
+            (),
+            tuple(source for _separation, source in ranked_sources),
+            invalid_source_count,
+            (
+                "Gaia target match: NO_MATCH; "
+                f"sources_within_{match_radius_arcsec:.1f}arcsec=0; "
+                f"nearest={nearest_text}; neighbors={len(ranked_sources)}; "
+                f"invalid_sources={invalid_source_count}."
+            ),
+        )
+
+    target_separation_arcsec, target_source = matches[0]
+    status = (
+        GAIA_TARGET_MATCH_SHADOW_MATCHED
+        if len(matches) == 1
+        else GAIA_TARGET_MATCH_SHADOW_AMBIGUOUS
     )
-    candidates = query_target_blend_catalog(
-        float(target_coord.ra.deg),
-        float(target_coord.dec.deg),
-        search_radius_arcsec,
-        target_mag,
-        progress,
+    match_sources = tuple(source for _separation, source in matches)
+    neighbor_sources = tuple(
+        source
+        for _separation, source in ranked_sources
+        if source is not target_source
     )
-    if not candidates:
+    return GaiaTargetMatchShadowAssessment(
+        status,
+        target_source,
+        target_separation_arcsec,
+        match_sources,
+        neighbor_sources,
+        invalid_source_count,
+        (
+            f"Gaia target match: {status}; "
+            f"target_source={target_source.gaia_source_id or target_source.catalog_id}; "
+            f"target_separation={target_separation_arcsec:.3f} arcsec; "
+            f"sources_within_{match_radius_arcsec:.1f}arcsec={len(matches)}; "
+            f"neighbors={len(neighbor_sources)}; "
+            f"invalid_sources={invalid_source_count}; position-only association."
+        ),
+    )
+
+
+def assess_gaia_magnitude_system_shadow(
+    target_match: GaiaTargetMatchShadowAssessment,
+) -> GaiaMagnitudeSystemShadowAssessment:
+    """Compare target and neighbor brightness only within the Gaia-G system."""
+
+    target_source = target_match.target_source
+    if target_source is None:
+        return GaiaMagnitudeSystemShadowAssessment(
+            GAIA_MAGNITUDE_SHADOW_TARGET_UNAVAILABLE,
+            "Gaia DR3 G",
+            None,
+            None,
+            (),
+            0,
+            len(target_match.neighbor_sources),
+            (
+                "Gaia magnitude assessment: TARGET_UNAVAILABLE; no Gaia target source "
+                "was associated; VSX magnitude not used."
+            ),
+        )
+
+    target_g_mag = target_source.gaia_magnitude_float("g")
+    target_bp_rp = target_source.gaia_bp_rp_float()
+    comparisons: list[GaiaNeighborMagnitudeShadowComparison] = []
+    for neighbor in target_match.neighbor_sources:
+        neighbor_g_mag = neighbor.gaia_magnitude_float("g")
+        neighbor_bp_rp = neighbor.gaia_bp_rp_float()
+        if target_g_mag is None:
+            status = GAIA_NEIGHBOR_MAGNITUDE_SHADOW_TARGET_G_MISSING
+            delta_g_mag = None
+        elif neighbor_g_mag is None:
+            status = GAIA_NEIGHBOR_MAGNITUDE_SHADOW_NEIGHBOR_G_MISSING
+            delta_g_mag = None
+        else:
+            status = GAIA_NEIGHBOR_MAGNITUDE_SHADOW_COMPARABLE
+            delta_g_mag = neighbor_g_mag - target_g_mag
+        delta_bp_rp = (
+            neighbor_bp_rp - target_bp_rp
+            if target_bp_rp is not None and neighbor_bp_rp is not None
+            else None
+        )
+        comparisons.append(
+            GaiaNeighborMagnitudeShadowComparison(
+                neighbor,
+                status,
+                target_g_mag,
+                neighbor_g_mag,
+                delta_g_mag,
+                target_bp_rp,
+                neighbor_bp_rp,
+                delta_bp_rp,
+            )
+        )
+
+    comparable_count = sum(
+        1
+        for comparison in comparisons
+        if comparison.status == GAIA_NEIGHBOR_MAGNITUDE_SHADOW_COMPARABLE
+    )
+    missing_count = len(comparisons) - comparable_count
+    if target_g_mag is None:
+        status = GAIA_MAGNITUDE_SHADOW_TARGET_G_MISSING
+    elif not comparisons:
+        status = GAIA_MAGNITUDE_SHADOW_NO_NEIGHBORS
+    elif comparable_count == 0:
+        status = GAIA_MAGNITUDE_SHADOW_NO_COMPARABLE_NEIGHBORS
+    elif missing_count:
+        status = GAIA_MAGNITUDE_SHADOW_PARTIAL
+    else:
+        status = GAIA_MAGNITUDE_SHADOW_COMPARABLE
+
+    color_deltas = [
+        abs(comparison.delta_bp_rp)
+        for comparison in comparisons
+        if comparison.delta_bp_rp is not None
+    ]
+    max_color_delta_text = (
+        "n/a" if not color_deltas else f"{max(color_deltas):.3f} mag"
+    )
+    return GaiaMagnitudeSystemShadowAssessment(
+        status,
+        "Gaia DR3 G",
+        target_source,
+        target_g_mag,
+        tuple(comparisons),
+        comparable_count,
+        missing_count,
+        (
+            f"Gaia magnitude assessment: {status}; system=Gaia DR3 G; "
+            f"target_G={format_optional_float(target_g_mag)}; "
+            f"comparable_neighbors={comparable_count}; "
+            f"missing_neighbors={missing_count}; "
+            f"max_abs_delta_BP-RP={max_color_delta_text}; "
+            "VSX magnitude not used; color is diagnostic only."
+        ),
+    )
+
+
+def gaussian_psf_aperture_fraction(
+    separation_px: float,
+    aperture_radius_px: float,
+    fwhm_px: float,
+    integration_steps: int = GAIA_BLEND_PSF_INTEGRATION_STEPS,
+) -> float:
+    """Return the fraction of a circular Gaussian PSF inside an offset aperture."""
+
+    if (
+        not np.isfinite(separation_px)
+        or not np.isfinite(aperture_radius_px)
+        or not np.isfinite(fwhm_px)
+        or separation_px < 0
+        or aperture_radius_px <= 0
+        or fwhm_px <= 0
+        or integration_steps < 32
+    ):
+        return float("nan")
+    sigma_px = fwhm_px / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+    if separation_px <= 1e-12:
+        return float(
+            1.0 - math.exp(-(aperture_radius_px**2) / (2.0 * sigma_px**2))
+        )
+
+    radial_min = max(0.0, separation_px - aperture_radius_px)
+    radial_max = separation_px + aperture_radius_px
+    radial_step = (radial_max - radial_min) / float(integration_steps)
+    radii = radial_min + (np.arange(integration_steps, dtype=np.float64) + 0.5) * radial_step
+    cosine_limit = (
+        aperture_radius_px**2 - radii**2 - separation_px**2
+    ) / (2.0 * radii * separation_px)
+    angular_fraction = np.where(
+        cosine_limit >= 1.0,
+        1.0,
+        np.where(
+            cosine_limit <= -1.0,
+            0.0,
+            1.0 - np.arccos(np.clip(cosine_limit, -1.0, 1.0)) / math.pi,
+        ),
+    )
+    radial_density = (
+        radii / sigma_px**2 * np.exp(-(radii**2) / (2.0 * sigma_px**2))
+    )
+    fraction = float(np.sum(radial_density * angular_fraction) * radial_step)
+    return min(1.0, max(0.0, fraction))
+
+
+def format_practical_blend_magnitude(value: float | None) -> str:
+    """Format modeled blend impact without implying unrealistic precision."""
+
+    if value is None or not np.isfinite(value):
+        return "n/a"
+    if abs(value) < 0.001:
+        return "<0.001 mag"
+    return f"{value:.3f} mag"
+
+
+def format_practical_blend_flux_ratio(value: float | None) -> str:
+    """Format a modeled relative flux contribution as a practical percent."""
+
+    if value is None or not np.isfinite(value):
+        return "n/a"
+    percent = 100.0 * value
+    if abs(percent) < 0.001:
+        return "<0.001%"
+    return f"{percent:.3f}%"
+
+
+def assess_gaia_blend_model_shadow(
+    magnitude_assessment: GaiaMagnitudeSystemShadowAssessment,
+    frame: ReferenceFrame,
+    aperture_settings: ApertureSettings,
+) -> GaiaBlendShadowAssessment:
+    """Estimate summed Gaia-neighbor flux for the quantitative policy."""
+
+    psf_model = "circular Gaussian; sigma=FWHM/(2*sqrt(2*ln(2)))"
+    fwhm_px = aperture_settings.fwhm_px
+    target_source = magnitude_assessment.target_source
+    if (
+        target_source is None
+        or fwhm_px is None
+        or not np.isfinite(fwhm_px)
+        or fwhm_px <= 0
+    ):
+        return GaiaBlendShadowAssessment(
+            GAIA_BLEND_SHADOW_MODEL_UNAVAILABLE,
+            psf_model,
+            fwhm_px,
+            aperture_settings.aperture_radius_px,
+            None,
+            (),
+            0,
+            len(magnitude_assessment.comparisons),
+            None,
+            None,
+            None,
+            (
+                "Gaia blend model: MODEL_UNAVAILABLE; Gaia target source or "
+                "reference FWHM unavailable."
+            ),
+        )
+
+    target_x, target_y, target_problem = object_pixel_position_in_frame(
+        target_source,
+        frame,
+    )
+    target_aperture_fraction = gaussian_psf_aperture_fraction(
+        0.0,
+        aperture_settings.aperture_radius_px,
+        fwhm_px,
+    )
+    if (
+        target_problem is not None
+        or not np.isfinite(target_x)
+        or not np.isfinite(target_y)
+        or not np.isfinite(target_aperture_fraction)
+        or target_aperture_fraction <= 0
+    ):
+        return GaiaBlendShadowAssessment(
+            GAIA_BLEND_SHADOW_MODEL_UNAVAILABLE,
+            psf_model,
+            fwhm_px,
+            aperture_settings.aperture_radius_px,
+            None,
+            (),
+            0,
+            len(magnitude_assessment.comparisons),
+            None,
+            None,
+            None,
+            (
+                "Gaia blend model: MODEL_UNAVAILABLE; target pixel geometry "
+                f"unavailable ({target_problem or 'invalid aperture fraction'})."
+            ),
+        )
+
+    contributions: list[GaiaBlendShadowContribution] = []
+    for comparison in magnitude_assessment.comparisons:
+        source = comparison.source
+        duplicated_source = source.gaia_duplicated_source_bool()
+        ipd_frac_multi_peak = source.gaia_ipd_fraction_float("multi_peak")
+        ipd_frac_odd_win = source.gaia_ipd_fraction_float("odd_win")
+        neighbor_x, neighbor_y, neighbor_problem = object_pixel_position_in_frame(
+            source,
+            frame,
+        )
+        separation_px = (
+            float(math.hypot(neighbor_x - target_x, neighbor_y - target_y))
+            if neighbor_problem is None
+            and np.isfinite(neighbor_x)
+            and np.isfinite(neighbor_y)
+            else None
+        )
+        if comparison.delta_g_mag is None:
+            contributions.append(
+                GaiaBlendShadowContribution(
+                    source,
+                    GAIA_BLEND_CONTRIBUTION_MAGNITUDE_UNAVAILABLE,
+                    separation_px,
+                    None,
+                    None,
+                    None,
+                    target_aperture_fraction,
+                    None,
+                    duplicated_source,
+                    ipd_frac_multi_peak,
+                    ipd_frac_odd_win,
+                )
+            )
+            continue
+        if separation_px is None:
+            contributions.append(
+                GaiaBlendShadowContribution(
+                    source,
+                    GAIA_BLEND_CONTRIBUTION_GEOMETRY_UNAVAILABLE,
+                    None,
+                    comparison.delta_g_mag,
+                    None,
+                    None,
+                    target_aperture_fraction,
+                    None,
+                    duplicated_source,
+                    ipd_frac_multi_peak,
+                    ipd_frac_odd_win,
+                )
+            )
+            continue
+
+        total_flux_ratio = float(10.0 ** (-0.4 * comparison.delta_g_mag))
+        neighbor_aperture_fraction = gaussian_psf_aperture_fraction(
+            separation_px,
+            aperture_settings.aperture_radius_px,
+            fwhm_px,
+        )
+        aperture_flux_ratio = (
+            total_flux_ratio
+            * neighbor_aperture_fraction
+            / target_aperture_fraction
+        )
+        contributions.append(
+            GaiaBlendShadowContribution(
+                source,
+                GAIA_BLEND_CONTRIBUTION_MODELED,
+                separation_px,
+                comparison.delta_g_mag,
+                total_flux_ratio,
+                neighbor_aperture_fraction,
+                target_aperture_fraction,
+                aperture_flux_ratio,
+                duplicated_source,
+                ipd_frac_multi_peak,
+                ipd_frac_odd_win,
+            )
+        )
+
+    modeled = [
+        contribution
+        for contribution in contributions
+        if contribution.status == GAIA_BLEND_CONTRIBUTION_MODELED
+        and contribution.aperture_flux_ratio is not None
+    ]
+    modeled_count = len(modeled)
+    unavailable_count = len(contributions) - modeled_count
+    total_aperture_flux_ratio = (
+        float(sum(contribution.aperture_flux_ratio or 0.0 for contribution in modeled))
+        if modeled
+        else None
+    )
+    magnitude_bias_mag = (
+        float(-2.5 * math.log10(1.0 + total_aperture_flux_ratio))
+        if total_aperture_flux_ratio is not None
+        else None
+    )
+    magnitude_impact_mag = (
+        abs(magnitude_bias_mag) if magnitude_bias_mag is not None else None
+    )
+    if not modeled:
+        status = GAIA_BLEND_SHADOW_NO_COMPARABLE_NEIGHBORS
+    elif unavailable_count:
+        status = GAIA_BLEND_SHADOW_PARTIAL
+    else:
+        status = GAIA_BLEND_SHADOW_MODELED
+
+    strongest = sorted(
+        modeled,
+        key=lambda contribution: contribution.aperture_flux_ratio or 0.0,
+        reverse=True,
+    )[:3]
+    strongest_text = ", ".join(
+        f"{item.source.gaia_source_id or item.source.catalog_id}:"
+        f"{format_practical_blend_magnitude(2.5 * math.log10(1.0 + item.aperture_flux_ratio))}"
+        for item in strongest
+        if item.aperture_flux_ratio is not None
+    ) or "none"
+    duplicated_count = sum(item.duplicated_source is True for item in contributions)
+    multi_peak_values = [
+        item.ipd_frac_multi_peak
+        for item in contributions
+        if item.ipd_frac_multi_peak is not None
+    ]
+    odd_win_values = [
+        item.ipd_frac_odd_win
+        for item in contributions
+        if item.ipd_frac_odd_win is not None
+    ]
+    return GaiaBlendShadowAssessment(
+        status,
+        psf_model,
+        fwhm_px,
+        aperture_settings.aperture_radius_px,
+        target_aperture_fraction,
+        tuple(contributions),
+        modeled_count,
+        unavailable_count,
+        total_aperture_flux_ratio,
+        magnitude_bias_mag,
+        magnitude_impact_mag,
+        (
+            f"Gaia blend model: {status}; model={psf_model}; "
+            f"modeled_neighbors={modeled_count}; unavailable={unavailable_count}; "
+            "summed_aperture_flux="
+            f"{format_practical_blend_flux_ratio(total_aperture_flux_ratio)}; "
+            f"magnitude_impact={format_practical_blend_magnitude(magnitude_impact_mag)}; "
+            f"strongest={strongest_text}; duplicated_sources={duplicated_count}; "
+            f"max_IPDfmp={format_optional_float(max(multi_peak_values) if multi_peak_values else None)}; "
+            f"max_IPDfow={format_optional_float(max(odd_win_values) if odd_win_values else None)}; "
+            "Gaia quality fields are diagnostic only; no policy effect."
+        ),
+    )
+
+
+def target_blend_policy_assessment(
+    target_match: GaiaTargetMatchShadowAssessment,
+    magnitude_assessment: GaiaMagnitudeSystemShadowAssessment,
+    blend_assessment: GaiaBlendShadowAssessment,
+    pixel_scale_arcsec: float,
+) -> TargetBlendAssessment:
+    """Convert the summed Gaia model into the productive 0.05-mag policy."""
+
+    strongest = max(
+        (
+            contribution
+            for contribution in blend_assessment.contributions
+            if contribution.aperture_flux_ratio is not None
+        ),
+        key=lambda contribution: contribution.aperture_flux_ratio or 0.0,
+        default=None,
+    )
+    neighbor = None if strongest is None else strongest.source
+    separation_px = None if strongest is None else strongest.separation_px
+    separation_arcsec = (
+        separation_px * pixel_scale_arcsec
+        if separation_px is not None and np.isfinite(pixel_scale_arcsec)
+        else None
+    )
+    neighbor_mag = None if neighbor is None else neighbor.gaia_magnitude_float("g")
+    target_mag = magnitude_assessment.target_g_mag
+
+    no_neighbors = (
+        target_match.status == GAIA_TARGET_MATCH_SHADOW_MATCHED
+        and magnitude_assessment.status == GAIA_MAGNITUDE_SHADOW_NO_NEIGHBORS
+        and not magnitude_assessment.comparisons
+    )
+    if no_neighbors:
         return TargetBlendAssessment(
             QUALITY_STATUS_OK,
             "OK",
             False,
-            f"Target blend check: no Gaia DR3 neighbor candidates within {search_radius_arcsec:.1f} arcsec.",
+            (
+                "Target blend assessment: OK; Gaia target source is uniquely "
+                "matched and no Gaia neighbors are present; summed impact=<0.001 mag."
+            ),
+            summed_flux_ratio=0.0,
+            magnitude_impact_mag=0.0,
+            evidence_complete=True,
         )
 
-    aperture_limit_px = aperture_settings.aperture_radius_px * TARGET_BLEND_APERTURE_RADIUS_FACTOR
-    warning_limit_px = aperture_settings.annulus_outer_px
-    nearest_warning: tuple[CatalogObject, float, float, float | None] | None = None
-    for candidate in candidates:
-        candidate_coord = sky_coord_for_object(candidate)
-        candidate_mag = candidate.magnitude_float()
-        if candidate_coord is None:
-            continue
-        separation_arcsec = float(target_coord.separation(candidate_coord).arcsec)
-        if separation_arcsec <= TARGET_BLEND_SAME_SOURCE_MAX_SEPARATION_ARCSEC:
-            continue
-        if (
-            target_mag is not None
-            and candidate_mag is not None
-            and candidate_mag - target_mag > TARGET_BLEND_NEIGHBOR_MAX_MAG_DELTA
-        ):
-            continue
-        candidate_x, candidate_y, candidate_problem = object_pixel_position_in_frame(candidate, frame)
-        if candidate_problem is not None or not np.isfinite(candidate_x) or not np.isfinite(candidate_y):
-            continue
-        separation_px = float(math.hypot(candidate_x - target_x, candidate_y - target_y))
-        if separation_px <= aperture_limit_px:
-            mag_text = "n/a" if candidate_mag is None else f"{candidate_mag:.3f}"
-            target_mag_text = "n/a" if target_mag is None else f"{target_mag:.3f}"
-            message = (
-                "Target blend check failed: "
-                f"{catalog_object_short_label(candidate)} catalog mag={mag_text} is "
-                f"{separation_px:.2f}px/{separation_arcsec:.1f} arcsec from target "
-                f"(aperture={aperture_settings.aperture_radius_px:.2f}px, "
-                f"limit={aperture_limit_px:.2f}px, target V={target_mag_text})."
-            )
-            return TargetBlendAssessment(
-                QUALITY_STATUS_INVALID,
-                "TARGET_BLEND_CATALOG_NEIGHBOR",
-                True,
-                message,
-                candidate,
-                separation_px,
-                separation_arcsec,
-                candidate_mag,
-                target_mag,
-            )
-        if separation_px <= warning_limit_px:
-            if nearest_warning is None or separation_px < nearest_warning[1]:
-                nearest_warning = (candidate, separation_px, separation_arcsec, candidate_mag)
-
-    if nearest_warning is not None:
-        candidate, separation_px, separation_arcsec, candidate_mag = nearest_warning
-        mag_text = "n/a" if candidate_mag is None else f"{candidate_mag:.3f}"
-        message = (
-            "Target blend warning: "
-            f"{catalog_object_short_label(candidate)} catalog mag={mag_text} is "
-            f"{separation_px:.2f}px/{separation_arcsec:.1f} arcsec from target "
-            f"(outside aperture limit {aperture_limit_px:.2f}px, "
-            f"inside annulus outer radius {warning_limit_px:.2f}px)."
-        )
+    evidence_complete = (
+        target_match.status == GAIA_TARGET_MATCH_SHADOW_MATCHED
+        and magnitude_assessment.status == GAIA_MAGNITUDE_SHADOW_COMPARABLE
+        and blend_assessment.status == GAIA_BLEND_SHADOW_MODELED
+        and blend_assessment.unavailable_count == 0
+        and blend_assessment.total_aperture_flux_ratio is not None
+        and blend_assessment.magnitude_impact_mag is not None
+    )
+    if not evidence_complete:
         return TargetBlendAssessment(
             QUALITY_STATUS_WARNING,
-            "TARGET_BLEND_CATALOG_NEIGHBOR_WARNING",
+            "TARGET_BLEND_EVIDENCE_INCOMPLETE",
             False,
-            message,
-            candidate,
+            (
+                "Target blend assessment: WARNING; quantitative Gaia evidence "
+                f"is incomplete (match={target_match.status}, "
+                f"magnitudes={magnitude_assessment.status}, "
+                f"model={blend_assessment.status}); measurement continues and "
+                "no hard contamination decision is made."
+            ),
+            neighbor,
             separation_px,
             separation_arcsec,
-            candidate_mag,
+            neighbor_mag,
             target_mag,
+            blend_assessment.total_aperture_flux_ratio,
+            blend_assessment.magnitude_impact_mag,
+            False,
+        )
+
+    impact = float(blend_assessment.magnitude_impact_mag)
+    summed_flux_ratio = float(blend_assessment.total_aperture_flux_ratio)
+    if impact >= TARGET_BLEND_ERROR_LIMIT_MAG:
+        return TargetBlendAssessment(
+            QUALITY_STATUS_INVALID,
+            "TARGET_BLEND_MODELED_CONTAMINATION",
+            False,
+            (
+                "Target blend assessment: INVALID after measurement; summed "
+                "Gaia-neighbor impact="
+                f"{format_practical_blend_magnitude(impact)} reaches the unchanged "
+                f"error limit {TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag "
+                "(summed aperture flux="
+                f"{format_practical_blend_flux_ratio(summed_flux_ratio)})."
+            ),
+            neighbor,
+            separation_px,
+            separation_arcsec,
+            neighbor_mag,
+            target_mag,
+            summed_flux_ratio,
+            impact,
+            True,
         )
 
     return TargetBlendAssessment(
@@ -6593,9 +7259,79 @@ def assess_target_catalog_blend(
         "OK",
         False,
         (
-            "Target blend check: no relevant Gaia DR3 neighbor within "
-            f"{warning_limit_px:.2f}px of the target aperture/annulus."
+            "Target blend assessment: OK; summed Gaia-neighbor "
+            f"impact={format_practical_blend_magnitude(impact)} is below the unchanged error limit "
+            f"{TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag "
+            "(summed aperture flux="
+            f"{format_practical_blend_flux_ratio(summed_flux_ratio)})."
         ),
+        neighbor,
+        separation_px,
+        separation_arcsec,
+        neighbor_mag,
+        target_mag,
+        summed_flux_ratio,
+        impact,
+        True,
+    )
+
+
+def assess_target_catalog_blend(
+    target: CatalogObject,
+    frame: ReferenceFrame,
+    aperture_settings: ApertureSettings,
+    progress: Callable[[str], None] | None = None,
+) -> TargetBlendAssessment:
+    """Assess the summed Gaia-neighbor impact without skipping measurement."""
+
+    target_coord = sky_coord_for_object(target)
+    if target_coord is None:
+        return TargetBlendAssessment(
+            QUALITY_STATUS_WARNING,
+            "TARGET_BLEND_EVIDENCE_INCOMPLETE",
+            False,
+            "Target blend assessment: WARNING; target coordinates are invalid; measurement continues.",
+        )
+
+    pixel_scale = reference_frame_pixel_scale_arcsec(frame)
+    search_radius_arcsec = max(
+        30.0,
+        aperture_settings.annulus_outer_px * pixel_scale * 1.2,
+    )
+    try:
+        candidates = query_target_blend_catalog(
+            float(target_coord.ra.deg),
+            float(target_coord.dec.deg),
+            search_radius_arcsec,
+            target.magnitude_float(),
+            progress,
+        )
+    except Exception as exc:
+        return TargetBlendAssessment(
+            QUALITY_STATUS_WARNING,
+            "TARGET_BLEND_EVIDENCE_INCOMPLETE",
+            False,
+            (
+                "Target blend assessment: WARNING; Gaia query failed "
+                f"({exc}); measurement continues."
+            ),
+        )
+    target_match = assess_gaia_target_source_match_shadow(target, candidates)
+    magnitude_assessment = assess_gaia_magnitude_system_shadow(target_match)
+    blend_assessment = assess_gaia_blend_model_shadow(
+        magnitude_assessment,
+        frame,
+        aperture_settings,
+    )
+    if progress is not None:
+        progress(target_match.message)
+        progress(magnitude_assessment.message)
+        progress(blend_assessment.message)
+    return target_blend_policy_assessment(
+        target_match,
+        magnitude_assessment,
+        blend_assessment,
+        pixel_scale,
     )
 
 
@@ -8850,6 +9586,70 @@ def combine_quality_note(existing: str, extra: str) -> str:
     return f"{existing}; {extra}"
 
 
+def apply_target_blend_assessment(
+    measurement: ApertureMeasurement,
+    assessment: TargetBlendAssessment,
+) -> ApertureMeasurement:
+    """Apply only the catalog-blend quality decision to a completed measurement."""
+
+    if measurement.role != "target" or assessment.status == QUALITY_STATUS_OK:
+        return measurement
+    current_status = measurement_quality_status(measurement)
+    if current_status == QUALITY_STATUS_INVALID:
+        return replace(
+            measurement,
+            quality_flag=combine_quality_flag(measurement.quality_flag, assessment.flag),
+            note=combine_quality_note(measurement.note, assessment.message),
+        )
+    is_invalid = assessment.status == QUALITY_STATUS_INVALID
+    return replace(
+        measurement,
+        valid=measurement.valid and not is_invalid,
+        quality_status=(
+            QUALITY_STATUS_INVALID if is_invalid else QUALITY_STATUS_WARNING
+        ),
+        quality_flag=combine_quality_flag(measurement.quality_flag, assessment.flag),
+        note=combine_quality_note(measurement.note, assessment.message),
+    )
+
+
+def apply_target_blend_assessment_to_measurements(
+    measurements: list[ApertureMeasurement],
+    assessment: TargetBlendAssessment,
+) -> list[ApertureMeasurement]:
+    """Apply one field-level blend assessment after all raw measurements exist."""
+
+    return [
+        apply_target_blend_assessment(measurement, assessment)
+        for measurement in measurements
+    ]
+
+
+def diagnostic_target_blend_measurements(
+    measured: list[ApertureMeasurement],
+    assessed: list[ApertureMeasurement],
+) -> list[ApertureMeasurement]:
+    """Restore only pre-blend-valid targets for diagnostic calibration."""
+
+    measured_valid_targets = {
+        (item.frame_index, item.filename, item.object_id)
+        for item in measured
+        if item.role == "target" and item.valid and item.inst_mag is not None
+    }
+    diagnostic: list[ApertureMeasurement] = []
+    for item in assessed:
+        identity = (item.frame_index, item.filename, item.object_id)
+        blend_rejected = (
+            item.role == "target"
+            and "TARGET_BLEND_MODELED_CONTAMINATION" in item.quality_flag.split("|")
+        )
+        if blend_rejected and identity in measured_valid_targets:
+            diagnostic.append(replace(item, valid=True))
+        else:
+            diagnostic.append(item)
+    return diagnostic
+
+
 def bright_end_residual_statistics(
     reference_rows: Iterable[tuple[float, float]],
     *,
@@ -9864,6 +10664,8 @@ def write_calibrated_light_curve(
     measurements: list[ApertureMeasurement],
     metadata: dict[str, object],
     min_valid_comps: int = MIN_VALID_COMP_STARS,
+    *,
+    result_rows_valid: bool = True,
 ) -> CalibrationWriteStats:
     """Write calibrated target magnitudes from instrumental measurements."""
 
@@ -10097,7 +10899,7 @@ def write_calibrated_light_curve(
                     "valid_comp_count": len(comp_items),
                     "comp_zero_point_scatter": f"{scatter:.6f}",
                     "comp_zero_point_error": f"{standard_error:.6f}",
-                    "valid": "1",
+                    "valid": "1" if result_rows_valid else "0",
                     "quality_status": measurement_quality_status(target),
                     "quality_flag": target.quality_flag,
                     "quality_note": target.note,
@@ -10240,6 +11042,7 @@ def write_single_field_zp_measurement_csv(
         "check_delta_mag",
         "check_quality_status",
         "check_quality_flag",
+        "valid",
         "quality_status",
         "quality_flag",
         "quality_note",
@@ -10289,6 +11092,7 @@ def write_single_field_zp_measurement_csv(
                 "check_delta_mag": format_csv_float(check_delta_mag),
                 "check_quality_status": "" if check is None else measurement_quality_status(check),
                 "check_quality_flag": "" if check is None else check.quality_flag,
+                "valid": int(target.valid),
                 "quality_status": measurement_quality_status(target),
                 "quality_flag": target.quality_flag,
                 "quality_note": target.note,
@@ -10461,6 +11265,14 @@ def is_single_field_zp_result_row(row: dict[str, str]) -> bool:
     return method in SINGLE_FIELD_ZP_METHOD_KEYS
 
 
+def result_row_is_valid(row: dict[str, str]) -> bool:
+    """Return whether a result row is usable, including legacy CSV schemas."""
+
+    if row.get("valid", "1").strip().lower() in {"0", "false", "no"}:
+        return False
+    return row.get("quality_status", "").strip().upper() != QUALITY_STATUS_INVALID
+
+
 def result_csv_contains_single_field_zp_rows(result_csv: Path) -> bool:
     """Return true when a result CSV is a Single Measurement Field-ZP result."""
 
@@ -10492,6 +11304,19 @@ def aavso_instrument_display_text(result_csv: Path | None) -> str:
         return aavso_instrument_from_result_csv(result_csv)
     except (OSError, ValueError):
         return "none"
+
+
+def validated_aavso_observer_code(value: object) -> str:
+    """Return one normalized AAVSO observer code or raise a user-facing error."""
+
+    observer_code = str(value or "").strip().upper()
+    if not observer_code:
+        raise ValueError("Enter your AAVSO observer code first.")
+    if not re.fullmatch(r"[A-Z0-9]{1,5}", observer_code):
+        raise ValueError(
+            "AAVSO observer code must contain 1 to 5 letters A-Z or digits 0-9 only."
+        )
+    return observer_code
 
 
 def aavso_notes_from_row(row: dict[str, str], instrument: str) -> str:
@@ -10564,7 +11389,7 @@ def result_csv_has_calibrated_check(result_csv: Path) -> bool:
     with result_csv.open(newline="") as input_fh:
         reader = csv_data_dict_reader(input_fh)
         for row in reader:
-            if row.get("valid", "1").strip() in {"0", "false", "False", "no", "NO"}:
+            if not result_row_is_valid(row):
                 continue
             try:
                 check_mag = float(row.get("check_calibrated_mag", ""))
@@ -10584,6 +11409,7 @@ def write_aavso_extended_report(
 ) -> int:
     """Write an AAVSO Extended Format report from a result_curve CSV."""
 
+    observer_code = validated_aavso_observer_code(observer_code)
     rows_written = 0
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with result_csv.open(newline="") as input_fh, output_path.open("w", newline="") as output_fh:
@@ -10597,7 +11423,7 @@ def write_aavso_extended_report(
         output_fh.write("#" + ",".join(AAVSO_EXTENDED_FIELDS) + "\n")
         writer = csv.writer(output_fh, lineterminator="\n")
         for row in reader:
-            if row.get("valid", "1").strip() in {"0", "false", "False", "no", "NO"}:
+            if not result_row_is_valid(row):
                 continue
             jd = first_result_row_float(row, "jd")
             mag = first_result_row_float(row, "target_calibrated_mag", "calibrated_mag")
@@ -10663,13 +11489,19 @@ def photometry_summary_lines(
     valid_target = sum(1 for item in target_measurements if item.valid)
     valid_comp = sum(1 for item in comparison_measurements if item.valid)
     invalid = [item for item in measurements if not item.valid]
-    reason_counts = Counter(item.note or "invalid measurement" for item in invalid)
+    reason_counts = compact_photometry_reason_counts(
+        invalid,
+        "invalid measurement",
+    )
     warnings = [
         item
         for item in measurements
         if item.valid and measurement_quality_status(item) == QUALITY_STATUS_WARNING
     ]
-    warning_counts = Counter(item.note or item.quality_flag for item in warnings)
+    warning_counts = compact_photometry_reason_counts(
+        warnings,
+        "warning measurement",
+    )
 
     by_frame: dict[int, list[ApertureMeasurement]] = {}
     for item in measurements:
@@ -10720,6 +11552,61 @@ def photometry_summary_lines(
         lines.append("No rejected aperture measurements.")
     lines.append("========================================")
     return lines
+
+
+def compact_photometry_reason_counts(
+    measurements: Iterable[ApertureMeasurement],
+    fallback: str,
+) -> Counter[str]:
+    """Group summary reasons by stable quality flag instead of per-frame notes."""
+
+    reasons: list[str] = []
+    for measurement in measurements:
+        quality_flag = measurement.quality_flag.strip()
+        if quality_flag and quality_flag != "OK":
+            reasons.append(quality_flag)
+            continue
+        reasons.append(measurement.note.strip() or quality_flag or fallback)
+    return Counter(reasons)
+
+
+def comparison_star_selection_failure_message(
+    raw_count: int,
+    usable_count: int,
+) -> str:
+    """Describe a final Comp-Star shortfall without changing selection policy."""
+
+    return (
+        "Comparison-star selection failed: "
+        f"{usable_count} usable Comp Stars remain from {raw_count} catalog "
+        "candidates after magnitude/error, visibility, and photometric quality "
+        f"filtering; at least {MIN_VALID_COMP_STARS} are required."
+    )
+
+
+def target_contamination_failure_message() -> str:
+    """Return the compact user-facing reason for a rejected target measurement."""
+
+    return "Rejected: Target contamination"
+
+
+def all_target_measurements_rejected_by_annulus_contamination(
+    measurements: Iterable[ApertureMeasurement],
+) -> bool:
+    """Return whether annulus contamination rejected every target measurement."""
+
+    targets = [measurement for measurement in measurements if measurement.role == "target"]
+    return bool(targets) and all(
+        not measurement.valid
+        and "ANNULUS_CONTAMINATION" in measurement.quality_flag.split("|")
+        for measurement in targets
+    )
+
+
+def annulus_contamination_failure_message() -> str:
+    """Return the compact user-facing reason for rejected target annuli."""
+
+    return "Rejected: Annulus contamination"
 
 
 def photometry_quality_summary(
@@ -11024,7 +11911,11 @@ def binned_lightcurve_points(
     )
 
 
-def load_light_curve_plot_data(result_csv: Path) -> LightCurvePlotData:
+def load_light_curve_plot_data(
+    result_csv: Path,
+    *,
+    include_invalid: bool = False,
+) -> LightCurvePlotData:
     """Read and validate the values used by all light-curve plot variants."""
 
     if not result_csv.exists():
@@ -11051,7 +11942,7 @@ def load_light_curve_plot_data(result_csv: Path) -> LightCurvePlotData:
 
     points: list[tuple[float, float, float | None, float | None]] = []
     for row in rows:
-        if row.get("valid", "1").strip() in {"0", "false", "False", "no", "NO"}:
+        if not include_invalid and not result_row_is_valid(row):
             continue
         try:
             jd = float(row["jd"])
@@ -11482,11 +12373,17 @@ class LightCurveWindow(QWidget):
         self.pending_single_vsx_selection: CatalogObject | None = None
         self.comparison_stars: list[CatalogObject] = []
         self.check_star: CatalogObject | None = None
+        self.comparison_selection_failure_reason = ""
         self.series_optimized_aperture_settings: ApertureSettings | None = None
         self.session_temp_directories: set[Path] = set()
         self.log_lines: list[str] = []
 
         self.target_label = QLabel("Selected target: none")
+        self.photometry_target_label = QLabel("Target: none")
+        self.photometry_target_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.photometry_target_label.setMaximumWidth(320)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -11562,6 +12459,7 @@ class LightCurveWindow(QWidget):
         self.result_browser_dialog: QDialog | None = None
         self.bav_result_browser_dialog: QDialog | None = None
         self.batch_tab: QWidget | None = None
+        self.bav_tab: QWidget | None = None
 
         self._build_ui()
         self.update_mode_dependent_controls()
@@ -11788,16 +12686,22 @@ class LightCurveWindow(QWidget):
         run_lightcurve_controls.addWidget(self.show_compstars_button)
 
         run_lightcurve_controls.addStretch(1)
+        run_lightcurve_controls.addWidget(self.photometry_target_label)
         run_lightcurve_layout.addLayout(run_lightcurve_controls)
         lightcurve_layout.addWidget(run_lightcurve_group)
 
         single_result_group = QGroupBox("Result")
         self.single_result_group = single_result_group
         single_result_layout = QVBoxLayout(single_result_group)
+        self.single_result_status_label = QLabel("MEASUREMENT STATUS: N/A")
+        self.single_result_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.single_result_status_label.setWordWrap(True)
+        single_result_layout.addWidget(self.single_result_status_label)
         for label in (self.single_result_target_label, self.single_result_check_label):
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             label.setWordWrap(True)
             single_result_layout.addWidget(label)
+        self.set_single_result_quality_banner("", "")
         single_result_group.setVisible(False)
         lightcurve_layout.addWidget(single_result_group)
 
@@ -11895,7 +12799,22 @@ class LightCurveWindow(QWidget):
         self.aavso_observer_code_edit = QLineEdit()
         self.aavso_observer_code_edit.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.aavso_observer_code_edit.setPlaceholderText("AAVSO observer code")
+        self.aavso_observer_code_edit.setToolTip(
+            "Required: 1 to 5 letters A-Z or digits 0-9."
+        )
         self.aavso_observer_code_edit.setFixedWidth(COMPACT_COMBO_WIDTH)
+        try:
+            observer_settings = load_optional_observer_result_settings()
+            bav_observer_code = str(
+                observer_settings.get("OBSERVER_AAVSO", "") or ""
+            ).strip().upper()
+        except Exception:
+            bav_observer_code = ""
+        self._aavso_bav_prefill = bav_observer_code
+        self.aavso_observer_code_edit.setText(bav_observer_code)
+        self.aavso_observer_code_edit.textEdited.connect(
+            self.uppercase_aavso_observer_code_input
+        )
         export_form.addRow("Observer code:", self.aavso_observer_code_edit)
 
         self.aavso_instrument_label = QLabel("none")
@@ -12031,6 +12950,7 @@ class LightCurveWindow(QWidget):
                 raise RuntimeError("create_bav_tab(context) did not return a QWidget")
 
             label = str(getattr(module, "PLUGIN_TAB_LABEL", "BAV")).strip() or "BAV"
+            self.bav_tab = bav_tab
             self.tabs.addTab(bav_tab, label)
             version = str(getattr(module, "BAV_PLUGIN_VERSION", "")).strip()
             version_text = f" (version {version})" if version else ""
@@ -12172,6 +13092,7 @@ class LightCurveWindow(QWidget):
             "get_photometry_mode": lambda: self.photometry_mode,
             "get_current_lightcurve": self.current_export_lightcurve,
             "set_current_lightcurve": self.set_current_lightcurve_from_plugin,
+            "set_aavso_observer_code_from_bav": self.set_aavso_observer_code_from_bav,
             "open_bav_results_folder": self.open_bav_result_browser,
             "get_diagnostic_result_csv": self.diagnostic_result_csv,
             "instrumental_csv_for_result_csv": self.instrumental_csv_for_result_csv,
@@ -12728,8 +13649,13 @@ class LightCurveWindow(QWidget):
 
         instrument_label = getattr(self, "aavso_instrument_label", None)
         if instrument_label is not None:
+            export_result = (
+                None
+                if self.current_result_origin == "diagnostic"
+                else self.loaded_lightcurve_csv
+            )
             instrument_label.setText(
-                aavso_instrument_display_text(self.loaded_lightcurve_csv)
+                aavso_instrument_display_text(export_result)
             )
 
     def display_result_status(self) -> str:
@@ -12931,8 +13857,56 @@ class LightCurveWindow(QWidget):
         """Reset the single-measurement result summary."""
 
         if hasattr(self, "single_result_target_label"):
+            self.set_single_result_quality_banner("", "")
             self.single_result_target_label.setText("Target: n/a")
             self.single_result_check_label.setText("Check: n/a")
+
+    def set_single_result_quality_banner(self, status: str, quality_flag: str) -> None:
+        """Show an unmistakable status banner above a Single Measurement result."""
+
+        if not hasattr(self, "single_result_status_label"):
+            return
+        normalized = str(status or "").strip().upper()
+        flags = str(quality_flag or "").strip()
+        if normalized == QUALITY_STATUS_INVALID:
+            if "TARGET_BLEND_MODELED_CONTAMINATION" in flags.split("|"):
+                reason = "TARGET CONTAMINATION"
+            elif "ANNULUS_CONTAMINATION" in flags.split("|"):
+                reason = "ANNULUS CONTAMINATION"
+            else:
+                reason = flags or "INVALID TARGET MEASUREMENT"
+            text = (
+                f"REJECTED / INVALID — {reason}\n"
+                "DIAGNOSTIC VALUE ONLY — NOT A VALID MEASUREMENT — EXPORT DISABLED"
+            )
+            style = (
+                "color: #ffffff; background-color: #8b1e1e; "
+                "border: 2px solid #ff6b6b; border-radius: 5px; "
+                "font-size: 16px; font-weight: 700; padding: 10px;"
+            )
+        elif normalized == QUALITY_STATUS_WARNING:
+            text = f"WARNING — {flags or 'CHECK QUALITY DETAILS'}"
+            style = (
+                "color: #1f1600; background-color: #e0a72f; "
+                "border: 2px solid #ffd166; border-radius: 5px; "
+                "font-size: 15px; font-weight: 700; padding: 8px;"
+            )
+        elif normalized == QUALITY_STATUS_OK:
+            text = "MEASUREMENT STATUS: OK"
+            style = (
+                "color: #ffffff; background-color: #276749; "
+                "border: 1px solid #68d391; border-radius: 5px; "
+                "font-size: 14px; font-weight: 700; padding: 7px;"
+            )
+        else:
+            text = "MEASUREMENT STATUS: N/A"
+            style = (
+                "color: #d8dee9; background-color: #353941; "
+                "border: 1px solid #555b66; border-radius: 5px; "
+                "font-weight: 600; padding: 6px;"
+            )
+        self.single_result_status_label.setText(text)
+        self.single_result_status_label.setStyleSheet(style)
 
     def set_loaded_single_result_summary(self, result_csv: Path, rows: list[dict[str, str]]) -> None:
         """Show a compact summary for a loaded Single Measurement result CSV."""
@@ -12943,7 +13917,7 @@ class LightCurveWindow(QWidget):
             (
                 item
                 for item in rows
-                if item.get("valid", "1").strip() not in {"0", "false", "False", "no", "NO"}
+                if result_row_is_valid(item)
             ),
             rows[0] if rows else {},
         )
@@ -12956,9 +13930,15 @@ class LightCurveWindow(QWidget):
         zp_scatter = csv_text(row.get("field_zero_point_scatter"), "n/a")
         image_source = csv_text(row.get("image_source"), "n/a")
         aavso_filter = csv_text(row.get("aavso_filter"), "n/a")
+        row_valid = result_row_is_valid(row)
+        quality_status = csv_text(row.get("quality_status"), QUALITY_STATUS_OK).upper()
+        quality_flag = csv_text(row.get("quality_flag"), "")
+        if not row_valid:
+            quality_status = QUALITY_STATUS_INVALID
+        self.set_single_result_quality_banner(quality_status, quality_flag)
+        target_prefix = "Target: " if row_valid else "Diagnostic value only: "
         self.single_result_target_label.setText(
-            "Target: "
-            f"{mag} +/- {err} mag, refs={references}, "
+            f"{target_prefix}{mag} +/- {err} mag, refs={references}, "
             f"ZP scatter={zp_scatter} mag, filter={aavso_filter} ({image_source})"
         )
 
@@ -12997,9 +13977,16 @@ class LightCurveWindow(QWidget):
         check_catalog_mag = None if check is None else check.catalog_mag
         check_snr = None if check is None or not np.isfinite(check.snr) else check.snr
 
+        target_status = measurement_quality_status(target)
+        self.set_single_result_quality_banner(target_status, target.quality_flag)
+        target_prefix = (
+            "Diagnostic value only: "
+            if target_status == QUALITY_STATUS_INVALID
+            else "Target: "
+        )
+
         self.single_result_target_label.setText(
-            "Target: "
-            f"{calibrated_mag:.4f} +/- {calibrated_error:.4f} mag, "
+            f"{target_prefix}{calibrated_mag:.4f} +/- {calibrated_error:.4f} mag, "
             f"SNR={target.snr:.1f}, {reference_label}={valid_comp_count}, "
             f"ZP scatter={zero_point_scatter:.4f} mag, "
             f"B-V={format_optional_float(target_bv)}, g-r={format_optional_float(target_gr)}"
@@ -13247,6 +14234,7 @@ class LightCurveWindow(QWidget):
 
         self.comparison_stars = []
         self.check_star = None
+        self.comparison_selection_failure_reason = ""
         self.series_optimized_aperture_settings = None
         self.comp_status = "none"
         if hasattr(self, "comp_tree"):
@@ -13270,7 +14258,7 @@ class LightCurveWindow(QWidget):
         self.filtered_catalog_objects = []
         self.selected_target = None
         self.clear_comparison_star_state()
-        self.target_label.setText("Selected target: none")
+        self.set_selected_target_labels()
         self.vsx_tree.clear()
         self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
         self.prepare_button.setEnabled(False)
@@ -13443,6 +14431,33 @@ class LightCurveWindow(QWidget):
                 except Exception as exc:
                     self.append_log(f"WARNING: Optional tab refresh failed: {exc}")
 
+    def refresh_bav_tab_view(self) -> None:
+        """Refresh the BAV view after the current result has changed."""
+
+        refresh_view = getattr(self.bav_tab, "refresh_plugin_view", None)
+        if callable(refresh_view):
+            try:
+                refresh_view()
+            except Exception as exc:
+                self.append_log(f"WARNING: BAV tab refresh failed: {exc}")
+
+    def set_selected_target_labels(self, target_name: str | None = None) -> None:
+        """Keep the Variables and Photometry target labels in sync."""
+
+        clean_name = str(target_name or "").strip()
+        display_name = clean_name or "none"
+        photometry_text = f"Target: {display_name}"
+        compact_photometry_text = self.photometry_target_label.fontMetrics().elidedText(
+            photometry_text,
+            Qt.TextElideMode.ElideMiddle,
+            self.photometry_target_label.maximumWidth(),
+        )
+        self.target_label.setText(f"Selected target: {display_name}")
+        self.photometry_target_label.setText(compact_photometry_text)
+        self.photometry_target_label.setToolTip(
+            photometry_text if compact_photometry_text != photometry_text else ""
+        )
+
     def choose_source_input(self) -> None:
         busy_message = self.busy_context_change_message("load another source")
         if busy_message is not None:
@@ -13549,7 +14564,7 @@ class LightCurveWindow(QWidget):
         self.comparison_stars = []
         self.check_star = None
         self.series_optimized_aperture_settings = None
-        self.target_label.setText("Selected target: none")
+        self.set_selected_target_labels()
         self.vsx_tree.clear()
         self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
         self.comp_tree.clear()
@@ -13647,7 +14662,7 @@ class LightCurveWindow(QWidget):
         self.comparison_stars = []
         self.check_star = None
         self.series_optimized_aperture_settings = None
-        self.target_label.setText("Selected target: none")
+        self.set_selected_target_labels()
         self.vsx_tree.clear()
         self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
         self.comp_tree.clear()
@@ -13983,7 +14998,7 @@ class LightCurveWindow(QWidget):
         self.comparison_stars = []
         self.check_star = None
         self.series_optimized_aperture_settings = None
-        self.target_label.setText("Selected target: none")
+        self.set_selected_target_labels()
         self.select_target_button.setEnabled(False)
         self.vsx_selected_button.setEnabled(False)
         self.comp_tree.clear()
@@ -14131,7 +15146,7 @@ class LightCurveWindow(QWidget):
         self.comparison_stars = []
         self.check_star = None
         self.series_optimized_aperture_settings = None
-        self.target_label.setText("Selected target: none")
+        self.set_selected_target_labels()
         self.select_target_button.setEnabled(False)
         self.vsx_selected_button.setEnabled(False)
         self.comp_tree.clear()
@@ -14372,7 +15387,7 @@ class LightCurveWindow(QWidget):
         self.comparison_stars = []
         self.check_star = None
         self.series_optimized_aperture_settings = None
-        self.target_label.setText("Selected target: none")
+        self.set_selected_target_labels()
         self.clear_single_result_summary()
         self.comp_tree.clear()
         self.run_light_curve_button.setEnabled(False)
@@ -14743,7 +15758,7 @@ class LightCurveWindow(QWidget):
         self.set_extremum_fit_text("Min/Max fit: none")
         self.clear_comparison_star_state()
         self.run_light_curve_button.setEnabled(self.photometry_mode == MODE_LIGHTCURVE)
-        self.target_label.setText(f"Selected target: {obj.name or '(unnamed)'}")
+        self.set_selected_target_labels(obj.name or "(unnamed)")
         self.update_selected_target_lightcurve_status()
         self.append_log(
             "Selected target: "
@@ -14839,6 +15854,7 @@ class LightCurveWindow(QWidget):
 
     def find_comparison_stars(self) -> bool:
         self.append_log("Selecting Comp Stars and Check Star for current Light Curve.")
+        self.comparison_selection_failure_reason = ""
         if self.photometry_mode == MODE_SINGLE_MEASUREMENT:
             self.append_log("Comp Stars are not used in Single Measurement mode; Field ZP is automatic.")
             return False
@@ -15072,11 +16088,14 @@ class LightCurveWindow(QWidget):
             )
         else:
             self.append_log("WARNING: No suitable Check Star available after Comp Star selection.")
-        if len(self.comparison_stars) < 3:
+        if len(self.comparison_stars) < MIN_VALID_COMP_STARS:
             self.set_comp_status("failed")
+            self.comparison_selection_failure_reason = comparison_star_selection_failure_message(
+                raw_count,
+                len(self.comparison_stars),
+            )
             self.append_log(
-                "WARNING: Fewer than 3 Comp Stars remain after visibility and "
-                "photometric quality filtering."
+                f"WARNING: {self.comparison_selection_failure_reason}"
             )
             self.update_compstars_dialog_status()
             return False
@@ -15253,6 +16272,15 @@ class LightCurveWindow(QWidget):
         if output_dir is None or stem is None:
             return None
         return output_dir / f"{stem}_result_curve.csv"
+
+    def selected_target_diagnostic_curve_csv(self) -> Path | None:
+        """Return the separate non-exportable target-contamination curve path."""
+
+        output_dir = self.lightcurve_output_directory()
+        stem = self.selected_target_output_stem()
+        if output_dir is None or stem is None:
+            return None
+        return output_dir / f"{stem}_diagnostic_curve.csv"
 
     def start_light_curve_for_batch(self) -> None:
         """Run one batch light-curve target through the normal GUI busy path."""
@@ -15634,18 +16662,11 @@ class LightCurveWindow(QWidget):
         )
         if blend_assessment.status == QUALITY_STATUS_OK:
             self.append_log(blend_assessment.message)
-        elif blend_assessment.blocking:
-            self.set_result_status("failed")
-            self.append_log(f"ERROR: {blend_assessment.message}")
-            QMessageBox.warning(
-                self,
-                "Single Measurement",
-                "Target measurement rejected.\n\n"
-                f"{blend_assessment.message}",
-            )
-            return
         else:
-            self.append_log(f"WARNING: {blend_assessment.message}")
+            self.append_log(
+                f"WARNING: {blend_assessment.message} "
+                "The aperture measurement will run before this quality decision is applied."
+            )
 
         measurements = aperture_measurements_for_frame(
             frame_path,
@@ -15854,6 +16875,10 @@ class LightCurveWindow(QWidget):
             target_measurement,
             linearity_assessment,
         )
+        target_measurement = apply_target_blend_assessment(
+            target_measurement,
+            blend_assessment,
+        )
         measurements = [
             target_measurement if item.role == "target" else item
             for item in measurements
@@ -15896,6 +16921,49 @@ class LightCurveWindow(QWidget):
             field_zp_references,
             field_zp_fit,
         )
+        if not target_measurement.valid:
+            message = (
+                target_contamination_failure_message()
+                if blend_assessment.status == QUALITY_STATUS_INVALID
+                else "Rejected: Invalid target measurement"
+            )
+            self.set_result_status("failed")
+            self.set_single_result_summary(
+                target_measurement,
+                check_measurement,
+                calibrated_mag,
+                calibrated_error,
+                check_calibrated_mag,
+                check_delta_mag,
+                zero_point_scatter,
+                field_zp_fit.used_count,
+                "refs",
+            )
+            self.lightcurve_status_label.setText(
+                f"{message}. Diagnostic: {result_csv}"
+            )
+            self.export_status_label.setText(
+                "Single measurement rejected; no result available for export."
+            )
+            self.append_log(f"ERROR: {message}")
+            self.append_log(
+                "Rejected Single Measurement diagnostic written: "
+                f"{result_csv.name}; quality="
+                f"{measurement_quality_status(target_measurement)}/"
+                f"{target_measurement.quality_flag}."
+            )
+            self.append_log(
+                f"Single instrumental photometry written: {instrumental_csv.name}."
+            )
+            self.append_log(
+                f"Single field-ZP references written: {field_zp_references_csv.name}."
+            )
+            QMessageBox.warning(
+                self,
+                "Single Measurement — REJECTED / INVALID",
+                f"{message}\n\nThe displayed magnitude is diagnostic only and cannot be exported.",
+            )
+            return
         self.append_log(
             "Single field-ZP measurement written: "
             f"{result_csv.name}; mag={calibrated_mag:.4f} "
@@ -15912,6 +16980,7 @@ class LightCurveWindow(QWidget):
         self.loaded_lightcurve_source_label = source_dir.name if source_dir is not None else ""
         self.current_exports.clear()
         self.set_result_status("created")
+        self.refresh_bav_tab_view()
         self.plot_light_curve_button.setEnabled(False)
         check_text = (
             "n/a"
@@ -15979,6 +17048,141 @@ class LightCurveWindow(QWidget):
         )
         self.append_log(single_summary)
 
+    def request_contaminated_target_diagnostic_curve(self) -> bool | None:
+        """Ask whether a manual rejected target should continue for diagnostics."""
+
+        if not ENABLE_CONTAMINATED_TARGET_DIAGNOSTIC_CURVE:
+            return None
+        if self.batch_tab is not None and getattr(self.batch_tab, "running", False):
+            return None
+
+        reply = QMessageBox.question(
+            self,
+            "Diagnostic Curve",
+            "The target is rejected because of modeled contamination.\n\n"
+            "Continue with Comp Star selection and aperture measurements to attempt "
+            "a separate diagnostic curve?\n\n"
+            "The curve will be marked invalid and cannot be exported, archived, "
+            "or used for Min/Max fitting.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self.append_log("Diagnostic contaminated-target curve declined.")
+            return False
+        self.append_log(
+            "Diagnostic contaminated-target curve requested; continuing with "
+            "Comp Star selection and aperture measurements."
+        )
+        return True
+
+    def offer_contaminated_target_diagnostic_curve(
+        self,
+        measured: list[ApertureMeasurement],
+        assessed: list[ApertureMeasurement],
+        result_metadata: dict[str, object],
+        target_name: str,
+        source_label: str,
+        *,
+        confirmed: bool = False,
+    ) -> bool:
+        """Offer one explicitly non-exportable curve after a manual blend rejection."""
+
+        if not ENABLE_CONTAMINATED_TARGET_DIAGNOSTIC_CURVE:
+            return False
+        if self.batch_tab is not None and getattr(self.batch_tab, "running", False):
+            return False
+
+        if not confirmed:
+            decision = self.request_contaminated_target_diagnostic_curve()
+            if decision is not True:
+                return decision is not None
+
+        diagnostic_measurements = diagnostic_target_blend_measurements(
+            measured,
+            assessed,
+        )
+        if not any(
+            item.role == "target" and item.valid
+            for item in diagnostic_measurements
+        ):
+            self.append_log(
+                "Diagnostic contaminated-target curve unavailable: "
+                "no target frame was valid before the blend assessment."
+            )
+            return False
+
+        diagnostic_csv = self.selected_target_diagnostic_curve_csv()
+        if diagnostic_csv is None:
+            self.append_log("ERROR: Diagnostic curve output path is unavailable.")
+            QMessageBox.warning(
+                self,
+                "Diagnostic Curve",
+                "Diagnostic curve output path is unavailable.",
+            )
+            return True
+
+        diagnostic_metadata = {
+            **result_metadata,
+            "RESULT_PURPOSE": CONTAMINATED_TARGET_DIAGNOSTIC_PURPOSE,
+            "EXPORT_ALLOWED": 0,
+            "ARCHIVE_ALLOWED": 0,
+            "EXTREMUM_FIT_ALLOWED": 0,
+            "DIAGNOSTIC_REASON": "TARGET_BLEND_MODELED_CONTAMINATION",
+            "DIAGNOSTIC_NOTE": (
+                "Rejected target measurements retained for visual testing only; "
+                "not a scientific result"
+            ),
+        }
+        diagnostic_stats = write_calibrated_light_curve(
+            diagnostic_csv,
+            diagnostic_measurements,
+            diagnostic_metadata,
+            result_rows_valid=False,
+        )
+        if diagnostic_stats.rows_written == 0:
+            self.append_log(
+                "Diagnostic contaminated-target curve could not be created: "
+                "no otherwise usable calibrated rows remained."
+            )
+            QMessageBox.warning(
+                self,
+                "Diagnostic Curve",
+                "No otherwise usable calibrated target rows remained.",
+            )
+            return True
+
+        self.loaded_lightcurve_csv = diagnostic_csv
+        self.loaded_lightcurve_target_name = target_name
+        self.loaded_lightcurve_source_label = source_label
+        self.current_result_origin = "diagnostic"
+        self.current_exports.clear()
+        self.set_result_status("warning")
+        self.plot_light_curve_button.setEnabled(True)
+        self.export_status_label.setText(
+            "Diagnostic curve: scientific export and archive are disabled."
+        )
+        self.tabs.setCurrentWidget(self.lightcurve_tab)
+        self.plot_light_curve_csv(
+            diagnostic_csv,
+            diagnostic_csv.with_suffix(".png"),
+            f"{target_name} — DIAGNOSTIC: TARGET CONTAMINATION — NOT FOR EXPORT",
+            source_label,
+            allow_extremum=False,
+            include_invalid=True,
+        )
+        self.lightcurve_status_label.setText(
+            "Diagnostic contaminated-target curve written: "
+            f"{diagnostic_stats.rows_written} row(s). NOT FOR EXPORT. "
+            f"Output: {diagnostic_csv}"
+        )
+        self.append_log(
+            "Diagnostic contaminated-target curve written: "
+            f"{diagnostic_csv} ({diagnostic_stats.rows_written} row(s)); "
+            "all target result rows remain valid=0/INVALID and export is disabled."
+        )
+        return True
+
     def run_light_curve(self) -> None:
         if self.photometry_mode == MODE_SINGLE_MEASUREMENT:
             self.run_single_measurement()
@@ -16014,34 +17218,44 @@ class LightCurveWindow(QWidget):
             target_blend_aperture_settings,
             self.append_log,
         )
+        self.clear_comparison_star_state()
+        diagnostic_curve_requested = False
         if blend_assessment.status == QUALITY_STATUS_OK:
             self.append_log(blend_assessment.message)
-        elif blend_assessment.blocking:
-            self.fail_lightcurve_run(blend_assessment.message)
-            self.lightcurve_status_label.setText(
-                "Light Curve not created: target blend detected."
-            )
-            self.append_log(f"ERROR: {blend_assessment.message}")
-            self.show_lightcurve_failure_dialog(
-                "Target measurement rejected.\n\n"
-                f"{blend_assessment.message}",
-            )
-            return
-        else:
+        elif blend_assessment.status == QUALITY_STATUS_INVALID:
             self.append_log(f"WARNING: {blend_assessment.message}")
+            diagnostic_decision = self.request_contaminated_target_diagnostic_curve()
+            if diagnostic_decision is True:
+                diagnostic_curve_requested = True
+            else:
+                message = target_contamination_failure_message()
+                self.fail_lightcurve_run(message)
+                self.lightcurve_status_label.setText(message)
+                self.append_log(f"ERROR: {message}")
+                if diagnostic_decision is None:
+                    self.show_lightcurve_failure_dialog(message)
+                return
+        else:
+            self.append_log(
+                f"WARNING: {blend_assessment.message} "
+                "All aperture measurements will run before this quality decision is applied."
+            )
 
         self.lightcurve_status_label.setText(
             "Selecting Comp Stars and Check Star automatically before creating the Light Curve."
         )
-        self.clear_comparison_star_state()
         selection_started = time.monotonic()
         if not self.find_comparison_stars():
-            self.fail_lightcurve_run("Comparison-star selection failed.")
+            message = (
+                self.comparison_selection_failure_reason
+                or "Comparison-star selection failed. See the log for details."
+            )
+            self.fail_lightcurve_run(message)
             self.lightcurve_status_label.setText(
-                "Light Curve not created: Comp Star selection failed."
+                f"Light Curve not created: {message}"
             )
             self.show_lightcurve_failure_dialog(
-                "Could not select Comp Stars.\n\nSee the log for details.",
+                f"Could not select Comp Stars.\n\n{message}",
             )
             return
         self.append_log(
@@ -16297,6 +17511,21 @@ class LightCurveWindow(QWidget):
             self.show_lightcurve_failure_dialog("No measurements were created.")
             return
 
+        measurements_before_target_blend = measurements
+        measurements = apply_target_blend_assessment_to_measurements(
+            measurements_before_target_blend,
+            blend_assessment,
+        )
+        if blend_assessment.status != QUALITY_STATUS_OK:
+            affected_targets = sum(
+                1 for item in measurements if item.role == "target"
+            )
+            self.append_log(
+                "Target blend quality applied after aperture measurement: "
+                f"{blend_assessment.status}/{blend_assessment.flag}; "
+                f"target rows={affected_targets}."
+            )
+
         try:
             result_metadata = self.result_metadata(
                 measurements,
@@ -16338,11 +17567,19 @@ class LightCurveWindow(QWidget):
                 f"rejected {calibration_stats.rejected_high_scatter} frame(s)."
             )
         if rows_written == 0:
-            message = (
-                "No calibrated Light Curve rows were written. "
-                f"Need at least {MIN_VALID_COMP_STARS} valid Comp Stars per frame "
-                "and a stable Comp Star zero point."
-            )
+            compact_rejection = False
+            if blend_assessment.status == QUALITY_STATUS_INVALID:
+                message = target_contamination_failure_message()
+                compact_rejection = True
+            elif all_target_measurements_rejected_by_annulus_contamination(measurements):
+                message = annulus_contamination_failure_message()
+                compact_rejection = True
+            else:
+                message = (
+                    "No calibrated Light Curve rows were written. "
+                    f"Need at least {MIN_VALID_COMP_STARS} valid Comp Stars per frame "
+                    "and a stable Comp Star zero point."
+                )
             self.fail_lightcurve_run(message)
             self.append_log(f"ERROR: {message}")
             for line in photometry_summary_lines(
@@ -16357,9 +17594,24 @@ class LightCurveWindow(QWidget):
             run_log = self.write_run_log(output_dir)
             self.append_log(f"Run log written: {run_log.name}")
             self.write_run_log(output_dir)
-            self.show_lightcurve_failure_dialog(
-                "No usable Light Curve points were created.\n\nSee the log for details.",
-            )
+            diagnostic_offer_handled = False
+            if blend_assessment.status == QUALITY_STATUS_INVALID:
+                diagnostic_offer_handled = self.offer_contaminated_target_diagnostic_curve(
+                    measurements_before_target_blend,
+                    measurements,
+                    result_metadata,
+                    target_name,
+                    source_dir.name if source_dir is not None else "",
+                    confirmed=diagnostic_curve_requested,
+                )
+            if not diagnostic_offer_handled:
+                self.show_lightcurve_failure_dialog(
+                    (
+                        message
+                        if compact_rejection
+                        else "No usable Light Curve points were created.\n\nSee the log for details."
+                    ),
+                )
             return
 
         self.plot_light_curve_button.setEnabled(True)
@@ -16369,6 +17621,7 @@ class LightCurveWindow(QWidget):
         self.current_result_origin = "created"
         self.current_exports.clear()
         self.set_result_status("created")
+        self.refresh_bav_tab_view()
         self.lightcurve_status_label.setText(
             f"Light Curve written: {rows_written} row(s), "
             f"target warnings={quality_summary['target_warning']}, "
@@ -16419,11 +17672,17 @@ class LightCurveWindow(QWidget):
                     "Loaded Light Curve CSV not found.",
                 )
                 return
+            diagnostic = self.current_result_origin == "diagnostic"
+            plot_target_name = self.loaded_lightcurve_target_name
+            if diagnostic:
+                plot_target_name += " — DIAGNOSTIC: TARGET CONTAMINATION — NOT FOR EXPORT"
             self.plot_light_curve_csv(
                 self.loaded_lightcurve_csv,
                 self.loaded_lightcurve_csv.with_suffix(".png"),
-                self.loaded_lightcurve_target_name,
+                plot_target_name,
                 self.loaded_lightcurve_source_label,
+                allow_extremum=not diagnostic,
+                include_invalid=diagnostic,
             )
             return
 
@@ -16470,6 +17729,7 @@ class LightCurveWindow(QWidget):
         target_name = target_name.replace("_", " ") or "Target"
         self.loaded_lightcurve_csv = path
         self.loaded_lightcurve_target_name = target_name
+        self.set_selected_target_labels(target_name)
         self.loaded_lightcurve_source_label = path.parent.name
         self.current_result_origin = "loaded"
         self.current_exports.clear()
@@ -16528,35 +17788,73 @@ class LightCurveWindow(QWidget):
             )
             return
         result_metadata = read_result_metadata_header(result_csv)
+        is_diagnostic_result = result_metadata_is_diagnostic(result_metadata)
         target_name = result_metadata.get("OBJECT_NAME", "").strip() or result_csv.name
         series_suffix = "_result_curve.csv"
         single_suffix = "_single_field_zp_measurement.csv"
+        diagnostic_suffix = "_diagnostic_curve.csv"
         if target_name.endswith(series_suffix):
             target_name = target_name[: -len(series_suffix)]
         elif target_name.endswith(single_suffix):
             target_name = target_name[: -len(single_suffix)]
+        elif target_name.endswith(diagnostic_suffix):
+            target_name = target_name[: -len(diagnostic_suffix)]
         elif target_name.endswith(".csv"):
             target_name = target_name[:-4]
         target_name = target_name.replace("_", " ") or "Target"
         self.loaded_lightcurve_csv = result_csv
         self.loaded_lightcurve_target_name = target_name
+        self.set_selected_target_labels(target_name)
         self.loaded_lightcurve_source_label = result_csv.parent.name
-        self.current_result_origin = "single" if is_single_result else "loaded"
+        self.current_result_origin = (
+            "diagnostic"
+            if is_diagnostic_result
+            else ("single" if is_single_result else "loaded")
+        )
         self.current_exports.clear()
-        self.set_result_status("loaded")
+        self.set_result_status("warning" if is_diagnostic_result else "loaded")
         self.plot_light_curve_button.setEnabled(not is_single_result)
-        self.export_status_label.setText(f"Current export source: {result_csv}")
+        if is_diagnostic_result:
+            self.export_status_label.setText(
+                "Diagnostic curve: scientific export and archive are disabled."
+            )
+        else:
+            self.export_status_label.setText(f"Current export source: {result_csv}")
         if is_single_result:
             rows: list[dict[str, str]] = []
             with result_csv.open(newline="") as fh:
                 reader = csv_data_dict_reader(fh)
                 rows.extend(reader)
             self.set_loaded_single_result_summary(result_csv, rows)
-            self.lightcurve_status_label.setText(f"Single measurement loaded: {result_csv}")
-            self.append_log(f"Single Measurement CSV loaded: {result_csv}")
+            if rows and not any(result_row_is_valid(row) for row in rows):
+                self.set_result_status("failed")
+                self.lightcurve_status_label.setText(
+                    f"Rejected Single Measurement diagnostic loaded: {result_csv}"
+                )
+                self.export_status_label.setText(
+                    "Rejected Single Measurement diagnostic; no valid row for export."
+                )
+                self.append_log(
+                    f"Rejected Single Measurement diagnostic loaded: {result_csv}"
+                )
+            else:
+                self.lightcurve_status_label.setText(
+                    f"Single measurement loaded: {result_csv}"
+                )
+                self.append_log(f"Single Measurement CSV loaded: {result_csv}")
             self.refresh_optional_tab_views()
             return
-        self.plot_light_curve_csv(result_csv, None, target_name, result_csv.parent.name)
+        plot_target_name = target_name
+        if is_diagnostic_result:
+            plot_target_name += " — DIAGNOSTIC: TARGET CONTAMINATION — NOT FOR EXPORT"
+        self.plot_light_curve_csv(
+            result_csv,
+            None,
+            plot_target_name,
+            result_csv.parent.name,
+            allow_extremum=not is_diagnostic_result,
+            include_invalid=is_diagnostic_result,
+        )
         self.refresh_optional_tab_views()
 
     def open_result_browser(self) -> None:
@@ -16936,24 +18234,44 @@ class LightCurveWindow(QWidget):
             raise RuntimeError(f"Result CSV not found: {path}")
         name = str(target_name or "").strip()
         result_metadata = read_result_metadata_header(path)
+        is_diagnostic_result = result_metadata_is_diagnostic(result_metadata)
         if not name:
             name = result_metadata.get("OBJECT_NAME", "").strip() or path.stem.replace("_result_curve", "")
             name = name.replace("_", " ")
         self.loaded_lightcurve_csv = path
         self.loaded_lightcurve_target_name = name or "Target"
+        self.set_selected_target_labels(self.loaded_lightcurve_target_name)
         self.loaded_lightcurve_source_label = path.parent.name
-        self.current_result_origin = "loaded"
+        self.current_result_origin = "diagnostic" if is_diagnostic_result else "loaded"
         self.current_exports.clear()
-        self.set_result_status("loaded")
-        can_plot_lightcurve = path.name.endswith("_result_curve.csv")
+        self.set_result_status("warning" if is_diagnostic_result else "loaded")
+        can_plot_lightcurve = (
+            path.name.endswith("_result_curve.csv") or is_diagnostic_result
+        )
         self.plot_light_curve_button.setEnabled(can_plot_lightcurve)
-        self.export_status_label.setText(f"Current export source: {path}")
-        self.lightcurve_status_label.setText(f"Light curve loaded: {path}")
+        if is_diagnostic_result:
+            self.export_status_label.setText(
+                "Diagnostic curve: scientific export and archive are disabled."
+            )
+            self.lightcurve_status_label.setText(f"Diagnostic curve loaded: {path}")
+        else:
+            self.export_status_label.setText(f"Current export source: {path}")
+            self.lightcurve_status_label.setText(f"Light curve loaded: {path}")
         self.update_current_curve_path_label()
         self.append_log(f"Light Curve CSV loaded from plugin: {path}")
         self.clear_extremum_fit(redraw=False, reset_status=False)
         if plot_lightcurve and can_plot_lightcurve:
-            self.plot_light_curve_csv(path, None, self.loaded_lightcurve_target_name, path.parent.name)
+            plot_target_name = self.loaded_lightcurve_target_name
+            if is_diagnostic_result:
+                plot_target_name += " — DIAGNOSTIC: TARGET CONTAMINATION — NOT FOR EXPORT"
+            self.plot_light_curve_csv(
+                path,
+                None,
+                plot_target_name,
+                path.parent.name,
+                allow_extremum=not is_diagnostic_result,
+                include_invalid=is_diagnostic_result,
+            )
         self.refresh_optional_tab_views()
 
     def current_export_lightcurve(self) -> tuple[Path, str] | None:
@@ -16964,6 +18282,12 @@ class LightCurveWindow(QWidget):
             and self.loaded_lightcurve_csv is not None
             and self.loaded_lightcurve_csv.exists()
         ):
+            try:
+                metadata = read_result_metadata_header(self.loaded_lightcurve_csv)
+            except OSError:
+                return None
+            if not result_metadata_allows_export(metadata):
+                return None
             return self.loaded_lightcurve_csv, self.loaded_lightcurve_target_name or "Target"
         return None
 
@@ -17041,22 +18365,39 @@ class LightCurveWindow(QWidget):
     def resolved_aavso_observer_code(self) -> tuple[str, str]:
         """Return the AAVSO observer code and the source used for export."""
 
-        observer_code = self.aavso_observer_code_edit.text().strip().upper()
-        if observer_code:
-            return observer_code, "Export tab"
+        observer_code = validated_aavso_observer_code(
+            self.aavso_observer_code_edit.text()
+        )
+        if self.aavso_observer_code_edit.text() != observer_code:
+            self.aavso_observer_code_edit.setText(observer_code)
+        if observer_code == getattr(self, "_aavso_bav_prefill", ""):
+            return observer_code, "BAV settings"
+        return observer_code, "Export tab"
+
+    def uppercase_aavso_observer_code_input(self, text: str) -> None:
+        """Uppercase AAVSO observer-code text as the user enters it."""
+
+        normalized = text.upper()
+        if normalized == text:
+            return
+        cursor_position = self.aavso_observer_code_edit.cursorPosition()
+        self.aavso_observer_code_edit.setText(normalized)
+        self.aavso_observer_code_edit.setCursorPosition(cursor_position)
+
+    def set_aavso_observer_code_from_bav(self, value: object) -> bool:
+        """Refresh the BAV prefill without replacing a manual Export override."""
 
         try:
-            optional_settings = load_optional_observer_result_settings()
-        except Exception:
-            return "", ""
-
-        observer_code = str(
-            optional_settings.get("OBSERVER_AAVSO", "") or ""
-        ).strip().upper()
-        if observer_code:
+            observer_code = validated_aavso_observer_code(value)
+        except ValueError:
+            return False
+        current_code = self.aavso_observer_code_edit.text().strip().upper()
+        previous_prefill = getattr(self, "_aavso_bav_prefill", "")
+        use_new_prefill = not current_code or current_code == previous_prefill
+        self._aavso_bav_prefill = observer_code
+        if use_new_prefill:
             self.aavso_observer_code_edit.setText(observer_code)
-            return observer_code, "BAV settings"
-        return "", ""
+        return use_new_prefill
 
     def export_aavso_report(self) -> None:
         """Export the current light curve as an AAVSO Extended Format report."""
@@ -17071,10 +18412,12 @@ class LightCurveWindow(QWidget):
                 "Create or open a result first.",
             )
             return
-        observer_code, observer_code_source = self.resolved_aavso_observer_code()
-        if not observer_code:
+        try:
+            observer_code, observer_code_source = self.resolved_aavso_observer_code()
+        except ValueError as exc:
             self.set_export_process_status("failed")
-            QMessageBox.warning(self, "AAVSO Export", "Enter your AAVSO observer code first.")
+            self.append_log(f"WARNING: AAVSO export observer code rejected: {exc}")
+            QMessageBox.warning(self, "AAVSO Export", str(exc))
             return
         result_csv, target_name = current
         output_path = self.current_aavso_export_path(result_csv)
@@ -17130,11 +18473,15 @@ class LightCurveWindow(QWidget):
         source_label: str = "",
         *,
         allow_extremum: bool = True,
+        include_invalid: bool = False,
     ) -> None:
         bin_mode = str(self.plot_binning_mode_combo.currentData() or "off")
         bin_value = int(self.plot_binning_value_spin.value())
         try:
-            plot_data = load_light_curve_plot_data(result_csv)
+            plot_data = load_light_curve_plot_data(
+                result_csv,
+                include_invalid=include_invalid,
+            )
             axis, bin_status_text = draw_light_curve_figure(
                 self.lightcurve_figure,
                 plot_data,
@@ -17527,14 +18874,26 @@ class LightCurveWindow(QWidget):
                 <li>Comparison stars and an independent check star are selected automatically.</li>
                 <li>Click <b>Show Comparison Stars</b> to inspect the selected ensemble.</li>
             </ul>
-            <p>Measurements are rejected for:</p>
+            <p>Measurements can be rejected for:</p>
             <ul>
                 <li>saturation, excessive high pixels, or non-positive flux;</li>
                 <li>SNR below {MIN_PHOTOMETRY_SNR:g} or magnitude error above
                 {MAX_INSTRUMENTAL_MAG_ERROR:g} mag;</li>
-                <li>a large centroid offset or excessive background contamination;</li>
+                <li>a large centroid offset;</li>
+                <li>a completely modeled Gaia neighbor blend with at least
+                {TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag expected target impact;</li>
+                <li>background contamination of a comparison or check star with at least
+                {REFERENCE_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact;</li>
+                <li>target background/annulus contamination with at least
+                {TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact;</li>
                 <li>inconsistent comparison-star zero points.</li>
             </ul>
+            <p>Warnings remain usable and stay visible in the CSV and log. In particular,
+            target background/annulus contamination is a warning from
+            {TARGET_ANNULUS_IMPACT_WARNING_MAG:.2f} mag and invalid from
+            {TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag.
+            Missing or ambiguous Gaia evidence is also a warning; the aperture measurement
+            still runs.</p>
             <div class="note">
                 The result contains only valid calibrated target points.<br>
                 Results: <code>../{RESULTS_DIRECTORY_NAME}/&lt;FITS-folder-name&gt;</code><br>

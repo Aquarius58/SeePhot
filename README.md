@@ -3,7 +3,7 @@
 Private prerelease repository for SeePhot, a Siril Python application for
 Seestar variable-star photometry.
 
-> **Development status:** internal prerelease (`0.4-pre`). Interfaces, file
+> **Development status:** internal prerelease (`0.4.5-pre`). Interfaces, file
 > formats, photometry rules, and installation steps may still change.
 
 ## Planned Prerelease Bundle
@@ -24,6 +24,17 @@ part of this prerelease:
 - `sp_mod_qc.py`
 - `sp_mod_linearity.py`
 - `sp_mod_archive.py`
+
+## Current Prerelease Focus
+
+- Target and annulus contamination are evaluated after measurement. Rejected
+  measurements are visibly marked and excluded from scientific plots,
+  extremum fitting, and AAVSO export.
+- The Export and BAV tabs share normalized AAVSO observer settings, while
+  telescope and instrument information comes from the current result data.
+- BAV reports provide a visible link to the corresponding VSX object page,
+  including a fallback for older result files that only store the VSX object
+  identifier.
 
 ## Requirements
 

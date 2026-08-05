@@ -36,6 +36,8 @@ APP_NAME = "SeestarLightcurve"
 CONFIG_NAME = "bav_report.json"
 REPORT_TABLE_HEADER_BACKGROUND = "#4472C4"
 REPORT_TABLE_HEADER_TEXT = "#FFFFFF"
+REPORT_LINK_COLOR = "#0563C1"
+VSX_DETAIL_URL_TEMPLATE = "https://vsx.aavso.org/index.php?oid={oid}&view=detail.top"
 RESULT_KIND_LIGHTCURVE = "lightcurve"
 RESULT_KIND_SINGLE_FIELD_ZP = "single_field_zp"
 SINGLE_FIELD_ZP_CALIBRATION_METHODS = {
@@ -85,7 +87,6 @@ LIGHTCURVE_SHEET_REQUIRED_METADATA = (
     "OBJECT_VAR_TYPE",
     "OBJECT_MAG_RANGE",
     "OBJECT_PERIOD",
-    "OBJECT_VSX_URL",
     "OBSERVER_BAV",
     "OBSERVER_NAME",
     "OBSERVER_AAVSO",
@@ -147,6 +148,7 @@ def load_config() -> dict[str, str]:
     for key, default_value in DEFAULT_CONFIG.items():
         value = data.get(key, default_value)
         config[key] = str(value) if value is not None else ""
+    config["aavso_code"] = config["aavso_code"].strip().upper()
     if config["telescope"] not in TELESCOPE_CHOICES:
         config["telescope"] = DEFAULT_CONFIG["telescope"]
     return config
@@ -159,6 +161,7 @@ def save_config(config: dict[str, str]) -> Path:
     for key in DEFAULT_CONFIG:
         clean_config[key] = str(config.get(key, "")).strip()
     clean_config["bav_code"] = clean_config["bav_code"].upper()
+    clean_config["aavso_code"] = clean_config["aavso_code"].upper()
     if clean_config["telescope"] not in TELESCOPE_CHOICES:
         clean_config["telescope"] = DEFAULT_CONFIG["telescope"]
 
@@ -426,6 +429,18 @@ def read_result_curve_with_metadata(path: Path) -> tuple[dict[str, str], list[di
     return metadata, rows
 
 
+def result_telescope_display_text(result_csv: Path | None) -> str:
+    """Return the telescope recorded for the current result."""
+
+    if result_csv is None or not result_csv.is_file():
+        return "none"
+    try:
+        metadata, _rows = read_result_curve_with_metadata(result_csv)
+    except OSError:
+        return "none"
+    return metadata.get("TELESCOPE", "").strip() or "none"
+
+
 def report_date_from_lightcurve(result_csv: Path | None) -> str:
     """Return the report start date from UTC_START or the earliest phot_time."""
 
@@ -510,10 +525,14 @@ def _lat_long_text(metadata: dict[str, str]) -> str:
 def _vsx_link(metadata: dict[str, str]) -> str:
     url = _metadata_value(metadata, "OBJECT_VSX_URL")
     oid = _metadata_value(metadata, "OBJECT_VSX_OID")
-    label = f"VSX {oid}" if oid else "VSX"
+    if not url and oid:
+        url = VSX_DETAIL_URL_TEMPLATE.format(oid=oid)
     if not url:
-        return label if oid else ""
-    return f'<link href="{escape(url, quote=True)}">{escape(label)}</link>'
+        return ""
+    return (
+        f'<link href="{escape(url, quote=True)}" color="{REPORT_LINK_COLOR}">'
+        "<u>Objektseite öffnen</u></link>"
+    )
 
 
 def _report_table(
@@ -792,6 +811,11 @@ def require_lightcurve_sheet_metadata(metadata: dict[str, str]) -> None:
         for key in LIGHTCURVE_SHEET_REQUIRED_METADATA
         if not _metadata_value(metadata, key)
     ]
+    if not (
+        _metadata_value(metadata, "OBJECT_VSX_URL")
+        or _metadata_value(metadata, "OBJECT_VSX_OID")
+    ):
+        missing.append("OBJECT_VSX_URL/OBJECT_VSX_OID")
     if missing:
         raise RuntimeError(
             "Result CSV is missing required BAV metadata header field(s): "
@@ -1100,8 +1124,10 @@ def validate_config(config: dict[str, str]) -> dict[str, str]:
     aavso_code = config.get("aavso_code", "").strip().upper()
     if not aavso_code:
         issues.append("AAVSO-Kürzel fehlt.")
-    elif not re.fullmatch(r"[A-Z0-9]+", aavso_code):
-        issues.append("AAVSO-Kürzel darf nur Buchstaben A–Z und Ziffern 0–9 enthalten.")
+    elif not re.fullmatch(r"[A-Z0-9]{1,5}", aavso_code):
+        issues.append(
+            "AAVSO-Kürzel muss aus 1 bis 5 Zeichen (A–Z oder 0–9) bestehen."
+        )
 
     site_name = config.get("site_name", "").strip()
     if not site_name:
@@ -1658,8 +1684,10 @@ def create_single_measurement_bav_file(
     if not re.fullmatch(r"[A-Z]+", bav_code):
         raise RuntimeError("BAV code is required for BAV Einzelhelligkeit export.")
     aavso_code = settings.get("aavso_code", "").strip().upper() or "na"
-    if aavso_code != "na" and not re.fullmatch(r"[A-Z0-9]+", aavso_code):
-        raise RuntimeError("AAVSO code must contain letters A-Z and digits 0-9 only.")
+    if aavso_code != "na" and not re.fullmatch(r"[A-Z0-9]{1,5}", aavso_code):
+        raise RuntimeError(
+            "AAVSO-Kürzel muss aus 1 bis 5 Zeichen (A–Z oder 0–9) bestehen."
+        )
     target_name = _metadata_value(metadata, "OBJECT_NAME") or row.get("target_id", "").strip()
     if not target_name:
         raise RuntimeError("Single Measurement CSV has no OBJECT_NAME or target_id.")
@@ -1778,7 +1806,20 @@ def create_bav_tab(context: dict[str, object]) -> object:
     aavso_code_edit = QLineEdit()
     aavso_code_edit.setAlignment(Qt.AlignmentFlag.AlignLeft)
     aavso_code_edit.setPlaceholderText("AAVSO-Kuerzel")
+    aavso_code_edit.setToolTip(
+        "Erforderlich: 1 bis 5 Zeichen, nur A–Z oder 0–9."
+    )
     aavso_code_edit.setText(config["aavso_code"])
+
+    def uppercase_aavso_code_input(text: str) -> None:
+        normalized = text.upper()
+        if normalized == text:
+            return
+        cursor_position = aavso_code_edit.cursorPosition()
+        aavso_code_edit.setText(normalized)
+        aavso_code_edit.setCursorPosition(cursor_position)
+
+    aavso_code_edit.textEdited.connect(uppercase_aavso_code_input)
     if limit_fields:
         aavso_code_edit.setFixedWidth(compact_width)
     left_form_layout.addRow("AAVSO-Kuerzel:", aavso_code_edit)
@@ -1898,12 +1939,9 @@ def create_bav_tab(context: dict[str, object]) -> object:
     ) = build_coordinate_row("longitude", ("O", "W"), LONGITUDE_MAX_DEGREES)
     right_form_layout.addRow("Länge:", longitude_row)
 
-    telescope_combo = QComboBox()
-    telescope_combo.addItems(TELESCOPE_CHOICES)
-    telescope_combo.setCurrentText(config["telescope"])
-    if limit_fields:
-        telescope_combo.setFixedWidth(compact_width)
-    right_form_layout.addRow("Teleskop:", telescope_combo)
+    telescope_label = QLabel("none")
+    telescope_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    right_form_layout.addRow("Teleskop:", telescope_label)
     form_row.addLayout(left_form_layout)
     form_row.addLayout(right_form_layout)
     form_row.addStretch(1)
@@ -1966,7 +2004,10 @@ def create_bav_tab(context: dict[str, object]) -> object:
             "longitude_degrees": str(longitude_degrees_spin.value()),
             "longitude_minutes": str(longitude_minutes_spin.value()),
             "longitude_seconds": _format_seconds_config(longitude_seconds_spin.value()),
-            "telescope": telescope_combo.currentText().strip(),
+            # Retain the legacy persisted value only as an instrument fallback
+            # for old/malformed FITS files. It is deliberately not editable:
+            # actual BAV outputs use TELESCOPE from the current result CSV.
+            "telescope": config["telescope"],
         }
 
     config_warning_state: dict[str, str | None] = {"message": None}
@@ -2010,6 +2051,11 @@ def create_bav_tab(context: dict[str, object]) -> object:
         config_file = save_config(settings)
         bav_code_edit.setText(settings["bav_code"])
         aavso_code_edit.setText(settings["aavso_code"])
+        update_main_observer_code = context.get(
+            "set_aavso_observer_code_from_bav"
+        )
+        if callable(update_main_observer_code):
+            update_main_observer_code(settings["aavso_code"])
         status_label.setText(f"Gespeichert: {config_file.name}")
         append_log(f"BAV settings saved: {config_file}")
         refresh()
@@ -2020,6 +2066,9 @@ def create_bav_tab(context: dict[str, object]) -> object:
         target_getter = context.get("get_selected_target")
         selected_target = target_getter() if callable(target_getter) else None
         target_name = getattr(selected_target, "name", None) or getattr(selected_target, "identifier", None) or "-"
+        current_result = _current_lightcurve(context)
+        result_csv = current_result[0] if current_result is not None else None
+        telescope_label.setText(result_telescope_display_text(result_csv))
         settings = current_config()
         append_log(
             "BAV tab refreshed: "
@@ -2032,7 +2081,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
             f"{settings['latitude_minutes']}' {settings['latitude_seconds']}\" , "
             f"lon={settings['longitude_hemisphere']} {settings['longitude_degrees']}° "
             f"{settings['longitude_minutes']}' {settings['longitude_seconds']}\" , "
-            f"telescope={settings['telescope'] or '-'}, "
+            f"telescope={telescope_label.text()}, "
             f"source={source_dir or '-'}, "
             f"results={results_dir or '-'}, "
             f"target={target_name}"
@@ -2245,6 +2294,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
 
     def reset_plugin_view() -> bool:
         last_output["path"] = None
+        telescope_label.setText("none")
         status_label.setText("")
         return True
 
