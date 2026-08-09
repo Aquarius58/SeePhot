@@ -1,4 +1,4 @@
-"""Neutral result-folder discovery helpers for SeePhot light-curve CSVs."""
+"""Neutral result-folder discovery helpers for SeePhot photometry CSVs."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from typing import Callable, TypeVar
 
 RESULT_SCAN_ATTEMPTS = 2
 RESULT_SCAN_RETRY_DELAY_SECONDS = 0.05
+RESULT_KIND_LIGHTCURVE = "lightcurve"
+RESULT_KIND_SINGLE = "single_measurement"
 RESULT_SCAN_PRUNED_DIRECTORY_NAMES = frozenset(
     {"aavso", "bav", "diagnostics", "siril_lightcurve_tmp"}
 )
@@ -33,6 +35,13 @@ class LightcurveResultCandidate:
     png_exists: bool
     aavso_exists: bool
     bav_file_count: int
+    result_kind: str = RESULT_KIND_LIGHTCURVE
+    quality_status: str = ""
+    quality_flag: str = ""
+    calibrated_mag: str = ""
+    calibrated_mag_error: str = ""
+    field_reference_used: str = ""
+    check_delta_mag: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,6 +85,16 @@ def _is_result_curve_filename(name: str) -> bool:
 
     folded = name.casefold()
     return folded == "result_curve.csv" or folded.endswith("_result_curve.csv")
+
+
+def _is_single_measurement_filename(name: str) -> bool:
+    """Return whether a filename is a supported Single Measurement CSV name."""
+
+    return name.casefold().endswith("_single_field_zp_measurement.csv")
+
+
+def _is_photometry_result_filename(name: str) -> bool:
+    return _is_result_curve_filename(name) or _is_single_measurement_filename(name)
 
 
 def read_result_metadata_header(path: Path) -> dict[str, str]:
@@ -155,14 +174,40 @@ def report_date_for_result(result_csv: Path, metadata: dict[str, str]) -> str:
 
 
 def result_target_stem(result_csv: Path) -> str:
-    """Return the target file stem for a result curve CSV."""
+    """Return the target file stem for a supported photometry result CSV."""
 
-    suffix = "_result_curve.csv"
     if result_csv.name.casefold() == "result_curve.csv":
         return "result"
-    if not result_csv.name.casefold().endswith(suffix):
-        raise RuntimeError(f"Unexpected result CSV filename: {result_csv.name}")
-    return result_csv.name[: -len(suffix)]
+    for suffix in ("_result_curve.csv", "_single_field_zp_measurement.csv"):
+        if result_csv.name.casefold().endswith(suffix):
+            return result_csv.name[: -len(suffix)]
+    raise RuntimeError(f"Unexpected result CSV filename: {result_csv.name}")
+
+
+def result_kind_for_csv(
+    result_csv: Path,
+    metadata: dict[str, str] | None = None,
+    first_row: dict[str, str] | None = None,
+) -> str | None:
+    """Classify a result by metadata/content, with its canonical name as fallback."""
+
+    if metadata is None:
+        metadata = read_result_metadata_header(result_csv)
+    mode = metadata.get("MODE", "").strip().casefold().replace("-", "_")
+    if mode in {"single", "single_measurement"}:
+        return RESULT_KIND_SINGLE
+    if mode in {"curve", "lightcurve", "light_curve"}:
+        return RESULT_KIND_LIGHTCURVE
+    if first_row is None:
+        first_row = first_result_data_row(result_csv)
+    method = first_row.get("calibration_method", "").strip().casefold().replace("-", "_")
+    if method in {"single_field_zp", "field_zp", "field_zero_point"}:
+        return RESULT_KIND_SINGLE
+    if _is_single_measurement_filename(result_csv.name):
+        return RESULT_KIND_SINGLE
+    if _is_result_curve_filename(result_csv.name):
+        return RESULT_KIND_LIGHTCURVE
+    return None
 
 
 def aavso_report_path(result_csv: Path) -> Path:
@@ -292,16 +337,23 @@ def lightcurve_result_candidate_from_csv(
     metadata: dict[str, str] | None = None,
     matching_bav_files: tuple[Path, ...] | None = None,
 ) -> LightcurveResultCandidate | None:
-    """Return one neutral result-browser row for a result CSV."""
+    """Return one neutral result-browser row for a supported result CSV."""
 
-    if not _is_result_curve_filename(result_csv.name):
+    if not _is_photometry_result_filename(result_csv.name):
         return None
     if metadata is None:
         metadata = read_result_metadata_header(result_csv)
+    first_row = first_result_data_row(result_csv)
+    result_kind = result_kind_for_csv(result_csv, metadata, first_row)
+    if result_kind is None:
+        return None
     target_name = metadata.get("OBJECT_NAME", "").strip() or result_target_stem(result_csv).replace("_", " ")
     report_date = report_date_for_result(result_csv, metadata)
     if matching_bav_files is None:
         matching_bav_files = tuple(bav_report_files(result_csv, metadata, target_name))
+    quality_status = first_row.get("quality_status", "").strip().upper()
+    if first_row.get("valid", "1").strip().casefold() in {"0", "false", "no"}:
+        quality_status = "INVALID"
     return LightcurveResultCandidate(
         result_csv=result_csv,
         target_name=target_name,
@@ -312,6 +364,19 @@ def lightcurve_result_candidate_from_csv(
         png_exists=result_csv.with_suffix(".png").exists(),
         aavso_exists=aavso_report_path(result_csv).exists(),
         bav_file_count=len(matching_bav_files),
+        result_kind=result_kind,
+        quality_status=quality_status,
+        quality_flag=first_row.get("quality_flag", "").strip(),
+        calibrated_mag=(
+            first_row.get("target_calibrated_mag", "").strip()
+            or first_row.get("calibrated_mag", "").strip()
+        ),
+        calibrated_mag_error=(
+            first_row.get("target_calibrated_mag_error", "").strip()
+            or first_row.get("calibrated_mag_error", "").strip()
+        ),
+        field_reference_used=first_row.get("field_reference_used", "").strip(),
+        check_delta_mag=first_row.get("check_delta_mag", "").strip(),
     )
 
 
@@ -319,6 +384,7 @@ def _scan_result_csv_paths(
     root: Path,
     *,
     include_archive: bool,
+    result_kind: str = RESULT_KIND_LIGHTCURVE,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> tuple[list[Path], dict[Path, Path], int, list[ResultScanIssue], int, int, bool]:
@@ -397,7 +463,12 @@ def _scan_result_csv_paths(
                     )
                     continue
 
-            if _is_result_curve_filename(entry.name):
+            filename_matches = (
+                _is_single_measurement_filename(entry.name)
+                if result_kind == RESULT_KIND_SINGLE
+                else _is_result_curve_filename(entry.name)
+            )
+            if filename_matches:
                 paths.append(Path(entry.path))
 
         pending.extend(sorted(child_directories, key=lambda path: str(path).casefold(), reverse=True))
@@ -421,6 +492,7 @@ def discover_lightcurve_results_with_diagnostics(
     results_dir: Path,
     *,
     bav_only: bool = False,
+    result_kind: str = RESULT_KIND_LIGHTCURVE,
     include_archive: bool | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
@@ -432,6 +504,10 @@ def discover_lightcurve_results_with_diagnostics(
         raise RuntimeError(f"Results folder not found: {root}")
     if include_archive is None:
         include_archive = bav_only
+    if result_kind not in {RESULT_KIND_LIGHTCURVE, RESULT_KIND_SINGLE}:
+        raise ValueError(f"Unsupported result kind: {result_kind}")
+    if bav_only and result_kind != RESULT_KIND_LIGHTCURVE:
+        raise ValueError("BAV result discovery supports light curves only")
 
     (
         result_paths,
@@ -444,6 +520,7 @@ def discover_lightcurve_results_with_diagnostics(
     ) = _scan_result_csv_paths(
         root,
         include_archive=include_archive,
+        result_kind=result_kind,
         progress_callback=progress_callback,
         cancel_requested=cancel_requested,
     )
@@ -515,7 +592,7 @@ def discover_lightcurve_results_with_diagnostics(
                 )
             )
             continue
-        if candidate is not None:
+        if candidate is not None and candidate.result_kind == result_kind:
             candidates.append(candidate)
 
     ordered_candidates = tuple(
@@ -546,6 +623,19 @@ def discover_lightcurve_results(results_dir: Path) -> list[LightcurveResultCandi
         discover_lightcurve_results_with_diagnostics(
             results_dir,
             bav_only=False,
+            include_archive=False,
+        ).candidates
+    )
+
+
+def discover_single_measurement_results(results_dir: Path) -> list[LightcurveResultCandidate]:
+    """Return all Single Measurement result CSVs below one results directory."""
+
+    return list(
+        discover_lightcurve_results_with_diagnostics(
+            results_dir,
+            bav_only=False,
+            result_kind=RESULT_KIND_SINGLE,
             include_archive=False,
         ).candidates
     )

@@ -38,7 +38,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.4.5-pre"
+SCRIPT_VERSION = "0.4.8-pre"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
@@ -13089,7 +13089,7 @@ class LightCurveWindow(QWidget):
             "result_instrument_defaults": result_instrument_defaults,
             "result_instrument_metadata_from_header": result_instrument_metadata_from_header,
             "ensure_importable_module": ensure_importable_module,
-            "get_photometry_mode": lambda: self.photometry_mode,
+            "get_photometry_mode": self.selected_photometry_mode,
             "get_current_lightcurve": self.current_export_lightcurve,
             "set_current_lightcurve": self.set_current_lightcurve_from_plugin,
             "set_aavso_observer_code_from_bav": self.set_aavso_observer_code_from_bav,
@@ -13111,9 +13111,12 @@ class LightCurveWindow(QWidget):
             "get_selected_vsx_targets": self.selected_vsx_targets_for_batch,
             "get_visible_vsx_targets": self.visible_vsx_targets_for_batch,
             "select_target_object": self.set_selected_target_object,
+            "start_batch_measurement": self.start_measurement_for_batch,
             "start_light_curve": self.start_light_curve_for_batch,
             "set_batch_result_status": self.set_batch_result_status,
             "create_light_curve": self.run_light_curve,
+            "describe_batch_result": self.describe_batch_result,
+            "show_batch_result": self.show_result_from_csv_for_batch,
             "plot_light_curve_from_csv": self.plot_light_curve_from_csv_for_batch,
             "automatic_stack_finished": self.automatic_stack_finished,
             "automatic_prepare_finished": self.automatic_prepare_finished,
@@ -14179,6 +14182,8 @@ class LightCurveWindow(QWidget):
 
         self.photometry_mode = next_mode
         self.pending_single_vsx_selection = carried_vsx_selection
+        if self.result_browser_dialog is not None:
+            self.result_browser_dialog.close()
         if not self.is_busy() and carried_single_fits is None:
             self.close_siril_display_context(
                 "mode change",
@@ -14219,15 +14224,20 @@ class LightCurveWindow(QWidget):
             "Light Curve CSV" if lightcurve_mode else "Measurement CSV"
         )
         self.open_lightcurve_group.setEnabled(True)
-        if hasattr(self, "plot_lightcurve_group"):
-            self.plot_lightcurve_group.setVisible(lightcurve_mode)
+        self.set_result_display_kind(single=not lightcurve_mode)
         if not lightcurve_mode:
             self.clear_comparison_star_state()
-        if hasattr(self, "single_result_group"):
-            self.single_result_group.setVisible(not lightcurve_mode)
         self.run_light_curve_button.setText(
             "Create Light Curve" if lightcurve_mode else "Run Measurement"
         )
+
+    def set_result_display_kind(self, *, single: bool) -> None:
+        """Show controls for the loaded/created result without changing acquisition mode."""
+
+        if hasattr(self, "single_result_group"):
+            self.single_result_group.setVisible(single)
+        if hasattr(self, "plot_lightcurve_group"):
+            self.plot_lightcurve_group.setVisible(not single)
 
     def clear_comparison_star_state(self) -> None:
         """Clear series-only comparison/check-star state."""
@@ -16291,6 +16301,67 @@ class LightCurveWindow(QWidget):
             self.run_light_curve,
         )
 
+    def start_measurement_for_batch(self, mode: str) -> None:
+        """Run one Batch target with the photometry mode frozen at Batch start."""
+
+        selected_mode = self.selected_photometry_mode()
+        if selected_mode != mode:
+            self.append_log(
+                "WARNING: Batch photometry mode differed from the current mode selector; "
+                f"using {selected_mode}."
+            )
+        if selected_mode == MODE_SINGLE_MEASUREMENT:
+            self.run_busy_action(
+                "PHOTOMETRY_RUNNING",
+                "Creating Single Measurement.",
+                self.run_single_measurement_for_batch,
+            )
+            return
+        self.start_light_curve_for_batch()
+
+    def selected_target_single_result_csv(self) -> Path | None:
+        output_dir = self.lightcurve_output_directory()
+        stem = self.selected_target_output_stem()
+        if output_dir is None or stem is None:
+            return None
+        return output_dir / f"{stem}_single_field_zp_measurement.csv"
+
+    def show_single_measurement_warning(
+        self,
+        message: str,
+        *,
+        title: str = "Single Measurement",
+    ) -> None:
+        """Record a Single failure and avoid modal dialogs during a Batch."""
+
+        self._single_measurement_failure_message = str(message)
+        if self.batch_tab is not None and getattr(self.batch_tab, "running", False):
+            return
+        QMessageBox.warning(self, title, message)
+
+    def run_single_measurement_for_batch(self) -> None:
+        """Run Single Measurement and translate its result to the Batch signal."""
+
+        result_csv = self.selected_target_single_result_csv()
+        before = None
+        if result_csv is not None and result_csv.exists():
+            stat = result_csv.stat()
+            before = (stat.st_mtime_ns, stat.st_size)
+        self._single_measurement_failure_message = ""
+        self.run_single_measurement()
+        changed_result = False
+        if result_csv is not None and result_csv.exists():
+            stat = result_csv.stat()
+            changed_result = before != (stat.st_mtime_ns, stat.st_size)
+        if result_csv is not None and (self.result_status == "created" or changed_result):
+            self.automatic_lightcurve_finished.emit(True, str(result_csv))
+            return
+        message = (
+            self._single_measurement_failure_message
+            or "Single Measurement failed. See the log for details."
+        )
+        self.automatic_lightcurve_finished.emit(False, message)
+
     def selected_target_instrumental_csv(self) -> Path | None:
         output_dir = self.lightcurve_output_directory()
         stem = self.selected_target_output_stem()
@@ -16574,6 +16645,7 @@ class LightCurveWindow(QWidget):
     def run_single_measurement(self) -> None:
         """Measure one target in the selected single FITS work frame."""
 
+        self.set_result_display_kind(single=True)
         self.append_log("Run Single Measurement requested.")
         if self.selected_target is None:
             current_selection = self.current_vsx_selection()
@@ -16595,11 +16667,11 @@ class LightCurveWindow(QWidget):
         self.append_log(f"Single measurement calibration: {calibration_label}.")
         if self.selected_target is None:
             self.set_result_status("failed")
-            QMessageBox.warning(self, "Single Measurement", "Select a variable first.")
+            self.show_single_measurement_warning("Select a variable first.")
             return
         if self.reference_frame is None:
             self.set_result_status("failed")
-            QMessageBox.warning(self, "Single Measurement", "Run Detect Variables first.")
+            self.show_single_measurement_warning("Run Detect Variables first.")
             return
 
         work_dir = self.work_sequence_directory()
@@ -16608,7 +16680,7 @@ class LightCurveWindow(QWidget):
         source_dir = self.current_source_directory()
         if work_dir is None or output_dir is None or stem is None:
             self.set_result_status("failed")
-            QMessageBox.warning(self, "Single Measurement", "Select a FITS input file first.")
+            self.show_single_measurement_warning("Select a FITS input file first.")
             return
 
         try:
@@ -16616,7 +16688,7 @@ class LightCurveWindow(QWidget):
         except ValueError as exc:
             self.set_result_status("failed")
             self.append_log(f"ERROR: {exc}")
-            QMessageBox.warning(self, "Single Measurement", str(exc))
+            self.show_single_measurement_warning(str(exc))
             return
 
         source_file = self.current_source_fits_file()
@@ -16631,10 +16703,8 @@ class LightCurveWindow(QWidget):
             )
             self.set_result_status("failed")
             self.append_log(f"ERROR: {message}")
-            QMessageBox.warning(
-                self,
-                "Single Measurement",
-                "Unsupported FITS filter metadata.\n\nRun CFA Channels / Stack first.",
+            self.show_single_measurement_warning(
+                "Unsupported FITS filter metadata.\n\nRun CFA Channels / Stack first."
             )
             return
         image_source, aavso_filter, origin_marker = filter_metadata
@@ -16650,7 +16720,7 @@ class LightCurveWindow(QWidget):
         except ValueError as exc:
             self.set_result_status("failed")
             self.append_log(f"ERROR: {exc}")
-            QMessageBox.warning(self, "Single Measurement", str(exc))
+            self.show_single_measurement_warning(str(exc))
             return
 
         aperture_settings = resolve_aperture_settings(self.reference_frame)
@@ -16686,7 +16756,7 @@ class LightCurveWindow(QWidget):
             )
             self.set_result_status("failed")
             self.append_log(f"ERROR: {message}")
-            QMessageBox.warning(self, "Single Measurement", "Target could not be measured.")
+            self.show_single_measurement_warning("Target could not be measured.")
             return
 
         target_error = (
@@ -16812,10 +16882,8 @@ class LightCurveWindow(QWidget):
             )
             self.set_result_status("failed")
             self.append_log(f"ERROR: {message}")
-            QMessageBox.warning(
-                self,
-                "Single Measurement",
-                "Single Measurement failed.\n\nNot enough usable reference stars.",
+            self.show_single_measurement_warning(
+                "Single Measurement failed.\n\nNot enough usable reference stars."
             )
             return
 
@@ -16864,11 +16932,9 @@ class LightCurveWindow(QWidget):
                 "ERROR: Single Measurement rejected by bright-linearity check: "
                 f"{linearity_assessment.note}."
             )
-            QMessageBox.warning(
-                self,
-                "Single Measurement",
+            self.show_single_measurement_warning(
                 "Single Measurement rejected.\n\n"
-                f"{linearity_assessment.note}",
+                f"{linearity_assessment.note}"
             )
             return
         target_measurement = apply_bright_linearity_assessment(
@@ -16958,10 +17024,9 @@ class LightCurveWindow(QWidget):
             self.append_log(
                 f"Single field-ZP references written: {field_zp_references_csv.name}."
             )
-            QMessageBox.warning(
-                self,
-                "Single Measurement — REJECTED / INVALID",
+            self.show_single_measurement_warning(
                 f"{message}\n\nThe displayed magnitude is diagnostic only and cannot be exported.",
+                title="Single Measurement — REJECTED / INVALID",
             )
             return
         self.append_log(
@@ -17188,6 +17253,7 @@ class LightCurveWindow(QWidget):
             self.run_single_measurement()
             return
 
+        self.set_result_display_kind(single=False)
         self.append_log("Create Light Curve requested.")
         self.loaded_lightcurve_csv = None
         self.loaded_lightcurve_target_name = "Target"
@@ -17744,6 +17810,50 @@ class LightCurveWindow(QWidget):
         )
         self.refresh_optional_tab_views()
 
+    def describe_batch_result(self, result_csv: Path | str) -> tuple[str, str]:
+        """Return the compact OK/WARN/ERROR status shown in the Batch table."""
+
+        path = Path(result_csv)
+        if not result_csv_contains_single_field_zp_rows(path):
+            return "OK", "Light Curve ready"
+        rows: list[dict[str, str]] = []
+        with path.open(newline="") as handle:
+            rows.extend(csv_data_dict_reader(handle))
+        if not rows:
+            return "ERROR", "Single Measurement result has no data row"
+        row = rows[0]
+        quality_status = csv_text(row.get("quality_status"), QUALITY_STATUS_OK).upper()
+        quality_flag = csv_text(row.get("quality_flag"), "")
+        magnitude = format_optional_float(
+            first_result_row_float(row, "target_calibrated_mag", "calibrated_mag"),
+            4,
+        )
+        error = format_optional_float(
+            first_result_row_float(
+                row,
+                "target_calibrated_mag_error",
+                "calibrated_mag_error",
+            ),
+            4,
+        )
+        measurement = f"mag={magnitude} +/- {error}"
+        if not result_row_is_valid(row) or quality_status == QUALITY_STATUS_INVALID:
+            return "ERROR", f"{quality_flag or 'INVALID'}; {measurement} (diagnostic only)"
+        if quality_status == QUALITY_STATUS_WARNING:
+            return "WARN", f"{quality_flag or 'quality warning'}; {measurement}"
+        return "OK", measurement
+
+    def show_result_from_csv_for_batch(self, result_csv: Path | str) -> None:
+        """Show a Batch result according to its CSV content."""
+
+        self.set_current_lightcurve_from_plugin(
+            result_csv,
+            "",
+            plot_lightcurve=True,
+            allow_extremum=True,
+        )
+        self.tabs.setCurrentWidget(self.lightcurve_tab)
+
     def open_light_curve_csv(self) -> None:
         busy_message = self.busy_context_change_message("load another result")
         if busy_message is not None:
@@ -17772,90 +17882,15 @@ class LightCurveWindow(QWidget):
         if not result_csv.exists():
             QMessageBox.warning(self, title, "Result CSV not found.")
             return
-        is_single_result = result_csv_contains_single_field_zp_rows(result_csv)
-        if self.photometry_mode == MODE_SINGLE_MEASUREMENT and not is_single_result:
-            QMessageBox.warning(
-                self,
-                title,
-                "This is not a Single Measurement result CSV.",
+        try:
+            self.set_current_lightcurve_from_plugin(
+                result_csv,
+                "",
+                plot_lightcurve=True,
             )
-            return
-        if self.photometry_mode == MODE_LIGHTCURVE and is_single_result:
-            QMessageBox.warning(
-                self,
-                title,
-                "This is a Single Measurement result CSV. Switch to Single Measurement mode first.",
-            )
-            return
-        result_metadata = read_result_metadata_header(result_csv)
-        is_diagnostic_result = result_metadata_is_diagnostic(result_metadata)
-        target_name = result_metadata.get("OBJECT_NAME", "").strip() or result_csv.name
-        series_suffix = "_result_curve.csv"
-        single_suffix = "_single_field_zp_measurement.csv"
-        diagnostic_suffix = "_diagnostic_curve.csv"
-        if target_name.endswith(series_suffix):
-            target_name = target_name[: -len(series_suffix)]
-        elif target_name.endswith(single_suffix):
-            target_name = target_name[: -len(single_suffix)]
-        elif target_name.endswith(diagnostic_suffix):
-            target_name = target_name[: -len(diagnostic_suffix)]
-        elif target_name.endswith(".csv"):
-            target_name = target_name[:-4]
-        target_name = target_name.replace("_", " ") or "Target"
-        self.loaded_lightcurve_csv = result_csv
-        self.loaded_lightcurve_target_name = target_name
-        self.set_selected_target_labels(target_name)
-        self.loaded_lightcurve_source_label = result_csv.parent.name
-        self.current_result_origin = (
-            "diagnostic"
-            if is_diagnostic_result
-            else ("single" if is_single_result else "loaded")
-        )
-        self.current_exports.clear()
-        self.set_result_status("warning" if is_diagnostic_result else "loaded")
-        self.plot_light_curve_button.setEnabled(not is_single_result)
-        if is_diagnostic_result:
-            self.export_status_label.setText(
-                "Diagnostic curve: scientific export and archive are disabled."
-            )
-        else:
-            self.export_status_label.setText(f"Current export source: {result_csv}")
-        if is_single_result:
-            rows: list[dict[str, str]] = []
-            with result_csv.open(newline="") as fh:
-                reader = csv_data_dict_reader(fh)
-                rows.extend(reader)
-            self.set_loaded_single_result_summary(result_csv, rows)
-            if rows and not any(result_row_is_valid(row) for row in rows):
-                self.set_result_status("failed")
-                self.lightcurve_status_label.setText(
-                    f"Rejected Single Measurement diagnostic loaded: {result_csv}"
-                )
-                self.export_status_label.setText(
-                    "Rejected Single Measurement diagnostic; no valid row for export."
-                )
-                self.append_log(
-                    f"Rejected Single Measurement diagnostic loaded: {result_csv}"
-                )
-            else:
-                self.lightcurve_status_label.setText(
-                    f"Single measurement loaded: {result_csv}"
-                )
-                self.append_log(f"Single Measurement CSV loaded: {result_csv}")
-            self.refresh_optional_tab_views()
-            return
-        plot_target_name = target_name
-        if is_diagnostic_result:
-            plot_target_name += " — DIAGNOSTIC: TARGET CONTAMINATION — NOT FOR EXPORT"
-        self.plot_light_curve_csv(
-            result_csv,
-            None,
-            plot_target_name,
-            result_csv.parent.name,
-            allow_extremum=not is_diagnostic_result,
-            include_invalid=is_diagnostic_result,
-        )
-        self.refresh_optional_tab_views()
+        except Exception as exc:
+            QMessageBox.warning(self, title, f"Could not load result CSV:\n{exc}")
+            self.append_log(f"WARNING: Result CSV could not be loaded: {exc}")
 
     def open_result_browser(self) -> None:
         """Select a result CSV from a scanned results folder."""
@@ -17878,6 +17913,11 @@ class LightCurveWindow(QWidget):
     def _open_result_browser(self, *, bav_only: bool) -> None:
         """Select a result CSV from a scanned folder, optionally requiring BAV files."""
 
+        browser_single = (
+            not bav_only and self.selected_photometry_mode() == MODE_SINGLE_MEASUREMENT
+        )
+        browser_result_kind = "single_measurement" if browser_single else "lightcurve"
+
         dialog_attribute = (
             "bav_result_browser_dialog" if bav_only else "result_browser_dialog"
         )
@@ -17887,8 +17927,16 @@ class LightCurveWindow(QWidget):
             existing_dialog.activateWindow()
             return
 
-        window_title = "BAV Results" if bav_only else "Open Result"
-        item_label = "BAV result(s)" if bav_only else "result(s)"
+        window_title = (
+            "BAV Results"
+            if bav_only
+            else ("Open Single Measurement Result" if browser_single else "Open Light Curve Result")
+        )
+        item_label = (
+            "BAV result(s)"
+            if bav_only
+            else ("Single Measurement result(s)" if browser_single else "Light Curve result(s)")
+        )
         start_dir = self.current_results_directory() or self.current_source_directory() or Path.home()
         selected = QFileDialog.getExistingDirectory(
             self,
@@ -17905,7 +17953,11 @@ class LightCurveWindow(QWidget):
             discovery_name = (
                 "discover_bav_lightcurve_results"
                 if bav_only
-                else "discover_lightcurve_results"
+                else (
+                    "discover_single_measurement_results"
+                    if browser_single
+                    else "discover_lightcurve_results"
+                )
             )
             discover_results = getattr(self.lightcurve_results_module, discovery_name)
         except Exception as exc:
@@ -17956,6 +18008,7 @@ class LightCurveWindow(QWidget):
                 report = detailed_discovery(
                     results_dir,
                     bav_only=bav_only,
+                    result_kind=browser_result_kind,
                     include_archive=bav_only,
                     progress_callback=update_progress,
                     cancel_requested=progress_dialog.wasCanceled,
@@ -18025,7 +18078,11 @@ class LightCurveWindow(QWidget):
             message = (
                 "No light-curve result CSVs with BAV output files found."
                 if bav_only
-                else "No light-curve result CSVs found."
+                else (
+                    "No Single Measurement result CSVs found."
+                    if browser_single
+                    else "No light-curve result CSVs found."
+                )
             )
             report_text = scan_report_text(scan_report)
             if report_text:
@@ -18038,7 +18095,7 @@ class LightCurveWindow(QWidget):
         dialog = QDialog(self)
         dialog.setWindowTitle(window_title)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dialog.resize(940, 420)
+        dialog.resize(1120 if browser_single else 940, 420)
         setattr(self, dialog_attribute, dialog)
         layout = QVBoxLayout(dialog)
 
@@ -18058,9 +18115,16 @@ class LightCurveWindow(QWidget):
 
         update_browser_status()
 
-        table = QTableWidget(len(candidates), 8)
+        table = QTableWidget(len(candidates), 10 if browser_single else 8)
         table.setHorizontalHeaderLabels(
-            ["Star", "Type", "Date", "Image folder", "Rows", "PNG", "AAVSO", "BAV"]
+            (
+                [
+                    "Star", "Date", "Image folder", "Mag", "Error",
+                    "Status", "Refs", "Check Δ", "AAVSO", "BAV",
+                ]
+                if browser_single
+                else ["Star", "Type", "Date", "Image folder", "Rows", "PNG", "AAVSO", "BAV"]
+            )
         )
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -18068,16 +18132,39 @@ class LightCurveWindow(QWidget):
         table.verticalHeader().setVisible(False)
         table.horizontalHeader().setStretchLastSection(False)
         table.setColumnWidth(0, 170)
-        table.setColumnWidth(1, 90)
-        table.setColumnWidth(2, 95)
-        table.setColumnWidth(3, 270)
-        table.setColumnWidth(4, 60)
-        table.setColumnWidth(5, 55)
-        table.setColumnWidth(6, 65)
-        table.setColumnWidth(7, 55)
+        table.setColumnWidth(1, 95 if browser_single else 90)
+        table.setColumnWidth(2, 270 if browser_single else 95)
+        table.setColumnWidth(3, 90 if browser_single else 270)
+        table.setColumnWidth(4, 70 if browser_single else 60)
+        table.setColumnWidth(5, 150 if browser_single else 55)
+        table.setColumnWidth(6, 55 if browser_single else 65)
+        table.setColumnWidth(7, 75 if browser_single else 55)
+        if browser_single:
+            table.setColumnWidth(8, 65)
+            table.setColumnWidth(9, 55)
 
-        for row_index, candidate in enumerate(candidates):
-            values = [
+        def candidate_values(candidate: object) -> list[str]:
+            if browser_single:
+                quality_status = str(getattr(candidate, "quality_status", "") or "OK").upper()
+                quality_flag = str(getattr(candidate, "quality_flag", "") or "")
+                status = "ERROR" if quality_status == QUALITY_STATUS_INVALID else (
+                    "WARN" if quality_status == QUALITY_STATUS_WARNING else "OK"
+                )
+                if quality_flag:
+                    status = f"{status}: {quality_flag}"
+                return [
+                    candidate.target_name,
+                    candidate.report_date,
+                    candidate.source_directory_name,
+                    str(getattr(candidate, "calibrated_mag", "")),
+                    str(getattr(candidate, "calibrated_mag_error", "")),
+                    status,
+                    str(getattr(candidate, "field_reference_used", "")),
+                    str(getattr(candidate, "check_delta_mag", "")),
+                    "yes" if candidate.aavso_exists else "no",
+                    "yes" if candidate.bav_file_count else "no",
+                ]
+            return [
                 candidate.target_name,
                 candidate.variable_type,
                 candidate.report_date,
@@ -18087,6 +18174,9 @@ class LightCurveWindow(QWidget):
                 "yes" if candidate.aavso_exists else "no",
                 str(candidate.bav_file_count),
             ]
+
+        for row_index, candidate in enumerate(candidates):
+            values = candidate_values(candidate)
             for column_index, value in enumerate(values):
                 table.setItem(row_index, column_index, QTableWidgetItem(value))
         table.selectRow(0)
@@ -18103,6 +18193,9 @@ class LightCurveWindow(QWidget):
         button_layout.addStretch(1)
         button_layout.addWidget(close_button)
         layout.addLayout(button_layout)
+        if browser_single:
+            preview_button.setVisible(False)
+            load_button.setText("Load")
 
         def selected_candidate() -> object | None:
             row = table.currentRow()
@@ -18189,16 +18282,7 @@ class LightCurveWindow(QWidget):
             candidates[:] = refreshed
             table.setRowCount(len(candidates))
             for row_index, candidate in enumerate(candidates):
-                values = [
-                    candidate.target_name,
-                    candidate.variable_type,
-                    candidate.report_date,
-                    candidate.source_directory_name,
-                    str(candidate.row_count),
-                    "yes" if candidate.png_exists else "no",
-                    "yes" if candidate.aavso_exists else "no",
-                    str(candidate.bav_file_count),
-                ]
+                values = candidate_values(candidate)
                 for column_index, value in enumerate(values):
                     table.setItem(row_index, column_index, QTableWidgetItem(value))
             if candidates:
@@ -18223,8 +18307,9 @@ class LightCurveWindow(QWidget):
         target_name: str,
         *,
         plot_lightcurve: bool = False,
+        allow_extremum: bool = True,
     ) -> None:
-        """Set the current result CSV from an optional plugin selection."""
+        """Load a curve or Single Measurement result according to its content."""
 
         busy_message = self.busy_context_change_message("load another result")
         if busy_message is not None:
@@ -18234,20 +18319,64 @@ class LightCurveWindow(QWidget):
             raise RuntimeError(f"Result CSV not found: {path}")
         name = str(target_name or "").strip()
         result_metadata = read_result_metadata_header(path)
+        is_single_result = result_csv_contains_single_field_zp_rows(path)
         is_diagnostic_result = result_metadata_is_diagnostic(result_metadata)
         if not name:
-            name = result_metadata.get("OBJECT_NAME", "").strip() or path.stem.replace("_result_curve", "")
+            name = result_metadata.get("OBJECT_NAME", "").strip() or path.name
+            for suffix in (
+                "_result_curve.csv",
+                "_single_field_zp_measurement.csv",
+                "_diagnostic_curve.csv",
+                ".csv",
+            ):
+                if name.endswith(suffix):
+                    name = name[: -len(suffix)]
+                    break
             name = name.replace("_", " ")
         self.loaded_lightcurve_csv = path
         self.loaded_lightcurve_target_name = name or "Target"
         self.set_selected_target_labels(self.loaded_lightcurve_target_name)
         self.loaded_lightcurve_source_label = path.parent.name
-        self.current_result_origin = "diagnostic" if is_diagnostic_result else "loaded"
+        self.current_result_origin = (
+            "diagnostic" if is_diagnostic_result else ("single" if is_single_result else "loaded")
+        )
         self.current_exports.clear()
         self.set_result_status("warning" if is_diagnostic_result else "loaded")
+        self.set_result_display_kind(single=is_single_result)
+        if is_single_result:
+            rows: list[dict[str, str]] = []
+            with path.open(newline="") as handle:
+                rows.extend(csv_data_dict_reader(handle))
+            if not rows:
+                raise RuntimeError("Single Measurement result has no data row")
+            self.plot_light_curve_button.setEnabled(False)
+            self.set_loaded_single_result_summary(path, rows)
+            if not any(result_row_is_valid(row) for row in rows):
+                self.set_result_status("failed")
+                self.lightcurve_status_label.setText(
+                    f"Rejected Single Measurement diagnostic loaded: {path}"
+                )
+                self.export_status_label.setText(
+                    "Rejected Single Measurement diagnostic; no valid row for export."
+                )
+                self.append_log(f"Rejected Single Measurement diagnostic loaded: {path}")
+            else:
+                quality_status = csv_text(rows[0].get("quality_status"), QUALITY_STATUS_OK).upper()
+                self.set_result_status(
+                    "warning" if quality_status == QUALITY_STATUS_WARNING else "loaded"
+                )
+                self.lightcurve_status_label.setText(f"Single Measurement loaded: {path}")
+                self.export_status_label.setText(f"Current export source: {path}")
+                self.append_log(f"Single Measurement CSV loaded: {path}")
+            self.update_current_curve_path_label()
+            self.clear_extremum_fit(redraw=False, reset_status=False)
+            self.refresh_optional_tab_views()
+            return
         can_plot_lightcurve = (
             path.name.endswith("_result_curve.csv") or is_diagnostic_result
         )
+        if not can_plot_lightcurve:
+            raise RuntimeError("CSV is neither a Light Curve nor a Single Measurement result")
         self.plot_light_curve_button.setEnabled(can_plot_lightcurve)
         if is_diagnostic_result:
             self.export_status_label.setText(
@@ -18258,7 +18387,7 @@ class LightCurveWindow(QWidget):
             self.export_status_label.setText(f"Current export source: {path}")
             self.lightcurve_status_label.setText(f"Light curve loaded: {path}")
         self.update_current_curve_path_label()
-        self.append_log(f"Light Curve CSV loaded from plugin: {path}")
+        self.append_log(f"Light Curve CSV loaded: {path}")
         self.clear_extremum_fit(redraw=False, reset_status=False)
         if plot_lightcurve and can_plot_lightcurve:
             plot_target_name = self.loaded_lightcurve_target_name
@@ -18269,13 +18398,13 @@ class LightCurveWindow(QWidget):
                 None,
                 plot_target_name,
                 path.parent.name,
-                allow_extremum=not is_diagnostic_result,
+                allow_extremum=allow_extremum and not is_diagnostic_result,
                 include_invalid=is_diagnostic_result,
             )
         self.refresh_optional_tab_views()
 
     def current_export_lightcurve(self) -> tuple[Path, str] | None:
-        """Return the current light-curve CSV and target name for export."""
+        """Return the current valid photometry result and target name for export."""
 
         if (
             self.current_result_origin in {"loaded", "created", "single"}

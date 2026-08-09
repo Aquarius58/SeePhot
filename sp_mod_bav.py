@@ -1337,8 +1337,8 @@ def _current_result_csv(context: dict[str, object]) -> tuple[Path, str]:
         return result_csv, target_name
 
     raise RuntimeError(
-        "No current result CSV available. Open an existing *_result_curve.csv "
-        "in the Photometry tab or generate a new light curve first."
+        "No current result CSV available. Open an existing Light Curve or "
+        "Single Measurement result in the Photometry tab first."
     )
 
 

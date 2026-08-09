@@ -3,7 +3,7 @@
 Private prerelease repository for SeePhot, a Siril Python application for
 Seestar variable-star photometry.
 
-> **Development status:** internal prerelease (`0.4.5-pre`). Interfaces, file
+> **Development status:** internal prerelease (`0.4.8-pre`). Interfaces, file
 > formats, photometry rules, and installation steps may still change.
 
 ## Planned Prerelease Bundle
@@ -27,6 +27,13 @@ part of this prerelease:
 
 ## Current Prerelease Focus
 
+- Light-curve and Single Measurement results are discovered separately according
+  to the selected photometry mode. Explicitly selected CSV files are recognized
+  by their content and loaded without resetting the acquisition mode.
+- Loaded valid light curves remain available for plotting, extremum fitting,
+  AAVSO export, and BAV output. Loaded valid Single Measurements remain available
+  for AAVSO and BAV single-brightness export, with existing export files shown in
+  the Single Measurement result browser.
 - Target and annulus contamination are evaluated after measurement. Rejected
   measurements are visibly marked and excluded from scientific plots,
   extremum fitting, and AAVSO export.
