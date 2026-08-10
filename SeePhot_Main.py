@@ -189,6 +189,7 @@ SERIES_RINGSET_APERTURE_FWHM_FACTORS = (1.2, 1.4, 1.6, 1.8, 2.1)
 SERIES_RINGSET_ANNULUS_INNER_FWHM_FACTORS = (2.4, 2.8, 3.2, 3.6)
 SERIES_RINGSET_ANNULUS_WIDTH_FWHM_FACTORS = (1.2, 1.6, 2.0, 2.6)
 SINGLE_FIELD_ZP_METHOD_ID = "FIELD_ZERO_POINT_AUTO_CATALOG_V1"
+CURRENT_RESULT_METADATA_VERSION = 1
 SINGLE_FIELD_ZP_LEGACY_METHOD_ID = "FIELD_ZERO_POINT_APASS_DR10_V1"
 SINGLE_FIELD_ZP_METHOD_KEYS = {
     SINGLE_FIELD_ZP_METHOD_ID.lower(),
@@ -4910,6 +4911,28 @@ def vsx_magnitude_display(obj: CatalogObject) -> str:
     return display or obj.magnitude
 
 
+def result_target_metadata(target: CatalogObject) -> dict[str, str]:
+    """Return the complete, portable target identity stored in every result."""
+
+    target_ra, target_dec = sexagesimal_ra_dec(target)
+    vsx_oid = target.value_for(("OID", "oid")).strip()
+    mag_range, mag_max_raw, mag_min_raw, mag_band = vsx_mag_range(target)
+    return {
+        "OBJECT_NAME": target.name.strip(),
+        "OBJECT_RA": target_ra,
+        "OBJECT_DEC": target_dec,
+        "OBJECT_VAR_TYPE": target.object_type.strip(),
+        "OBJECT_MAG_RANGE": mag_range,
+        "OBJECT_MAG_MAX_RAW": mag_max_raw,
+        "OBJECT_MAG_MIN_RAW": mag_min_raw,
+        "OBJECT_MAG_BAND": mag_band,
+        "OBJECT_PERIOD": normalize_period(target.period).strip(),
+        "OBJECT_EPOCH": target.value_for(("Epoch", "epoch")).strip(),
+        "OBJECT_VSX_OID": vsx_oid,
+        "OBJECT_VSX_URL": aavso_vsx_detail_url(vsx_oid) if vsx_oid else "",
+    }
+
+
 def catalog_object_report_entry(obj: CatalogObject) -> str:
     """Return a compact star entry for report metadata."""
 
@@ -6278,6 +6301,29 @@ def aavso_vsx_detail_url(oid: str) -> str:
         "https://vsx.aavso.org/index.php?"
         f"oid={urllib.parse.quote(str(oid).strip())}&view=detail.top"
     )
+
+
+def current_result_vsx_url(metadata: dict[str, str]) -> str:
+    """Return the VSX URL from the one supported current result format."""
+
+    if metadata.get("RESULT_METADATA_VERSION", "").strip() != str(
+        CURRENT_RESULT_METADATA_VERSION
+    ):
+        raise ValueError("The result is not in the current result format.")
+    required = (
+        "OBJECT_NAME",
+        "OBJECT_RA",
+        "OBJECT_DEC",
+        "OBJECT_VSX_OID",
+        "OBJECT_VSX_URL",
+    )
+    missing = [key for key in required if not metadata.get(key, "").strip()]
+    if missing:
+        raise ValueError(
+            "The current result format has incomplete VSX target metadata: "
+            + ", ".join(missing)
+        )
+    return metadata["OBJECT_VSX_URL"].strip()
 
 
 def vizier_vsx_objects_for_table(
@@ -15339,50 +15385,23 @@ class LightCurveWindow(QWidget):
     def open_current_result_vsx_page(self) -> None:
         """Open the VSX page for the currently loaded or generated result."""
 
-        current = self.current_export_lightcurve()
+        current = self.current_display_result()
         if current is None:
             QMessageBox.warning(self, "Open VSX", "Open a result first.")
             return
 
         result_csv, target_name = current
         metadata = read_result_metadata_header(result_csv)
-        oid = metadata.get("OBJECT_VSX_OID", "").strip()
-        url = metadata.get("OBJECT_VSX_URL", "").strip()
-
-        if not oid and self.selected_target is not None:
-            selected_name = self.selected_target.catalog_object.name.strip()
-            if selected_name and selected_name.casefold() == str(target_name).strip().casefold():
-                oid = self.selected_target.catalog_object.value_for(("OID", "oid")).strip()
-
-        if not oid and not url:
-            object_name = metadata.get("OBJECT_NAME", "").strip() or str(target_name).strip()
-            object_ra = metadata.get("OBJECT_RA", "").strip()
-            object_dec = metadata.get("OBJECT_DEC", "").strip()
-            if object_ra and object_dec:
-                lookup_obj = CatalogObject(
-                    {
-                        "Name": object_name,
-                        "RA": object_ra,
-                        "DEC": object_dec,
-                    }
-                )
-                self.append_log(f"VSX OID missing for loaded result {object_name}; querying VizieR by position.")
-                try:
-                    oid = query_vizier_vsx_oid(lookup_obj)
-                except Exception as exc:
-                    self.append_log(f"ERROR: Could not query VSX OID for loaded result: {exc}")
-                    QMessageBox.warning(self, "Open VSX", f"Could not query VSX OID:\n{exc}")
-                    return
-
-        if not url:
-            if not oid:
-                QMessageBox.warning(
-                    self,
-                    "Open VSX",
-                    "Could not find the VSX page for the loaded result.",
-                )
-                return
-            url = aavso_vsx_detail_url(oid)
+        try:
+            url = current_result_vsx_url(metadata)
+        except ValueError as exc:
+            self.append_log(f"WARNING: Result has no current VSX metadata: {exc}")
+            QMessageBox.warning(
+                self,
+                "Open VSX",
+                f"VSX is unavailable for this result.\n\n{exc}",
+            )
+            return
 
         if not QDesktopServices.openUrl(QUrl(url)):
             QMessageBox.warning(self, "Open VSX", "Could not open VSX page.")
@@ -16472,9 +16491,6 @@ class LightCurveWindow(QWidget):
             f"({instrument_sources['PIXEL_SCALE_ARCSEC_PX']})."
         )
         target = self.selected_target.catalog_object
-        target_ra, target_dec = sexagesimal_ra_dec(target)
-        vsx_oid = target.value_for(("OID", "oid")).strip()
-        mag_range, mag_max_raw, mag_min_raw, mag_band = vsx_mag_range(target)
         target_exptimes = [
             item.exptime
             for item in measurements
@@ -16497,19 +16513,8 @@ class LightCurveWindow(QWidget):
             photometry_method += f"; note={aperture_settings.note}"
 
         return {
-            "RESULT_METADATA_VERSION": 1,
-            "OBJECT_NAME": target.name.strip(),
-            "OBJECT_RA": target_ra,
-            "OBJECT_DEC": target_dec,
-            "OBJECT_VAR_TYPE": target.object_type.strip(),
-            "OBJECT_MAG_RANGE": mag_range,
-            "OBJECT_MAG_MAX_RAW": mag_max_raw,
-            "OBJECT_MAG_MIN_RAW": mag_min_raw,
-            "OBJECT_MAG_BAND": mag_band,
-            "OBJECT_PERIOD": normalize_period(target.period).strip(),
-            "OBJECT_EPOCH": target.value_for(("Epoch", "epoch")).strip(),
-            "OBJECT_VSX_OID": vsx_oid,
-            "OBJECT_VSX_URL": aavso_vsx_detail_url(vsx_oid) if vsx_oid else "",
+            "RESULT_METADATA_VERSION": CURRENT_RESULT_METADATA_VERSION,
+            **result_target_metadata(target),
             "OBSERVER_BAV": optional_settings["OBSERVER_BAV"],
             "OBSERVER_NAME": optional_settings["OBSERVER_NAME"],
             "OBSERVER_AAVSO": optional_settings["OBSERVER_AAVSO"],
@@ -16799,11 +16804,12 @@ class LightCurveWindow(QWidget):
             f"({instrument_sources['PIXEL_SCALE_ARCSEC_PX']})."
         )
         metadata = {
+            "RESULT_METADATA_VERSION": CURRENT_RESULT_METADATA_VERSION,
             "SINGLE_MEASUREMENT_VERSION": 1,
             "SCRIPT_VERSION": SCRIPT_VERSION,
             "MODE": MODE_SINGLE_MEASUREMENT,
             "SINGLE_FIELD_ZP_METHOD": SINGLE_FIELD_ZP_METHOD_ID,
-            "OBJECT_NAME": self.selected_target.catalog_object.name.strip(),
+            **result_target_metadata(self.selected_target.catalog_object),
             "SOURCE_FILE": str(self.current_source_fits_file() or ""),
             "WORK_FILE": str(frame_path),
             "PHOTOMETRY_METHOD": (
@@ -18419,6 +18425,13 @@ class LightCurveWindow(QWidget):
                 return None
             return self.loaded_lightcurve_csv, self.loaded_lightcurve_target_name or "Target"
         return None
+
+    def current_display_result(self) -> tuple[Path, str] | None:
+        """Return the displayed result even when scientific export is disabled."""
+
+        if self.loaded_lightcurve_csv is None or not self.loaded_lightcurve_csv.exists():
+            return None
+        return self.loaded_lightcurve_csv, self.loaded_lightcurve_target_name or "Target"
 
     def current_aavso_export_directory(self) -> Path | None:
         """Return the directory where the current AAVSO report is written."""
