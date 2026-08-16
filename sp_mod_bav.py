@@ -31,12 +31,15 @@ warnings.filterwarnings(
 
 
 PLUGIN_TAB_LABEL = "BAV"
-BAV_PLUGIN_VERSION = "0.2"
+BAV_PLUGIN_VERSION = "0.3"
 APP_NAME = "SeestarLightcurve"
 CONFIG_NAME = "bav_report.json"
 REPORT_TABLE_HEADER_BACKGROUND = "#4472C4"
 REPORT_TABLE_HEADER_TEXT = "#FFFFFF"
 REPORT_LINK_COLOR = "#0563C1"
+BAV_PDF_COMMENT_MAX_LENGTH = 90
+BAV_PDF_COMMENT_FONT_SIZES = (8.0, 7.5, 7.0, 6.5, 6.0, 5.5)
+BAV_PDF_COMMENT_VALUE_WIDTH_MM = 57
 VSX_DETAIL_URL_TEMPLATE = "https://vsx.aavso.org/index.php?oid={oid}&view=detail.top"
 RESULT_KIND_LIGHTCURVE = "lightcurve"
 RESULT_KIND_SINGLE_FIELD_ZP = "single_field_zp"
@@ -921,7 +924,71 @@ def _fit_overlay_points(
     )
 
 
-def report_results_table(metadata: dict[str, str], fit: dict[str, object], styles: object) -> object:
+def bav_pdf_comment_text(comment: str) -> str:
+    """Return width-measured markup occupying exactly two PDF comment lines."""
+
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    normalized = " ".join(str(comment or "").split())
+    if len(normalized) > BAV_PDF_COMMENT_MAX_LENGTH:
+        raise ValueError(
+            f"BAV PDF comment must not exceed {BAV_PDF_COMMENT_MAX_LENGTH} characters."
+        )
+    if not normalized:
+        return "-<br/>&nbsp;"
+    usable_width = BAV_PDF_COMMENT_VALUE_WIDTH_MM * mm - 10
+    if stringWidth(normalized, "Helvetica", 8.0) <= usable_width:
+        return f"{escape(normalized)}<br/>&nbsp;"
+
+    whitespace_positions = [
+        index for index, char in enumerate(normalized) if char == " "
+    ]
+    if not whitespace_positions:
+        raise ValueError("BAV PDF comment is too wide and has no word boundary for wrapping.")
+
+    selected: tuple[float, str, str] | None = None
+    for font_size in BAV_PDF_COMMENT_FONT_SIZES:
+        candidates: list[tuple[float, float, str, str]] = []
+        for split_at in whitespace_positions:
+            first_line = normalized[:split_at].rstrip()
+            second_line = normalized[split_at + 1 :].lstrip()
+            first_width = stringWidth(first_line, "Helvetica", font_size)
+            second_width = stringWidth(second_line, "Helvetica", font_size)
+            if first_width <= usable_width and second_width <= usable_width:
+                candidates.append(
+                    (
+                        abs(first_width - second_width),
+                        max(first_width, second_width),
+                        first_line,
+                        second_line,
+                    )
+                )
+        if candidates:
+            _balance, _maximum, first_line, second_line = min(candidates)
+            selected = (font_size, first_line, second_line)
+            break
+    if selected is None:
+        raise ValueError("BAV PDF comment is too wide for two PDF lines.")
+
+    font_size, first_line, second_line = selected
+
+    def nonbreaking_markup(text: str) -> str:
+        return escape(text).replace(" ", "&nbsp;")
+
+    return (
+        f'<font size="{font_size:g}">{nonbreaking_markup(first_line)}</font>'
+        f'<br/><font size="{font_size:g}">'
+        f"{nonbreaking_markup(second_line) or '&nbsp;'}</font>"
+    )
+
+
+def report_results_table(
+    metadata: dict[str, str],
+    fit: dict[str, object],
+    styles: object,
+    comment: str = "",
+) -> object:
     """Return the Results table from the current extremum fit."""
 
     from reportlab.lib.units import mm
@@ -940,7 +1007,7 @@ def report_results_table(metadata: dict[str, str], fit: dict[str, object], style
         ("HJD", escape(hjd_text)),
         ("UTC", escape(_utc_from_jd_text(jd))),
         ("Mag", "" if mag is None else escape(f"{mag:.4f}")),
-        ("Comment", "-"),
+        ("Comment", bav_pdf_comment_text(comment)),
     ]
     return _report_table("Results", rows, styles, (25 * mm, 57 * mm))
 
@@ -1396,15 +1463,6 @@ def short_jd_filename_text(metadata: dict[str, str], fit: dict[str, object]) -> 
     return text[2:] if text.startswith("24") else text
 
 
-def bav_target_output_prefix(metadata: dict[str, str]) -> str:
-    """Return the stable filename prefix identifying one BAV target."""
-
-    raw_constellation = constellation_abbreviation(metadata)
-    constellation = safe_filename_text(raw_constellation, "Const")
-    object_name = bav_technical_object_name(_metadata_value(metadata, "OBJECT_NAME"), raw_constellation, "target")
-    return f"{constellation}_{object_name}_"
-
-
 def bav_output_prefix(metadata: dict[str, str], fit: dict[str, object]) -> str:
     """Return Sternbild_Sternname_JD_BAVKennung filename prefix."""
 
@@ -1414,31 +1472,6 @@ def bav_output_prefix(metadata: dict[str, str], fit: dict[str, object]) -> str:
     short_jd = safe_filename_text(short_jd_filename_text(metadata, fit), "JD")
     bav_code = safe_filename_text(_metadata_value(metadata, "OBSERVER_BAV").upper(), "BAV")
     return f"{constellation}_{object_name}_{short_jd}_{bav_code}"
-
-
-def existing_bav_target_files(
-    output_dir: Path,
-    metadata: dict[str, str],
-) -> tuple[Path, ...]:
-    """Return existing app-created BAV files for this target, independent of fit JD."""
-
-    if not output_dir.is_dir():
-        return ()
-    target_prefix = bav_target_output_prefix(metadata)
-    matches: list[Path] = []
-    for path in output_dir.iterdir():
-        if not (path.is_file() or path.is_symlink()):
-            continue
-        if not path.name.startswith(target_prefix):
-            continue
-        lower_name = path.name.lower()
-        if (
-            path.suffix.lower() == ".pdf"
-            or lower_name.endswith("_minimax.txt")
-            or lower_name.endswith("_report.txt")
-        ):
-            matches.append(path)
-    return tuple(sorted(matches, key=lambda path: path.name.casefold()))
 
 
 def bav_observation_date_token(result_csv: Path) -> str:
@@ -1458,7 +1491,7 @@ def existing_bav_files_prompt(
     file_list = "\n".join(f"• {path.name}" for path in existing_files)
     return (
         f"Für {target_name} gibt es für die Beobachtung {observation_date} "
-        "bereits BAV-Dateien:\n\n"
+        "und den aktuellen Extremwert bereits BAV-Dateien:\n\n"
         f"{file_list}\n\n"
         "Sollen diese Dateien gelöscht und neu erzeugt werden?"
     )
@@ -1473,6 +1506,22 @@ def bav_output_paths(result_csv: Path, metadata: dict[str, str], fit: dict[str, 
 def bav_single_magnitudes_path(result_csv: Path, metadata: dict[str, str], fit: dict[str, object]) -> Path:
     prefix = bav_output_prefix(metadata, fit)
     return result_csv.parent / "BAV" / f"{prefix}_Report.txt"
+
+
+def existing_bav_output_files(
+    result_csv: Path,
+    metadata: dict[str, str],
+    fit: dict[str, object],
+) -> tuple[Path, ...]:
+    """Return existing files belonging to exactly the current extremum fit."""
+
+    output_pdf, minimax_path = bav_output_paths(result_csv, metadata, fit)
+    report_path = bav_single_magnitudes_path(result_csv, metadata, fit)
+    return tuple(
+        path
+        for path in (output_pdf, minimax_path, report_path)
+        if path.is_file() or path.is_symlink()
+    )
 
 
 def bav_single_measurement_path(result_csv: Path, metadata: dict[str, str]) -> Path:
@@ -1503,6 +1552,7 @@ def ensure_valid_cwd(preferred_directory: Path) -> None:
 def create_lightcurve_sheet_pdf(
     context: dict[str, object],
     settings: dict[str, str] | None = None,
+    comment: str = "",
 ) -> Path:
     """Create a minimal BAV lightcurve sheet PDF for the current light curve."""
 
@@ -1552,7 +1602,7 @@ def create_lightcurve_sheet_pdf(
     story.append(Spacer(1, 5 * mm))
     story.append(report_observation_photometry_tables(report_metadata, rows, styles))
     story.append(Spacer(1, 5 * mm))
-    story.append(report_results_table(report_metadata, extremum_fit, styles))
+    story.append(report_results_table(report_metadata, extremum_fit, styles, comment))
     doc.build(story)
     return output_pdf
 
@@ -1761,6 +1811,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
         QFormLayout,
         QGroupBox,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QMessageBox,
@@ -2113,7 +2164,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
             fit = _current_extremum_fit(context)
             bav_output_paths(result_csv, metadata, fit)
             bav_single_magnitudes_path(result_csv, metadata, fit)
-            existing_files = existing_bav_target_files(folder, metadata)
+            existing_files = existing_bav_output_files(result_csv, metadata, fit)
             observation_date = bav_observation_date_token(result_csv)
         except Exception as exc:
             status_label.setText("BAV-Zieldateien konnten nicht bestimmt werden.")
@@ -2143,7 +2194,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
                     append_log(f"WARNING: Could not delete BAV file {path}: {exc}")
                     status_label.setText("BAV-Datei konnte nicht geloescht werden.")
                     return False
-            append_log(f"Deleted {len(existing_files)} existing BAV file(s) for current target from {folder}.")
+            append_log(f"Deleted {len(existing_files)} existing BAV file(s) for current extremum fit from {folder}.")
         folder.mkdir(parents=True, exist_ok=True)
         return True
 
@@ -2179,6 +2230,37 @@ def create_bav_tab(context: dict[str, object]) -> object:
         if result_kind is None:
             return
         update_export_description(result_kind)
+        pdf_comment = ""
+        if result_kind != RESULT_KIND_SINGLE_FIELD_ZP:
+            comment_question = QMessageBox(tab)
+            comment_question.setWindowTitle("BAV-Kommentar")
+            comment_question.setText("Kommentar zum Lichtkurvenblatt hinzufügen?")
+            yes_button = comment_question.addButton("Ja", QMessageBox.ButtonRole.YesRole)
+            no_button = comment_question.addButton("Nein", QMessageBox.ButtonRole.NoRole)
+            comment_question.setDefaultButton(no_button)
+            comment_question.exec()
+            if comment_question.clickedButton() is yes_button:
+                comment_dialog = QInputDialog(tab)
+                comment_dialog.setWindowTitle("BAV-Kommentar")
+                comment_dialog.setLabelText(
+                    f"Kommentar eingeben (maximal {BAV_PDF_COMMENT_MAX_LENGTH} Zeichen):"
+                )
+                comment_dialog.setInputMode(QInputDialog.InputMode.TextInput)
+                comment_dialog.setOkButtonText("OK")
+                comment_dialog.setCancelButtonText("Abbrechen")
+                comment_edit = comment_dialog.findChild(QLineEdit)
+                if comment_edit is not None:
+                    comment_edit.setMaxLength(BAV_PDF_COMMENT_MAX_LENGTH)
+
+                def enforce_comment_limit(text: str) -> None:
+                    if len(text) > BAV_PDF_COMMENT_MAX_LENGTH:
+                        comment_dialog.setTextValue(text[:BAV_PDF_COMMENT_MAX_LENGTH])
+
+                comment_dialog.textValueChanged.connect(enforce_comment_limit)
+                if not comment_dialog.exec():
+                    append_log("BAV output creation aborted in comment dialog.")
+                    return
+                pdf_comment = comment_dialog.textValue().strip()
         if (
             result_kind != RESULT_KIND_SINGLE_FIELD_ZP
             and not prepare_bav_output_directory(settings)
@@ -2195,7 +2277,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
                 created_paths.append(output_report)
                 append_log(f"BAV Einzelhelligkeit file created: {output_report}")
             else:
-                output_pdf = create_lightcurve_sheet_pdf(context, settings)
+                output_pdf = create_lightcurve_sheet_pdf(context, settings, pdf_comment)
                 created_paths.append(output_pdf)
                 append_log(f"BAV Lichtkurvenblatt PDF created: {output_pdf}")
                 output_minimax = create_minimax_file(context, settings)

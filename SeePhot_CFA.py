@@ -1668,6 +1668,16 @@ class StackWindow(QWidget):
         self.source_edit.setText(self.source_dir)
         return path
 
+    def set_source_directory(self, source_dir: str | Path) -> bool:
+        """Select an existing source folder supplied by another SeePhot step."""
+
+        path = Path(source_dir).expanduser()
+        if not path.is_dir():
+            return False
+        self.source_dir = str(path.resolve())
+        self.source_edit.setText(self.source_dir)
+        return True
+
     def dialog_start_directory(self) -> str:
         current_path = self.sync_source_dir_from_edit()
         if current_path is None:

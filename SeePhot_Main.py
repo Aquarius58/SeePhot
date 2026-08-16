@@ -38,7 +38,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.4.8-pre"
+SCRIPT_VERSION = "0.4.12-pre"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
@@ -130,6 +130,8 @@ RESULT_TELESCOPE_SPECS: dict[str, dict[str, object]] = {
 # VSX target search defaults.
 # Limit magnitude is passed to Siril's VSX conesearch.
 DEFAULT_VSX_LIMIT_MAG = 16.0
+VSX_QUERY_ATTEMPTS = 2
+VSX_QUERY_RETRY_DELAY_SECONDS = 1.0
 
 # APASS comparison-star defaults.
 # dVmag filters comparison stars by magnitude distance from the selected
@@ -190,6 +192,7 @@ SERIES_RINGSET_ANNULUS_INNER_FWHM_FACTORS = (2.4, 2.8, 3.2, 3.6)
 SERIES_RINGSET_ANNULUS_WIDTH_FWHM_FACTORS = (1.2, 1.6, 2.0, 2.6)
 SINGLE_FIELD_ZP_METHOD_ID = "FIELD_ZERO_POINT_AUTO_CATALOG_V1"
 CURRENT_RESULT_METADATA_VERSION = 1
+FIELD_FOOTPRINT_ORDER = "x0_y0;xmax_y0;xmax_ymax;x0_ymax"
 SINGLE_FIELD_ZP_LEGACY_METHOD_ID = "FIELD_ZERO_POINT_APASS_DR10_V1"
 SINGLE_FIELD_ZP_METHOD_KEYS = {
     SINGLE_FIELD_ZP_METHOD_ID.lower(),
@@ -1492,6 +1495,78 @@ def external_siril_binary_path() -> Path | None:
     return None
 
 
+def appimage_root_for_siril_binary(siril_binary: Path) -> Path | None:
+    """Return the AppImage mount containing a Siril executable, if applicable."""
+
+    if not sys.platform.startswith("linux"):
+        return None
+
+    lexical_binary_path = siril_binary.expanduser().absolute()
+    resolved_binary_path = lexical_binary_path.resolve()
+    binary_paths = tuple(dict.fromkeys((lexical_binary_path, resolved_binary_path)))
+    app_dir: Path | None = None
+    configured_app_dir = os.environ.get("APPDIR", "").strip()
+    if configured_app_dir:
+        candidate = Path(configured_app_dir).expanduser().resolve()
+        if any(binary_path.is_relative_to(candidate) for binary_path in binary_paths):
+            app_dir = candidate
+
+    if app_dir is None:
+        for binary_path in binary_paths:
+            for candidate in binary_path.parents:
+                app_run = candidate / "AppRun"
+                has_appimage_layout = (
+                    candidate.name.startswith(".mount_")
+                    and binary_path.parent == candidate / "usr" / "bin"
+                    and (candidate / "usr" / "lib").is_dir()
+                )
+                if (
+                    (app_run.is_file() or app_run.is_symlink())
+                    and (candidate / "usr").is_dir()
+                ) or has_appimage_layout:
+                    app_dir = candidate
+                    break
+            if app_dir is not None:
+                break
+
+    return app_dir
+
+
+def external_siril_command(siril_binary: Path, script_path: Path) -> list[str]:
+    """Return the supported standalone command for an installed or AppImage Siril."""
+
+    app_dir = appimage_root_for_siril_binary(siril_binary)
+    if app_dir is not None:
+        app_run = app_dir / "AppRun"
+        if app_run.is_file() or app_run.is_symlink():
+            return [str(app_run), "siril-cli", "-s", str(script_path)]
+    return [str(siril_binary), "-s", str(script_path)]
+
+
+def external_siril_environment(siril_binary: Path) -> dict[str, str]:
+    """Return a fallback environment for a directly invoked AppImage binary."""
+
+    environment = os.environ.copy()
+    app_dir = appimage_root_for_siril_binary(siril_binary)
+
+    if app_dir is None:
+        return environment
+
+    library_dirs: list[Path] = []
+    for base in (app_dir / "lib", app_dir / "usr" / "lib", app_dir / "usr" / "lib64"):
+        if not base.is_dir():
+            continue
+        library_dirs.append(base)
+        library_dirs.extend(sorted(path for path in base.iterdir() if path.is_dir()))
+
+    existing_dirs = environment.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+    combined_dirs = [str(path) for path in library_dirs]
+    combined_dirs.extend(path for path in existing_dirs if path)
+    environment["APPDIR"] = str(app_dir)
+    environment["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(combined_dirs))
+    return environment
+
+
 def close_siril_image_and_change_cwd(
     siril: s.SirilInterface,
     safe_directory: Path,
@@ -1555,6 +1630,21 @@ class LightCurvePlotData:
     check_delta_values: np.ndarray
     filter_label: str
     exposure_seconds: float | None
+
+
+@dataclass(frozen=True)
+class LightCurveTrimPlan:
+    """Complete replacement content for trimming one current result CSV."""
+
+    result_csv: Path
+    metadata: dict[str, object]
+    fieldnames: tuple[str, ...]
+    rows: tuple[dict[str, str], ...]
+    original_row_count: int
+    range_min_jd: float
+    range_max_jd: float
+    source_size: int
+    source_mtime_ns: int
 
 
 @dataclass(frozen=True)
@@ -5096,6 +5186,145 @@ def augment_result_metadata_from_rows(
     return result
 
 
+def build_lightcurve_trim_plan(
+    result_csv: Path,
+    range_min_jd: float,
+    range_max_jd: float,
+) -> LightCurveTrimPlan:
+    """Return the exact current-format CSV content kept by a JD trim."""
+
+    if not result_csv.is_file():
+        raise FileNotFoundError(f"Result CSV not found: {result_csv}")
+    lower = min(float(range_min_jd), float(range_max_jd))
+    upper = max(float(range_min_jd), float(range_max_jd))
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        raise ValueError("Select a valid JD range first.")
+
+    metadata = read_result_metadata_header(result_csv)
+    with result_csv.open(newline="") as handle:
+        reader = csv_data_dict_reader(handle)
+        fieldnames = tuple(reader.fieldnames or ())
+        source_rows = list(reader)
+    if not fieldnames or "jd" not in fieldnames:
+        raise ValueError("The current result CSV has no usable jd column.")
+
+    kept_rows = tuple(
+        row
+        for row in source_rows
+        if (
+            (jd := result_row_float(row, "jd")) is not None
+            and lower <= jd <= upper
+        )
+    )
+    if len(kept_rows) < 2:
+        raise ValueError("The selected range must keep at least two light-curve rows.")
+    if len(kept_rows) == len(source_rows):
+        raise ValueError("The selected range does not remove any light-curve rows.")
+
+    original_count_text = metadata.get("LIGHTCURVE_ORIGINAL_OBS_COUNT", "").strip()
+    try:
+        original_count = int(original_count_text)
+    except ValueError:
+        original_count = len(source_rows)
+    original_count = max(original_count, len(source_rows))
+
+    trimmed_metadata = augment_result_metadata_from_rows(metadata, list(kept_rows))
+    trimmed_metadata.update(
+        {
+            "LIGHTCURVE_TRIMMED": 1,
+            "LIGHTCURVE_ORIGINAL_OBS_COUNT": original_count,
+            "LIGHTCURVE_TRIM_JD_START": f"{lower:.8f}",
+            "LIGHTCURVE_TRIM_JD_END": f"{upper:.8f}",
+        }
+    )
+    source_stat = result_csv.stat()
+    return LightCurveTrimPlan(
+        result_csv=result_csv,
+        metadata=trimmed_metadata,
+        fieldnames=fieldnames,
+        rows=kept_rows,
+        original_row_count=len(source_rows),
+        range_min_jd=lower,
+        range_max_jd=upper,
+        source_size=source_stat.st_size,
+        source_mtime_ns=source_stat.st_mtime_ns,
+    )
+
+
+def write_lightcurve_trim_plan(plan: LightCurveTrimPlan) -> None:
+    """Atomically replace a result CSV with one previously reviewed trim plan."""
+
+    current_stat = plan.result_csv.stat()
+    if (
+        current_stat.st_size != plan.source_size
+        or current_stat.st_mtime_ns != plan.source_mtime_ns
+    ):
+        raise RuntimeError("The result CSV changed after the trim preview. Select the range again.")
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            prefix=f".{plan.result_csv.name}.",
+            suffix=".tmp",
+            dir=plan.result_csv.parent,
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            write_result_metadata_header(handle, plan.metadata)
+            writer = csv.DictWriter(handle, fieldnames=plan.fieldnames)
+            writer.writeheader()
+            writer.writerows(plan.rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, stat.S_IMODE(current_stat.st_mode))
+        os.replace(temporary_path, plan.result_csv)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def local_derived_export_files(
+    result_csv: Path,
+    target_name: str,
+) -> tuple[Path, ...]:
+    """Return local AAVSO/BAV derivatives without any archive or DB semantics."""
+
+    matches: list[Path] = []
+    aavso_path = (
+        result_csv.parent
+        / "AAVSO"
+        / (result_csv.stem.replace("_result_curve", "") + "_aavso_extended.txt")
+    )
+    if aavso_path.is_file() or aavso_path.is_symlink():
+        matches.append(aavso_path)
+
+    bav_directory = result_csv.parent / "BAV"
+    if bav_directory.is_dir():
+        results_module = load_lightcurve_results_module()
+        bav_files = getattr(results_module, "bav_report_files", None)
+        if not callable(bav_files):
+            raise RuntimeError("Could not safely identify local BAV files for this result.")
+        metadata = read_result_metadata_header(result_csv)
+        matches.extend(
+            path
+            for path in bav_files(result_csv, metadata, target_name)
+            if (
+                path.suffix.casefold() == ".pdf"
+                or path.name.casefold().endswith("_minimax.txt")
+                or path.name.casefold().endswith("_report.txt")
+            )
+        )
+
+    unique: dict[Path, Path] = {}
+    for path in matches:
+        unique[path.resolve()] = path
+    return tuple(sorted(unique.values(), key=lambda path: str(path).casefold()))
+
+
 def cleanup_plate_solve_artifacts(directory: Path) -> None:
     """Remove stale sequence artifacts produced by a previous plate solve attempt."""
 
@@ -5611,24 +5840,54 @@ def reference_frame_search_radius_arcmin(frame: ReferenceFrame) -> float:
 
     center = SkyCoord(frame.ra_deg * u.deg, frame.dec_deg * u.deg, frame="icrs")
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FITSFixedWarning)
-            with fits.open(frame.path) as hdul:
-                wcs = WCS(hdul[0].header)
-        corners = (
-            (0, 0),
-            (max(frame.width - 1, 0), 0),
-            (0, max(frame.height - 1, 0)),
-            (max(frame.width - 1, 0), max(frame.height - 1, 0)),
-        )
         separations = [
-            center.separation(wcs.pixel_to_world(x, y)).arcmin
-            for x, y in corners
+            center.separation(corner).arcmin
+            for corner in reference_frame_icrs_corners(frame)
         ]
         radius = max(separations) * 1.05
     except Exception:
         radius = reference_frame_fallback_radius_arcmin(frame)
     return max(radius, 5.0)
+
+
+def reference_frame_icrs_corners(frame: ReferenceFrame) -> tuple[SkyCoord, ...]:
+    """Return reference-frame corners in stable pixel-coordinate order."""
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        with fits.open(frame.path) as hdul:
+            wcs = WCS(hdul[0].header).celestial
+    pixels = (
+        (0, 0),
+        (max(frame.width - 1, 0), 0),
+        (max(frame.width - 1, 0), max(frame.height - 1, 0)),
+        (0, max(frame.height - 1, 0)),
+    )
+    corners = tuple(wcs.pixel_to_world(x, y) for x, y in pixels)
+    if any(
+        not np.isfinite(float(corner.ra.deg))
+        or not np.isfinite(float(corner.dec.deg))
+        for corner in corners
+    ):
+        raise ValueError("Reference-frame WCS produced a non-finite sky footprint.")
+    return corners
+
+
+def reference_frame_field_metadata(frame: ReferenceFrame) -> dict[str, str]:
+    """Serialize the solved reference field used for catalog queries."""
+
+    corners = reference_frame_icrs_corners(frame)
+    footprint = ";".join(
+        f"{float(corner.ra.deg):.8f},{float(corner.dec.deg):.8f}"
+        for corner in corners
+    )
+    return {
+        "FIELD_CENTER_RA_DEG": f"{frame.ra_deg:.8f}",
+        "FIELD_CENTER_DEC_DEG": f"{frame.dec_deg:.8f}",
+        "FIELD_FOOTPRINT_ICRS": footprint,
+        "FIELD_FOOTPRINT_ORDER": FIELD_FOOTPRINT_ORDER,
+        "FIELD_SEARCH_RADIUS_ARCMIN": f"{reference_frame_search_radius_arcmin(frame):.6f}",
+    }
 
 
 def reference_frame_fallback_radius_arcmin(frame: ReferenceFrame) -> float:
@@ -6227,25 +6486,62 @@ def query_vizier_vsx_region(
     frame: ReferenceFrame,
     progress: Callable[[str], None] | None = None,
 ) -> list[CatalogObject]:
-    """Query VizieR VSX, falling back to astroquery if TAP is unavailable."""
+    """Query VizieR VSX with retries and an independent astroquery fallback."""
 
-    try:
-        rows = query_vizier_vsx_region_tap(frame)
-        if progress is not None:
-            progress(f"VizieR VSX TAP returned {len(rows)} object(s).")
-        return rows
-    except Exception as tap_exc:
-        if progress is not None:
-            progress(f"WARNING: VizieR VSX TAP failed: {tap_exc}; trying astroquery fallback.")
+    tap_exc: Exception | None = None
+    for attempt in range(1, VSX_QUERY_ATTEMPTS + 1):
+        try:
+            rows = query_vizier_vsx_region_tap(frame)
+            if progress is not None:
+                progress(f"VizieR VSX TAP returned {len(rows)} object(s).")
+            return rows
+        except Exception as exc:
+            tap_exc = exc
+            if progress is not None:
+                progress(
+                    "WARNING: VizieR VSX TAP request "
+                    f"{attempt}/{VSX_QUERY_ATTEMPTS} failed: {exc}"
+                )
+            if attempt < VSX_QUERY_ATTEMPTS:
+                time.sleep(VSX_QUERY_RETRY_DELAY_SECONDS)
+
+    if progress is not None:
+        progress("Trying the independent astroquery VizieR VSX fallback.")
+
+    astroquery_exc: Exception | None = None
+    for attempt in range(1, VSX_QUERY_ATTEMPTS + 1):
         try:
             rows = query_vizier_vsx_region_astroquery(frame)
-        except Exception as astroquery_exc:
-            raise RuntimeError(
-                f"VizieR VSX TAP failed: {tap_exc}; astroquery fallback failed: {astroquery_exc}"
-            ) from astroquery_exc
-        if progress is not None:
-            progress(f"Astroquery VizieR VSX fallback returned {len(rows)} object(s).")
-        return rows
+            if rows:
+                if progress is not None:
+                    progress(f"Astroquery VizieR VSX fallback returned {len(rows)} object(s).")
+                return rows
+            if progress is not None:
+                next_step = (
+                    "retrying because VizieR can represent a service error as an empty result"
+                    if attempt < VSX_QUERY_ATTEMPTS
+                    else "no rows remained after the final fallback request"
+                )
+                progress(
+                    "WARNING: Astroquery VizieR VSX fallback returned no table rows "
+                    f"on request {attempt}/{VSX_QUERY_ATTEMPTS}; {next_step}."
+                )
+        except Exception as exc:
+            astroquery_exc = exc
+            if progress is not None:
+                progress(
+                    "WARNING: Astroquery VizieR VSX fallback request "
+                    f"{attempt}/{VSX_QUERY_ATTEMPTS} failed: {exc}"
+                )
+        if attempt < VSX_QUERY_ATTEMPTS:
+            time.sleep(VSX_QUERY_RETRY_DELAY_SECONDS)
+
+    if astroquery_exc is not None:
+        raise RuntimeError(
+            f"VizieR VSX TAP failed: {tap_exc}; "
+            f"astroquery fallback failed: {astroquery_exc}"
+        ) from astroquery_exc
+    return []
 
 
 def query_vizier_vsx_oid(obj: CatalogObject) -> str:
@@ -12291,11 +12587,35 @@ class PlateSolveWorker(QThread):
         )
         start_time = time.monotonic()
         try:
+            command = external_siril_command(siril_binary, script_path)
+            uses_app_run = Path(command[0]).name == "AppRun"
+            child_environment = (
+                os.environ.copy()
+                if uses_app_run
+                else external_siril_environment(siril_binary)
+            )
+            if sys.platform.startswith("linux"):
+                self.emit_log(
+                    f"Standalone Siril command: {' '.join(command)}"
+                )
+                if uses_app_run:
+                    self.emit_log(
+                        "Standalone Siril launch mode: AppImage AppRun owns "
+                        "the runtime loader and library paths."
+                    )
+                else:
+                    self.emit_log(
+                        "Standalone Siril fallback environment: "
+                        f"APPDIR={child_environment.get('APPDIR', '<unset>')}; "
+                        "LD_LIBRARY_PATH="
+                        f"{child_environment.get('LD_LIBRARY_PATH', '<unset>')}"
+                    )
             with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
                 result = subprocess.run(
-                    [str(siril_binary), "-s", str(script_path)],
+                    command,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
+                    env=child_environment,
                     check=False,
                 )
         except Exception as exc:
@@ -12501,6 +12821,7 @@ class LightCurveWindow(QWidget):
         self.automatic_stack_worker: QThread | None = None
         self.cfa_stack_signal_connected = False
         self.automatic_module: object | None = None
+        self.profiling_module: object | None = None
         self.lightcurve_results_module: object | None = None
         self.result_browser_dialog: QDialog | None = None
         self.bav_result_browser_dialog: QDialog | None = None
@@ -12538,20 +12859,30 @@ class LightCurveWindow(QWidget):
         input_layout = QVBoxLayout(input_tab)
 
         cfa_stack_script = Path(__file__).with_name("SeePhot_CFA.py")
-        if cfa_stack_script.exists():
+        automatic_script = Path(__file__).with_name("sp_mod_auto.py")
+        if cfa_stack_script.exists() or automatic_script.exists():
             cfa_group = QGroupBox("1. Prepare Seestar FITS")
-            cfa_layout = QVBoxLayout(cfa_group)
-            self.cfa_stack_button = QPushButton("CFA Channels / Stack")
-            self.cfa_stack_button.clicked.connect(
-                lambda: self.run_busy_action(
-                    "STACK_WINDOW_OPENING",
-                    "Opening CFA Channels / Stack window.",
-                    self.open_cfa_stack_window,
+            cfa_layout = QHBoxLayout(cfa_group)
+            if cfa_stack_script.exists():
+                self.cfa_stack_button = QPushButton("CFA Channels / Stack")
+                self.cfa_stack_button.clicked.connect(
+                    lambda: self.run_busy_action(
+                        "STACK_WINDOW_OPENING",
+                        "Opening CFA Channels / Stack window.",
+                        self.open_cfa_stack_window,
+                    )
                 )
-            )
-            cfa_layout.addWidget(self.cfa_stack_button, alignment=Qt.AlignmentFlag.AlignLeft)
+                cfa_layout.addWidget(self.cfa_stack_button)
+                self.append_log(f"CFA stack script available: {cfa_stack_script.name}.")
+            if automatic_script.exists():
+                self.automatic_button = QPushButton("Batch Mode")
+                self.automatic_button.clicked.connect(self.open_automatic_runner)
+                cfa_layout.addWidget(self.automatic_button)
+                self.append_log(
+                    f"Optional CFA/Stack Batch module available: {automatic_script.name}."
+                )
+            cfa_layout.addStretch(1)
             input_layout.addWidget(cfa_group)
-            self.append_log(f"CFA stack script available: {cfa_stack_script.name}.")
 
         source_group = QGroupBox("2. Detect Variables")
         self.source_group = source_group
@@ -12591,16 +12922,16 @@ class LightCurveWindow(QWidget):
         source_layout.addRow(detect_layout)
         input_layout.addWidget(source_group)
 
-        automatic_script = Path(__file__).with_name("sp_mod_auto.py")
-        if automatic_script.exists():
-            automatic_group = QGroupBox("CFA/Stack Batch")
-            automatic_layout = QHBoxLayout(automatic_group)
-            self.automatic_button = QPushButton("Configure...")
-            self.automatic_button.clicked.connect(self.open_automatic_runner)
-            automatic_layout.addWidget(self.automatic_button)
-            automatic_layout.addStretch(1)
-            input_layout.insertWidget(0, automatic_group)
-            self.append_log(f"Optional CFA/Stack Batch module available: {automatic_script.name}.")
+        profiling_script = Path(__file__).with_name("sp_mod_profiling.py")
+        if profiling_script.exists():
+            profiling_group = QGroupBox("Stack Profiling")
+            profiling_layout = QHBoxLayout(profiling_group)
+            self.profiling_button = QPushButton("Analyze")
+            self.profiling_button.clicked.connect(self.open_profiling_runner)
+            profiling_layout.addWidget(self.profiling_button)
+            profiling_layout.addStretch(1)
+            input_layout.insertWidget(0, profiling_group)
+            self.append_log(f"Optional Stack Profiling module available: {profiling_script.name}.")
 
         input_layout.addStretch(1)
 
@@ -12820,6 +13151,22 @@ class LightCurveWindow(QWidget):
             )
         )
         fit_lightcurve_controls.addWidget(self.fit_extremum_button)
+
+        self.trim_lightcurve_button = QPushButton("Trim to Selection")
+        self.trim_lightcurve_button.setEnabled(False)
+        self.trim_lightcurve_button.setToolTip(
+            "Keep only CSV rows inside the selected JD range. This permanently updates "
+            "the current light curve used by plots, fits, AAVSO/BAV exports, and saved results."
+        )
+        self.trim_lightcurve_button.clicked.connect(
+            lambda: self.run_busy_action(
+                "TRIM_RUNNING",
+                "Trimming the selected light-curve range.",
+                self.trim_lightcurve_to_selection,
+                [self.trim_lightcurve_button],
+            )
+        )
+        fit_lightcurve_controls.addWidget(self.trim_lightcurve_button)
 
         self.clear_extremum_button = QPushButton("Clear Fit")
         self.clear_extremum_button.setEnabled(False)
@@ -13167,6 +13514,7 @@ class LightCurveWindow(QWidget):
             "automatic_stack_finished": self.automatic_stack_finished,
             "automatic_prepare_finished": self.automatic_prepare_finished,
             "automatic_lightcurve_finished": self.automatic_lightcurve_finished,
+            "open_cfa_stack_for_source": self.open_cfa_stack_for_profiling,
         }
 
     def busy_action_buttons(self) -> list[QPushButton]:
@@ -13175,6 +13523,7 @@ class LightCurveWindow(QWidget):
         names = (
             "cfa_stack_button",
             "automatic_button",
+            "profiling_button",
             "prepare_button",
             "run_light_curve_button",
             "export_aavso_button",
@@ -13239,9 +13588,12 @@ class LightCurveWindow(QWidget):
         self.busy_state = state
         self.busy_message = message
         self._busy_locked_buttons = {}
+        # Snapshot and lock child action buttons before disabling their parent
+        # context groups. Otherwise QWidget.isEnabled() already reports False
+        # for the child and the busy-state restore leaves it disabled.
         lock_widgets: list[QWidget] = [
-            *self.busy_context_widgets(),
             *self.busy_action_buttons(),
+            *self.busy_context_widgets(),
         ]
         if buttons is not None:
             lock_widgets.extend(button for button in buttons if isinstance(button, QPushButton))
@@ -13322,13 +13674,13 @@ class LightCurveWindow(QWidget):
         self.cfa_stack_module = module
         return module
 
-    def open_cfa_stack_window(self) -> None:
+    def open_cfa_stack_window(self, initial_source_dir: str | Path | None = None) -> bool:
         """Open SeePhot_CFA.py as a separate preprocessing window when available."""
 
         script_path = Path(__file__).with_name("SeePhot_CFA.py")
         if not script_path.exists():
             QMessageBox.warning(self, "CFA Channels / Stack", f"Script not found:\n{script_path}")
-            return
+            return False
 
         try:
             module = self.load_cfa_stack_module()
@@ -13345,6 +13697,13 @@ class LightCurveWindow(QWidget):
                 )
                 self.cfa_stack_signal_connected = False
 
+            if initial_source_dir is not None:
+                set_source_directory = getattr(self.cfa_stack_window, "set_source_directory", None)
+                if not callable(set_source_directory) or not set_source_directory(initial_source_dir):
+                    raise FileNotFoundError(
+                        f"Profiling source folder not found: {Path(initial_source_dir).expanduser()}"
+                    )
+
             result_signal = getattr(self.cfa_stack_window, "stack_result_ready", None)
             if result_signal is not None and not self.cfa_stack_signal_connected:
                 result_signal.connect(self.on_cfa_stack_result_ready)
@@ -13354,10 +13713,58 @@ class LightCurveWindow(QWidget):
             self.cfa_stack_window.raise_()
             self.cfa_stack_window.activateWindow()
             self.append_log(f"Opened CFA Channels / Stack window from {script_path.name}.")
+            return True
         except Exception as exc:
             message = f"Could not open CFA Channels / Stack.\n\n{exc}"
             self.append_log(f"WARNING: {message.replace(chr(10), ' ')}")
             QMessageBox.warning(self, "CFA Channels / Stack", message)
+            return False
+
+    def open_cfa_stack_for_profiling(self, source_dir: str) -> bool:
+        """Open CFA/Stack with a source explicitly confirmed by Stack Profiling."""
+
+        if self.is_busy():
+            active = self.busy_message or self.busy_state
+            QMessageBox.information(
+                self,
+                "Operation Running",
+                f"Another operation is still running:\n{active}",
+            )
+            return False
+        return self.open_cfa_stack_window(source_dir)
+
+    def open_profiling_runner(self) -> None:
+        """Open the optional read-only Stack Profiling dialog."""
+
+        script_path = Path(__file__).with_name("sp_mod_profiling.py")
+        if not script_path.exists():
+            QMessageBox.warning(self, "Stack Profiling", f"Script not found:\n{script_path}")
+            return
+
+        try:
+            if self.profiling_module is None:
+                spec = importlib.util.spec_from_file_location("sp_mod_profiling", script_path)
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("could not create import spec")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                try:
+                    spec.loader.exec_module(module)
+                except Exception:
+                    sys.modules.pop(spec.name, None)
+                    raise
+                self.profiling_module = module
+
+            open_dialog = getattr(self.profiling_module, "open_profiling_dialog", None)
+            if not callable(open_dialog):
+                raise RuntimeError(
+                    "sp_mod_profiling.py has no open_profiling_dialog(context, parent)"
+                )
+            open_dialog(self.qc_plugin_context(), self)
+        except Exception as exc:
+            message = f"Could not open Stack Profiling.\n\n{exc}"
+            self.append_log(f"WARNING: {message.replace(chr(10), ' ')}")
+            QMessageBox.warning(self, "Stack Profiling", message)
 
     def open_automatic_runner(self) -> None:
         """Open the optional CFA/Stack Batch dialog from sp_mod_auto.py."""
@@ -13869,6 +14276,13 @@ class LightCurveWindow(QWidget):
             self.lightcurve_toolbar = toolbar
             layout.addWidget(toolbar)
             layout.addWidget(self.lightcurve_canvas, stretch=1)
+            trim_hint = QLabel(
+                "Before performing a Min/Max fit or export, you may select a suitable "
+                "range of the light curve and use \"Trim to Selection\" to make it "
+                "the new result range."
+            )
+            trim_hint.setWordWrap(True)
+            layout.addWidget(trim_hint)
             self.plot_extremum_fit_label = QLabel(self.extremum_fit_label.text())
             layout.addWidget(self.plot_extremum_fit_label)
             self.plot_dialog = dialog
@@ -14317,6 +14731,10 @@ class LightCurveWindow(QWidget):
         self.set_selected_target_labels()
         self.vsx_tree.clear()
         self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
+        self.prepare_button.setText("Run")
+        self.prepare_description_label.setText(
+            "Register frames · plate solve · load reference · query VSX"
+        )
         self.prepare_button.setEnabled(False)
         self.select_target_button.setEnabled(False)
         self.vsx_selected_button.setEnabled(False)
@@ -14350,6 +14768,7 @@ class LightCurveWindow(QWidget):
         self.lightcurve_span_selector = None
         self.lightcurve_fit_artists = []
         self.fit_extremum_button.setEnabled(False)
+        self.trim_lightcurve_button.setEnabled(False)
         self.clear_extremum_button.setEnabled(False)
         self.lightcurve_canvas.draw()
         self.update_overall_status()
@@ -14624,6 +15043,10 @@ class LightCurveWindow(QWidget):
         self.vsx_tree.clear()
         self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
         self.comp_tree.clear()
+        self.prepare_button.setText("Run")
+        self.prepare_description_label.setText(
+            "Register frames · plate solve · load reference · query VSX"
+        )
         self.prepare_button.setEnabled(True)
         self.select_target_button.setEnabled(False)
         self.vsx_selected_button.setEnabled(False)
@@ -14686,6 +15109,14 @@ class LightCurveWindow(QWidget):
             if self.current_scan is None or self.current_scan.first_fits is None:
                 return
 
+        if (
+            self.prepare_completed
+            and self.reference_frame is not None
+            and self.reference_frame.path.exists()
+        ):
+            self.retry_vsx_query()
+            return
+
         try:
             hints = read_plate_solve_hints(self.current_scan.first_fits)
         except Exception as exc:
@@ -14734,6 +15165,34 @@ class LightCurveWindow(QWidget):
         self.start_plate_solve(confirm=False, hints=hints)
         if self.solve_worker is None:
             self.finish_busy_action("FIELD_SETUP_RUNNING")
+
+    def retry_vsx_query(self) -> None:
+        """Refresh VSX while retaining the already registered and solved sequence."""
+
+        if not self.begin_busy_action(
+            "FIELD_SETUP_RUNNING",
+            "Retrying VSX query with the prepared reference frame.",
+        ):
+            return
+        self.set_varstars_status("detecting")
+        self.append_log(
+            "Reusing registered and plate-solved work files; registration, alignment, "
+            "and plate solving are not repeated."
+        )
+        success = False
+        message = "VSX query failed."
+        try:
+            if self.load_reference_frame() and self.show_vsx_overlay():
+                self.set_varstars_status("ready")
+                success = True
+                message = "VSX objects loaded from the prepared reference frame."
+            else:
+                self.set_varstars_status("failed")
+                message = "VSX query failed; prepared work files were retained."
+                self.append_log(message)
+        finally:
+            self.finish_busy_action("FIELD_SETUP_RUNNING")
+        self.automatic_prepare_finished.emit(success, message)
 
     def start_plate_solve(
         self,
@@ -14829,15 +15288,18 @@ class LightCurveWindow(QWidget):
                 "WARNING: Prepare finished without a usable WCS reference frame."
             )
         if success and self.prepare_completed:
+            self.prepare_button.setText("Query VSX again")
+            self.prepare_description_label.setText(
+                "Prepared frames retained · refreshes only the VSX catalog"
+            )
             self.append_log("Loading variable table after field setup.")
             if self.load_reference_frame() and self.show_vsx_overlay():
                 self.set_varstars_status("ready")
             else:
                 self.set_varstars_status("failed")
-                QMessageBox.warning(
-                    self,
-                    "Detect Variables",
-                    "Variables could not be loaded.\n\nRun Detect Variables again.",
+                self.append_log(
+                    "VSX loading failed; prepared work files retained for a "
+                    "catalog-only retry."
                 )
         elif success:
             self.set_varstars_status("failed")
@@ -15039,12 +15501,26 @@ class LightCurveWindow(QWidget):
             )
 
         if not objects:
-            message = "No VSX objects fall inside the usable photometry area of the reference image."
+            if raw_count == 0:
+                message = (
+                    "VizieR VSX returned no catalog rows after retrying; this may be a "
+                    "temporary catalog-service problem."
+                )
+                dialog_message = (
+                    "VizieR returned no VSX catalog rows.\n\n"
+                    "The prepared frames were retained; click Query VSX again to retry."
+                )
+            else:
+                message = (
+                    "No VSX objects fall inside the usable photometry area of the "
+                    "reference image."
+                )
+                dialog_message = "No variables found in the usable image area."
             self.append_log(f"WARNING: {message}")
             QMessageBox.warning(
                 self,
                 "Detect Variables",
-                "No variables found in the usable image area.",
+                dialog_message,
             )
             return False
 
@@ -15067,7 +15543,7 @@ class LightCurveWindow(QWidget):
         self.append_log(f"VSX table populated: {self.vsx_tree.topLevelItemCount()} row(s).")
         self.tabs.setCurrentWidget(self.varstar_tab)
         self.append_log(
-            f"VSX objects loaded: {len(objects)} from VizieR VSX TAP "
+            f"VSX objects loaded: {len(objects)} from VizieR VSX "
             f"(limit magnitude {DEFAULT_VSX_LIMIT_MAG:g}; "
             f"{outside_count} outside the usable reference area filtered out)"
         )
@@ -15769,7 +16245,16 @@ class LightCurveWindow(QWidget):
         """Set the current target from a catalog object without relying on tree selection."""
 
         if self.reference_frame is None:
-            QMessageBox.warning(self, "Select Target", "Run Detect Variables first.")
+            if self.photometry_mode == MODE_SINGLE_MEASUREMENT:
+                self.show_single_measurement_warning(
+                    "Run Detect Variables first.",
+                    title="Select Target",
+                )
+            else:
+                self.show_lightcurve_failure_dialog(
+                    "Run Detect Variables first.",
+                    title="Select Target",
+                )
             return False
 
         self.selected_target = SelectedTarget(obj, self.reference_frame)
@@ -15804,9 +16289,7 @@ class LightCurveWindow(QWidget):
                     "Single target precheck failed: target could not be measured."
                 )
                 self.append_log("ERROR: Single target precheck failed before measurement.")
-                QMessageBox.warning(
-                    self,
-                    "Single Measurement",
+                self.show_single_measurement_warning(
                     "Target could not be measured.\n\nRun Measurement remains disabled.",
                 )
                 return False
@@ -15832,9 +16315,7 @@ class LightCurveWindow(QWidget):
                     "ERROR: Single target is not measurable; measurement disabled: "
                     f"{measurement.quality_flag} ({measurement.note})."
                 )
-                QMessageBox.warning(
-                    self,
-                    "Single Measurement",
+                self.show_single_measurement_warning(
                     "Target is not measurable.\n\n"
                     f"{measurement.quality_flag} ({measurement.note})\n\n"
                     "Run Measurement remains disabled.",
@@ -16464,8 +16945,11 @@ class LightCurveWindow(QWidget):
 
         if self.selected_target is None:
             raise RuntimeError("No VSX target selected for result metadata.")
+        if self.reference_frame is None:
+            raise RuntimeError("No solved reference frame available for result metadata.")
 
         optional_settings = load_optional_observer_result_settings()
+        field_metadata = reference_frame_field_metadata(self.reference_frame)
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", FITSFixedWarning)
@@ -16515,6 +16999,7 @@ class LightCurveWindow(QWidget):
         return {
             "RESULT_METADATA_VERSION": CURRENT_RESULT_METADATA_VERSION,
             **result_target_metadata(target),
+            **field_metadata,
             "OBSERVER_BAV": optional_settings["OBSERVER_BAV"],
             "OBSERVER_NAME": optional_settings["OBSERVER_NAME"],
             "OBSERVER_AAVSO": optional_settings["OBSERVER_AAVSO"],
@@ -16803,6 +17288,15 @@ class LightCurveWindow(QWidget):
             f"pixel scale={instrument_metadata['PIXEL_SCALE_ARCSEC_PX']} arcsec/px "
             f"({instrument_sources['PIXEL_SCALE_ARCSEC_PX']})."
         )
+        try:
+            field_metadata = reference_frame_field_metadata(self.reference_frame)
+        except Exception as exc:
+            self.set_result_status("failed")
+            self.append_log(f"ERROR: Reference-field metadata could not be created: {exc}")
+            self.show_single_measurement_warning(
+                f"Could not create reference-field metadata.\n\n{exc}"
+            )
+            return
         metadata = {
             "RESULT_METADATA_VERSION": CURRENT_RESULT_METADATA_VERSION,
             "SINGLE_MEASUREMENT_VERSION": 1,
@@ -16810,6 +17304,7 @@ class LightCurveWindow(QWidget):
             "MODE": MODE_SINGLE_MEASUREMENT,
             "SINGLE_FIELD_ZP_METHOD": SINGLE_FIELD_ZP_METHOD_ID,
             **result_target_metadata(self.selected_target.catalog_object),
+            **field_metadata,
             "SOURCE_FILE": str(self.current_source_fits_file() or ""),
             "WORK_FILE": str(frame_path),
             "PHOTOMETRY_METHOD": (
@@ -18659,9 +19154,11 @@ class LightCurveWindow(QWidget):
                 interactive=True,
             )
             self.fit_extremum_button.setEnabled(True)
+            self.trim_lightcurve_button.setEnabled(True)
         else:
             self.lightcurve_span_selector = None
             self.fit_extremum_button.setEnabled(False)
+            self.trim_lightcurve_button.setEnabled(False)
         self.clear_extremum_button.setEnabled(False)
         self.lightcurve_canvas.draw()
 
@@ -18688,7 +19185,114 @@ class LightCurveWindow(QWidget):
         self.lightcurve_selected_range = (min(xmin, xmax), max(xmin, xmax))
         self.lightcurve_status_label.setText(
             f"Selected JD range: {self.lightcurve_selected_range[0]:.8f} - "
-            f"{self.lightcurve_selected_range[1]:.8f}"
+            f"{self.lightcurve_selected_range[1]:.8f}. "
+            "Choose Fit Min/Max or Trim to Selection."
+        )
+
+    def trim_lightcurve_to_selection(self) -> None:
+        """Permanently make the selected JD span the current result CSV."""
+
+        current = self.current_export_lightcurve()
+        if current is None:
+            QMessageBox.warning(
+                self,
+                "Trim Light Curve",
+                "Create or open a Light Curve result first.",
+            )
+            return
+        if self.lightcurve_selected_range is None:
+            QMessageBox.warning(
+                self,
+                "Trim Light Curve",
+                "Drag across the plot to select the complete range to keep.",
+            )
+            return
+
+        result_csv, target_name = current
+        try:
+            plan = build_lightcurve_trim_plan(
+                result_csv,
+                *self.lightcurve_selected_range,
+            )
+            export_files = local_derived_export_files(result_csv, target_name)
+        except Exception as exc:
+            self.append_log(f"WARNING: Light Curve trim could not be prepared: {exc}")
+            QMessageBox.warning(self, "Trim Light Curve", str(exc))
+            return
+
+        removed_count = plan.original_row_count - len(plan.rows)
+        confirmation = QMessageBox(self)
+        confirmation.setWindowTitle("Trim Light Curve")
+        confirmation.setIcon(QMessageBox.Icon.Warning)
+        confirmation.setText("Make the selected range the complete light curve?")
+        details = (
+            f"Keep {len(plan.rows)} of {plan.original_row_count} CSV rows and remove "
+            f"{removed_count}.\n\n"
+            "This permanently rewrites the current result CSV and clears the current "
+            "Min/Max fit. The instrumental photometry CSV is not changed."
+        )
+        if export_files:
+            details += (
+                f"\n\n{len(export_files)} existing local AAVSO/BAV export file(s) "
+                "will be deleted and must be recreated."
+            )
+            confirmation.setDetailedText(
+                "Local export files to delete:\n"
+                + "\n".join(str(path) for path in export_files)
+            )
+        confirmation.setInformativeText(details)
+        trim_button = confirmation.addButton("Trim", QMessageBox.ButtonRole.AcceptRole)
+        confirmation.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        confirmation.setDefaultButton(trim_button)
+        confirmation.exec()
+        if confirmation.clickedButton() is not trim_button:
+            self.append_log("Light Curve trim aborted by user.")
+            return
+
+        deleted_exports: list[Path] = []
+        try:
+            for path in export_files:
+                path.unlink()
+                deleted_exports.append(path)
+            write_lightcurve_trim_plan(plan)
+        except Exception as exc:
+            self.append_log(f"ERROR: Light Curve trim failed: {type(exc).__name__}: {exc}")
+            QMessageBox.critical(
+                self,
+                "Trim Light Curve",
+                f"The Light Curve could not be trimmed.\n\n{exc}",
+            )
+            return
+
+        self.clear_extremum_fit(redraw=False, reset_status=True)
+        self.reset_export_status()
+        self.export_status_label.setText(
+            f"Current export source was trimmed; recreate AAVSO/BAV exports: {result_csv}"
+        )
+        output_png = result_csv.with_suffix(".png")
+        self.plot_light_curve_csv(
+            result_csv,
+            output_png,
+            target_name,
+            self.loaded_lightcurve_source_label,
+        )
+        message = (
+            f"Light Curve trimmed: kept {len(plan.rows)} of {plan.original_row_count} rows "
+            f"in JD {plan.range_min_jd:.8f}-{plan.range_max_jd:.8f}; "
+            f"deleted {len(deleted_exports)} local export file(s)."
+        )
+        self.lightcurve_status_label.setText(message)
+        self.append_log(message)
+        self.refresh_optional_tab_views()
+        try:
+            self.write_run_log(result_csv.parent)
+        except Exception as exc:
+            self.append_log(f"WARNING: Run log update after Light Curve trim failed: {exc}")
+        QMessageBox.information(
+            self,
+            "Trim Light Curve",
+            f"Light Curve trimmed.\n\nKept {len(plan.rows)} of "
+            f"{plan.original_row_count} rows.",
         )
 
     def clear_extremum_fit(
@@ -19051,7 +19655,16 @@ class LightCurveWindow(QWidget):
                 <li><b>VSX</b> opens the current target's catalog page.</li>
                 <li><b>Plot Light Curve</b> opens the graph.</li>
                 <li><b>Running mean</b> adds an overlay without changing the CSV.</li>
+                <li>To remove noisy data at the beginning or end, drag the complete
+                range to keep and click <b>Trim to Selection</b>. This permanently
+                rewrites the current result CSV.</li>
             </ul>
+
+            <div class="note">
+                Trimming clears the current Min/Max fit and deletes existing local
+                AAVSO/BAV export files after confirmation. Recreate those exports from
+                the trimmed result. The instrumental photometry CSV is unchanged.
+            </div>
 
             <p><b>Fit a minimum or maximum</b></p>
             <ol>
