@@ -5,6 +5,7 @@ from __future__ import annotations
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import csv
+import math
 import os
 import re
 import time
@@ -18,6 +19,41 @@ RESULT_SCAN_ATTEMPTS = 2
 RESULT_SCAN_RETRY_DELAY_SECONDS = 0.05
 RESULT_KIND_LIGHTCURVE = "lightcurve"
 RESULT_KIND_SINGLE = "single_measurement"
+RESULT_VARIANT_RAW = "raw"
+RESULT_VARIANT_BINNED = "binned"
+RESULT_VARIANT_SINGLE = "single"
+DEFAULT_RESULT_TELESCOPE = "Seestar S50"
+RESULT_TELESCOPE_SPECS: dict[str, dict[str, object]] = {
+    "Seestar S30": {
+        "sensor": "Sony IMX662",
+        "pixel_scale_arcsec_px": 3.99,
+    },
+    "Seestar S30pro": {
+        "sensor": "Sony IMX585",
+        "pixel_scale_arcsec_px": 3.76,
+    },
+    "Seestar S50": {
+        "sensor": "Sony IMX462",
+        "pixel_scale_arcsec_px": 2.39,
+    },
+    "Seestar S50Pro": {
+        "sensor": "OmniVision OS08B10",
+        "pixel_scale_arcsec_px": 2.30,
+    },
+}
+RESULT_TELESCOPE_CHOICES = tuple(RESULT_TELESCOPE_SPECS)
+BINNED_RESULT_NAME_RE = re.compile(
+    r"^(?P<target>.+)_result_curve_bin(?P<value>[1-9][0-9]*)(?P<unit>img|sec)\.csv$",
+    re.IGNORECASE,
+)
+RAW_RESULT_NAME_RE = re.compile(
+    r"^(?P<target>.+)_result_curve\.csv$",
+    re.IGNORECASE,
+)
+SINGLE_RESULT_NAME_RE = re.compile(
+    r"^(?P<target>.+)_single_field_zp_measurement\.csv$",
+    re.IGNORECASE,
+)
 RESULT_SCAN_PRUNED_DIRECTORY_NAMES = frozenset(
     {"aavso", "bav", "diagnostics", "siril_lightcurve_tmp"}
 )
@@ -42,6 +78,21 @@ class LightcurveResultCandidate:
     calibrated_mag_error: str = ""
     field_reference_used: str = ""
     check_delta_mag: str = ""
+    has_calibrated_check: bool = False
+    result_variant: str = RESULT_VARIANT_RAW
+    result_variant_label: str = "Raw"
+
+
+@dataclass(frozen=True)
+class ResultFilename:
+    """Canonical interpretation of one supported SeePhot result filename."""
+
+    result_kind: str
+    target_stem: str
+    variant: str
+    variant_label: str
+    binning_mode: str = ""
+    binning_value: int | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +107,7 @@ class LightcurveResultScan:
     folders_scanned: int
     result_csv_found: int
     issues: tuple[ResultScanIssue, ...]
+    invalid_results: tuple[ResultScanIssue, ...]
     archive_directories_skipped: int
     symlink_directories_skipped: int
     cancelled: bool
@@ -80,17 +132,62 @@ def _retry_result_scan_io(
     raise last_error
 
 
+def parse_result_filename(path_or_name: Path | str) -> ResultFilename | None:
+    """Return the single central filename contract for SeePhot result CSVs."""
+
+    name = Path(path_or_name).name
+    if name.casefold() == "result_curve.csv":
+        return ResultFilename(
+            RESULT_KIND_LIGHTCURVE,
+            "result",
+            RESULT_VARIANT_RAW,
+            "Raw",
+        )
+    match = BINNED_RESULT_NAME_RE.fullmatch(name)
+    if match is not None:
+        value = int(match.group("value"))
+        unit = match.group("unit").casefold()
+        mode = "count" if unit == "img" else "seconds"
+        label = f"bin{value}{unit}"
+        return ResultFilename(
+            RESULT_KIND_LIGHTCURVE,
+            match.group("target"),
+            RESULT_VARIANT_BINNED,
+            label,
+            mode,
+            value,
+        )
+    match = RAW_RESULT_NAME_RE.fullmatch(name)
+    if match is not None:
+        return ResultFilename(
+            RESULT_KIND_LIGHTCURVE,
+            match.group("target"),
+            RESULT_VARIANT_RAW,
+            "Raw",
+        )
+    match = SINGLE_RESULT_NAME_RE.fullmatch(name)
+    if match is not None:
+        return ResultFilename(
+            RESULT_KIND_SINGLE,
+            match.group("target"),
+            RESULT_VARIANT_SINGLE,
+            "Single",
+        )
+    return None
+
+
 def _is_result_curve_filename(name: str) -> bool:
     """Return whether a filename is a supported series-result CSV name."""
 
-    folded = name.casefold()
-    return folded == "result_curve.csv" or folded.endswith("_result_curve.csv")
+    parsed = parse_result_filename(name)
+    return parsed is not None and parsed.result_kind == RESULT_KIND_LIGHTCURVE
 
 
 def _is_single_measurement_filename(name: str) -> bool:
     """Return whether a filename is a supported Single Measurement CSV name."""
 
-    return name.casefold().endswith("_single_field_zp_measurement.csv")
+    parsed = parse_result_filename(name)
+    return parsed is not None and parsed.result_kind == RESULT_KIND_SINGLE
 
 
 def _is_photometry_result_filename(name: str) -> bool:
@@ -176,12 +273,82 @@ def report_date_for_result(result_csv: Path, metadata: dict[str, str]) -> str:
 def result_target_stem(result_csv: Path) -> str:
     """Return the target file stem for a supported photometry result CSV."""
 
-    if result_csv.name.casefold() == "result_curve.csv":
-        return "result"
-    for suffix in ("_result_curve.csv", "_single_field_zp_measurement.csv"):
-        if result_csv.name.casefold().endswith(suffix):
-            return result_csv.name[: -len(suffix)]
+    parsed = parse_result_filename(result_csv)
+    if parsed is not None:
+        return parsed.target_stem
     raise RuntimeError(f"Unexpected result CSV filename: {result_csv.name}")
+
+
+def result_variant_label(result_csv: Path) -> str:
+    """Return a short user-facing label for the result variant."""
+
+    parsed = parse_result_filename(result_csv)
+    if parsed is None:
+        raise RuntimeError(f"Unexpected result CSV filename: {result_csv.name}")
+    return parsed.variant_label
+
+
+def result_output_stem(result_csv: Path) -> str:
+    """Return the filename stem used by result-specific derivative files."""
+
+    parsed = parse_result_filename(result_csv)
+    if parsed is None:
+        raise RuntimeError(f"Unexpected result CSV filename: {result_csv.name}")
+    if parsed.result_kind == RESULT_KIND_SINGLE:
+        return result_csv.stem
+    return result_csv.stem.replace("_result_curve", "", 1)
+
+
+def result_variant_token(result_csv: Path) -> str:
+    """Return the stable filesystem token for a derived result variant."""
+
+    parsed = parse_result_filename(result_csv)
+    if parsed is None:
+        raise RuntimeError(f"Unexpected result CSV filename: {result_csv.name}")
+    if parsed.variant != RESULT_VARIANT_BINNED:
+        return ""
+    unit = "img" if parsed.binning_mode == "count" else "sec"
+    return f"bin{parsed.binning_value}{unit}"
+
+
+def bav_output_directory(result_csv: Path) -> Path:
+    """Return an isolated BAV directory for the selected result variant."""
+
+    base = result_csv.parent / "BAV"
+    token = result_variant_token(result_csv)
+    return base / token if token else base
+
+
+def raw_lightcurve_result_path(output_dir: Path, target_stem: str) -> Path:
+    """Return the canonical raw light-curve result path."""
+
+    return Path(output_dir) / f"{target_stem}_result_curve.csv"
+
+
+def single_measurement_result_path(output_dir: Path, target_stem: str) -> Path:
+    """Return the canonical Single Measurement result path."""
+
+    return Path(output_dir) / f"{target_stem}_single_field_zp_measurement.csv"
+
+
+def binned_result_path(source_result_csv: Path, mode: str, value: int) -> Path:
+    """Return the canonical binned-result path for one raw light curve."""
+
+    parsed = parse_result_filename(source_result_csv)
+    if (
+        parsed is None
+        or parsed.result_kind != RESULT_KIND_LIGHTCURVE
+        or parsed.variant != RESULT_VARIANT_RAW
+    ):
+        raise ValueError("Binning output requires a canonical raw light-curve filename.")
+    if mode not in {"count", "seconds"}:
+        raise ValueError("Binning mode must be 'count' or 'seconds'.")
+    if value < 2:
+        raise ValueError("A bin needs at least two input measurements.")
+    unit = "img" if mode == "count" else "sec"
+    return source_result_csv.with_name(
+        f"{parsed.target_stem}_result_curve_bin{value}{unit}.csv"
+    )
 
 
 def result_kind_for_csv(
@@ -216,8 +383,36 @@ def aavso_report_path(result_csv: Path) -> Path:
     return (
         result_csv.parent
         / "AAVSO"
-        / (result_csv.stem.replace("_result_curve", "") + "_aavso_extended.txt")
+        / f"{result_output_stem(result_csv)}_aavso_extended.txt"
     )
+
+
+def instrumental_csv_for_result_csv(result_csv: Path) -> Path:
+    """Return the instrumental measurement source for a supported result."""
+
+    parsed = parse_result_filename(result_csv)
+    if parsed is None:
+        raise RuntimeError(f"Unexpected result CSV filename: {result_csv.name}")
+    diagnostics_dir = result_csv.parent / "diagnostics"
+    if parsed.result_kind == RESULT_KIND_SINGLE:
+        filename = f"{parsed.target_stem}_single_instrumental_photometry.csv"
+    else:
+        filename = f"{parsed.target_stem}_instrumental_photometry.csv"
+    new_path = diagnostics_dir / filename
+    old_path = result_csv.parent / filename
+    return new_path if new_path.exists() or not old_path.exists() else old_path
+
+
+def single_references_csv_for_result_csv(result_csv: Path) -> Path:
+    """Return the Field-ZP reference CSV associated with a Single result."""
+
+    parsed = parse_result_filename(result_csv)
+    if parsed is None or parsed.result_kind != RESULT_KIND_SINGLE:
+        raise ValueError("Field-ZP references require a Single Measurement result.")
+    filename = f"{parsed.target_stem}_single_field_zp_references.csv"
+    new_path = result_csv.parent / "diagnostics" / filename
+    old_path = result_csv.parent / filename
+    return new_path if new_path.exists() or not old_path.exists() else old_path
 
 
 def normalized_target_match_text(text: str) -> str:
@@ -304,7 +499,7 @@ def bav_report_files(
     """Return BAV export files for the current result target, if any."""
 
     if available_files is None:
-        bav_dir = result_csv.parent / "BAV"
+        bav_dir = bav_output_directory(result_csv)
         if not bav_dir.is_dir():
             return []
         available_files = tuple(path for path in bav_dir.iterdir() if path.is_file())
@@ -331,6 +526,33 @@ def count_result_rows(result_csv: Path) -> int:
     return 0
 
 
+def result_csv_has_calibrated_check_delta(result_csv: Path) -> bool:
+    """Return whether a valid row can be plotted for the independent check star."""
+
+    if not result_csv.exists():
+        return False
+    with result_csv.open(newline="") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            fieldnames = [item.strip() for item in line.rstrip("\n\r").split(",")]
+            if not any(fieldnames):
+                return False
+            for row in csv.DictReader(handle, fieldnames=fieldnames):
+                if row.get("valid", "1").strip().casefold() in {"0", "false", "no"}:
+                    continue
+                if row.get("quality_status", "").strip().upper() == "INVALID":
+                    continue
+                try:
+                    value = float(row.get("check_delta_mag", ""))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    return True
+            return False
+    return False
+
+
 def lightcurve_result_candidate_from_csv(
     result_csv: Path,
     *,
@@ -347,6 +569,9 @@ def lightcurve_result_candidate_from_csv(
     result_kind = result_kind_for_csv(result_csv, metadata, first_row)
     if result_kind is None:
         return None
+    row_count = count_result_rows(result_csv)
+    if row_count == 0:
+        return None
     target_name = metadata.get("OBJECT_NAME", "").strip() or result_target_stem(result_csv).replace("_", " ")
     report_date = report_date_for_result(result_csv, metadata)
     if matching_bav_files is None:
@@ -354,13 +579,25 @@ def lightcurve_result_candidate_from_csv(
     quality_status = first_row.get("quality_status", "").strip().upper()
     if first_row.get("valid", "1").strip().casefold() in {"0", "false", "no"}:
         quality_status = "INVALID"
+    parsed_filename = parse_result_filename(result_csv)
+    if parsed_filename is None:
+        return None
+    if parsed_filename.variant == RESULT_VARIANT_BINNED:
+        variant_label = parsed_filename.variant_label
+    elif (
+        metadata.get("SOURCE_PROVENANCE") == "SINGLE_FRAME_LG_SERIES"
+        and metadata.get("BINNING_ALLOWED") == "1"
+    ):
+        variant_label = "Raw"
+    else:
+        variant_label = ""
     return LightcurveResultCandidate(
         result_csv=result_csv,
         target_name=target_name,
         variable_type=metadata.get("OBJECT_VAR_TYPE", "").strip(),
         report_date=report_date,
         source_directory_name=result_csv.parent.name,
-        row_count=count_result_rows(result_csv),
+        row_count=row_count,
         png_exists=result_csv.with_suffix(".png").exists(),
         aavso_exists=aavso_report_path(result_csv).exists(),
         bav_file_count=len(matching_bav_files),
@@ -377,6 +614,9 @@ def lightcurve_result_candidate_from_csv(
         ),
         field_reference_used=first_row.get("field_reference_used", "").strip(),
         check_delta_mag=first_row.get("check_delta_mag", "").strip(),
+        has_calibrated_check=result_csv_has_calibrated_check_delta(result_csv),
+        result_variant=parsed_filename.variant,
+        result_variant_label=variant_label,
     )
 
 
@@ -526,6 +766,7 @@ def discover_lightcurve_results_with_diagnostics(
     )
 
     candidates: list[LightcurveResultCandidate] = []
+    invalid_results: list[ResultScanIssue] = []
     bav_directory_cache: dict[Path, tuple[Path, ...]] = {}
     for result_index, result_csv in enumerate(result_paths):
         if progress_callback is not None and (
@@ -544,9 +785,10 @@ def discover_lightcurve_results_with_diagnostics(
             )
             matching_bav_files: tuple[Path, ...] | None = None
             if bav_only:
-                bav_dir = bav_directories.get(result_csv.parent)
-                if bav_dir is None:
+                base_bav_dir = bav_directories.get(result_csv.parent)
+                if base_bav_dir is None:
                     continue
+                bav_dir = bav_output_directory(result_csv)
                 if bav_dir not in bav_directory_cache:
                     def read_bav_files() -> tuple[Path, ...]:
                         with os.scandir(bav_dir) as entries:
@@ -594,6 +836,13 @@ def discover_lightcurve_results_with_diagnostics(
             continue
         if candidate is not None and candidate.result_kind == result_kind:
             candidates.append(candidate)
+        elif candidate is None:
+            invalid_results.append(
+                ResultScanIssue(
+                    path=result_csv,
+                    message="Result CSV has no data rows and is not loadable.",
+                )
+            )
 
     ordered_candidates = tuple(
         sorted(
@@ -610,6 +859,7 @@ def discover_lightcurve_results_with_diagnostics(
         folders_scanned=folders_scanned,
         result_csv_found=len(result_paths),
         issues=tuple(issues),
+        invalid_results=tuple(invalid_results),
         archive_directories_skipped=archive_directories_skipped,
         symlink_directories_skipped=symlink_directories_skipped,
         cancelled=cancelled,

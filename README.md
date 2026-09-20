@@ -1,83 +1,89 @@
 # SeePhot
 
-Private prerelease repository for SeePhot, a Siril Python application for
-Seestar variable-star photometry.
+SeePhot is a Siril Python application for Seestar variable-star photometry,
+light-curve analysis, and related CFA/stack workflows.
 
-> **Development status:** internal prerelease (`0.4.8-pre`). Interfaces, file
-> formats, photometry rules, and installation steps may still change.
+## Current Main Release
 
-## Planned Prerelease Bundle
+- SeePhot Main: `0.8.20`
+- SeePhot CFA: `0.5.0`
 
-The internal prerelease contains the main application and the small set of
-modules needed for the current manual workflow:
+The Main release is a manually tested snapshot. The Main and CFA applications
+keep independent internal version numbers; the GitHub release version follows
+SeePhot Main.
 
-- `SeePhot_Main.py` — application entry point.
-- `SeePhot_CFA.py` — optional CFA channel extraction and stacking companion.
-- `sp_mod_results.py` — result discovery and metadata helpers.
-- `sp_mod_bav.py` — optional BAV report support.
+## Release Bundle
 
-The following development or machine-specific modules are intentionally not
-part of this prerelease:
+Keep all ten Python files in the same Siril script directory:
 
-- `sp_mod_auto.py`
-- `sp_mod_batch.py`
-- `sp_mod_qc.py`
-- `sp_mod_linearity.py`
-- `sp_mod_archive.py`
+- `SeePhot_Main.py` — main photometry and analysis application.
+- `SeePhot_CFA.py` — CFA channel extraction and stacking companion.
+- `sp_mod_analyze.py` — standalone analysis and photometric linearity tools.
+- `sp_mod_auto.py` — multi-folder CFA/stack batch workflow.
+- `sp_mod_batch.py` — multi-target photometry batch workflow.
+- `sp_mod_bav.py` — BAV report and export support.
+- `sp_mod_binning.py` — scientific flux-based light-curve binning.
+- `sp_mod_linearity.py` — linearity and dynamic-range diagnostics.
+- `sp_mod_profiling.py` — stack timing analysis and recommendations.
+- `sp_mod_results.py` — result discovery, metadata, and output-path helpers.
 
-## Current Prerelease Focus
+The development-only modules `sp_mod_qc.py`, `sp_mod_archive.py`, and
+`sp_mod_ext_scopes.py` are not part of the Main release.
 
-- Light-curve and Single Measurement results are discovered separately according
-  to the selected photometry mode. Explicitly selected CSV files are recognized
-  by their content and loaded without resetting the acquisition mode.
-- Loaded valid light curves remain available for plotting, extremum fitting,
-  AAVSO export, and BAV output. Loaded valid Single Measurements remain available
-  for AAVSO and BAV single-brightness export, with existing export files shown in
-  the Single Measurement result browser.
-- Target and annulus contamination are evaluated after measurement. Rejected
-  measurements are visibly marked and excluded from scientific plots,
-  extremum fitting, and AAVSO export.
-- The Export and BAV tabs share normalized AAVSO observer settings, while
-  telescope and instrument information comes from the current result data.
-- BAV reports provide a visible link to the corresponding VSX object page,
-  including a fallback for older result files that only store the VSX object
-  identifier.
+## Main Features
+
+- Series photometry and Single Measurement workflows for Seestar FITS data.
+- Variable-star discovery, comparison-star handling, and calibrated result
+  generation.
+- Light-curve plotting, scientific binning, and robust extremum fitting.
+- Gaia-based target and annulus contamination assessment with explicit
+  rejection and diagnostic outcomes.
+- AAVSO and BAV export workflows, including multiple extrema and optional
+  period information.
+- Multi-target photometry batches and multi-folder CFA/stack batches.
+- Pause-aware and dynamic stacking modes with stack profiling and planning
+  recommendations.
+- Photometric linearity analysis and support for Seestar S50 and S50 Pro
+  metadata.
 
 ## Requirements
 
 - Siril 1.3.0 or newer with Python scripting support.
 - `sirilpy` 1.0.13 or newer.
-- Python packages used by the main workflow: `PyQt6`, `astropy`, `numpy`, and
+- Python packages used by the core workflow: `PyQt6`, `astropy`, `numpy`, and
   `matplotlib`.
-- Some optional operations may additionally use `scipy`, `astroquery`, or
-  `reportlab`.
+- Some workflows additionally use `scipy`, `astroquery`, or `reportlab`.
 
 SeePhot is intended to run inside Siril's Python environment, not as a
 standalone system-Python application.
 
 ## Installation
 
-1. Copy all included `.py` files into the same Siril Python script directory.
-2. In Siril, select that directory under the Python scripts settings.
-3. Start `SeePhot_Main.py` from Siril's Scripts menu.
+1. Download the source archive from the GitHub release page.
+2. Copy the ten `.py` files listed under **Release Bundle** into the same Siril
+   Python script directory.
+3. In Siril, select that directory under the Python scripts settings.
+4. Start `SeePhot_Main.py` from Siril's Scripts menu.
 
-Only `SeePhot_Main.py` and `SeePhot_CFA.py` are executable applications.
-Files beginning with `sp_mod_` are support modules and should not be started
+`SeePhot_Main.py` and `SeePhot_CFA.py` are the executable applications. Files
+beginning with `sp_mod_` are support modules and should not be started
 directly.
+
+## CFA Release
+
+The standalone public CFA/stack application is maintained separately at:
+
+https://github.com/Aquarius58/siril-seestar-stack
+
+The CFA file included here is the version tested as part of this Main release
+snapshot and can therefore differ from a later standalone CFA release.
 
 ## Repository Status
 
-This repository is private and intended for internal prerelease testing. It is
-not yet the public distribution channel for SeePhot.
-
-The standalone CFA/stacking companion is maintained separately at:
-
-https://github.com/Aquarius58/siril-seestar-stack
+This repository contains tagged SeePhot Main releases. Repository visibility
+is managed independently on GitHub and does not change the release contents.
 
 ## License
 
 SeePhot and the included support modules are licensed under
 GPL-3.0-or-later. See `LICENSE` and the SPDX identifier in each source file.
-
-`SeePhot_CFA.py` is maintained separately under the same license in its
-upstream repository.

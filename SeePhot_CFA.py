@@ -22,8 +22,9 @@ Inputs
 ------
 Input files are the original Seestar `.fit` frames located directly in the
 selected folder. `DATE-OBS` is required; files without it are skipped. Seestar
-`DATE-OBS` is treated as exposure end time. If `EXPTIME` is missing, the script
-uses a 10 second fallback.
+frames with `DATE-EXP` use `DATE-OBS` as the exposure start and `DATE-EXP` as
+the exposure end; without `DATE-EXP`, `DATE-OBS` is treated as the exposure
+end. If `EXPTIME` is missing, the script uses a 10 second fallback.
 
 Outputs
 -------
@@ -86,11 +87,13 @@ import sys
 import time
 import importlib.util
 import os
+import statistics
 import tempfile
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import unquote, urlparse
 
 import sirilpy as s
@@ -146,7 +149,7 @@ warnings.filterwarnings(
 )
 
 # User settings
-SCRIPT_VERSION = "0.4.0"
+SCRIPT_VERSION = "0.5.0"
 SIRIL_REQUIRES = "1.3.0"
 OUTPUT_BITS_COMMAND = "set16bits"
 SSAP_HEADER_VALUE = "SeePhot_CFA.py"
@@ -155,6 +158,8 @@ DEFAULT_PLAN_MODE = "time"
 DEFAULT_DURATION_PLANS = (100, 1000)
 DEFAULT_FRAME_PLANS = (10, 100)
 ALL_PLAN_NAME = "ALL"
+GROUPING_BEHAVIOR_CONTINUOUS = "continuous"
+GROUPING_BEHAVIOR_GAP_AWARE = "gap_aware"
 
 STACK_METHOD = "rej"
 REJECTION_LOW = 3.0
@@ -172,6 +177,7 @@ REGISTRATION_MINPAIRS = 10
 
 TEMP_BASENAME = "tmp"
 DEFAULT_SUBFRAME_EXPOSURE = 10.0
+TIMING_INTERVAL_TOLERANCE_SECONDS = 1.0
 SPLIT_CFA_TO_PHOTOMETRY_CHANNELS = True
 KEEP_CHANNEL_IMAGES = True
 DEFAULT_OVERWRITE_RESULTS = False
@@ -184,8 +190,9 @@ PROGRESS_LOG_INTERVAL = 50
 
 WINDOW_TITLE = f"SeePhot Stack {SCRIPT_VERSION}"
 MAIN_WINDOW_OBJECT_NAME = "seephot_seestar_stack_main_window"
-SINGLE_INSTANCE_LOCK_PATH = Path(tempfile.gettempdir()) / "seephot_seestar_stack.lock"
-SINGLE_INSTANCE_LOCK_MAX_AGE_SECONDS = 12 * 60 * 60
+SINGLE_INSTANCE_LOCK_PATH = Path(tempfile.gettempdir()) / "seephot_seestar.lock"
+SIRIL_CONNECT_ATTEMPTS = 6
+SIRIL_CONNECT_RETRY_DELAY_SECONDS = 0.2
 WINDOW_WIDTH = 380
 FULL_CHANNEL_WINDOW_WIDTH = 430
 WINDOW_HEIGHT = 520
@@ -359,8 +366,9 @@ class StackPlan:
 @dataclass(frozen=True)
 class FitsFrame:
     path: Path
-    date_obs: datetime
+    end_time: datetime
     exptime: float
+    timing_source: str = "legacy_date_obs_end"
 
 
 @dataclass(frozen=True)
@@ -391,20 +399,24 @@ def is_fits_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in {".fit", ".fits"} and not is_hidden_fits(path)
 
 
-def parse_date_obs(value: object, path: Path) -> datetime:
+def parse_fits_time(value: object, path: Path, key: str) -> datetime:
     if value is None:
-        raise ValueError(f"{path.name} lacks DATE-OBS")
+        raise ValueError(f"{path.name} lacks {key}")
 
-    date_obs = str(value).strip()
-    if not date_obs:
-        raise ValueError(f"{path.name} has empty DATE-OBS")
-    if date_obs.endswith("Z"):
-        date_obs = date_obs[:-1] + "+00:00"
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{path.name} has empty {key}")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
 
-    dt = datetime.fromisoformat(date_obs)
+    dt = datetime.fromisoformat(text)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def parse_date_obs(value: object, path: Path) -> datetime:
+    return parse_fits_time(value, path, "DATE-OBS")
 
 
 def parse_exptime(header: fits.Header, path: Path, log_callback) -> float:
@@ -446,9 +458,52 @@ def parse_exptime_for_output(header: fits.Header) -> float:
 def read_frame(path: Path, log_callback) -> FitsFrame:
     with fits.open(path) as hdul:
         header = hdul[0].header
-        date_obs = parse_date_obs(header.get("DATE-END", header.get("DATE-OBS")), path)
         exptime = parse_exptime(header, path, log_callback)
-    return FitsFrame(path=path, date_obs=date_obs, exptime=exptime)
+        if "DATE-EXP" in header:
+            start_time = parse_fits_time(header.get("DATE-OBS"), path, "DATE-OBS")
+            end_time = parse_fits_time(header.get("DATE-EXP"), path, "DATE-EXP")
+            header_exposure = (end_time - start_time).total_seconds()
+            tolerance = max(TIMING_INTERVAL_TOLERANCE_SECONDS, exptime * 0.01)
+            if header_exposure <= 0 or abs(header_exposure - exptime) > tolerance:
+                raise ValueError(
+                    f"{path.name} has inconsistent DATE-OBS/DATE-EXP interval "
+                    f"({header_exposure:g}s; EXPTIME={exptime:g}s)"
+                )
+            return FitsFrame(path, end_time, exptime, "date_obs_date_exp")
+        if "DATE-END" in header:
+            return FitsFrame(
+                path,
+                parse_fits_time(header.get("DATE-END"), path, "DATE-END"),
+                exptime,
+                "normalized_date_end",
+            )
+        return FitsFrame(
+            path,
+            parse_date_obs(header.get("DATE-OBS"), path),
+            exptime,
+            "legacy_date_obs_end",
+        )
+
+
+def timing_summary(frames: list[FitsFrame]) -> str:
+    counts = {
+        source: sum(frame.timing_source == source for frame in frames)
+        for source in ("date_obs_date_exp", "legacy_date_obs_end", "normalized_date_end")
+    }
+    parts: list[str] = []
+    if counts["date_obs_date_exp"]:
+        parts.append(
+            f"{counts['date_obs_date_exp']} modern DATE-OBS start + DATE-EXP end"
+        )
+    if counts["legacy_date_obs_end"]:
+        parts.append(
+            f"{counts['legacy_date_obs_end']} legacy DATE-OBS end (start derived from EXPTIME)"
+        )
+    if counts["normalized_date_end"]:
+        parts.append(
+            f"{counts['normalized_date_end']} normalized DATE-OBS start + DATE-END end"
+        )
+    return "FITS timing: " + "; ".join(parts) + "."
 
 
 def image_has_bayer_header(path: Path) -> bool:
@@ -572,7 +627,7 @@ def collect_valid_fits(source_dir: Path, log_callback, skipped_callback=None) ->
             if skipped_callback is not None:
                 skipped_callback()
             log_callback(f"[WARN] Skipping {path.name}: {exc}")
-    return sorted(frames, key=lambda frame: frame.date_obs)
+    return sorted(frames, key=lambda frame: frame.end_time)
 
 
 def build_stack_plans(mode: str, values: tuple[int, int]) -> tuple[StackPlan, StackPlan, StackPlan]:
@@ -591,29 +646,60 @@ def build_stack_plans(mode: str, values: tuple[int, int]) -> tuple[StackPlan, St
     raise ValueError(f"Unsupported plan mode: {mode}")
 
 
-def split_into_blocks(frames: list[FitsFrame], plan: StackPlan) -> list[tuple[int, list[FitsFrame]]]:
+def split_into_blocks(
+    frames: list[FitsFrame],
+    plan: StackPlan,
+    behavior: str = GROUPING_BEHAVIOR_CONTINUOUS,
+) -> list[tuple[int, list[FitsFrame]]]:
+    """Create CFA stack blocks without requiring any external SeePhot module."""
+    if behavior not in {GROUPING_BEHAVIOR_CONTINUOUS, GROUPING_BEHAVIOR_GAP_AWARE}:
+        raise ValueError(f"Unsupported grouping behavior: {behavior}")
+    if not frames:
+        return []
+    # ALL has one unambiguous meaning: stack every selected frame. Observation
+    # gaps only affect the finite frame-count and duration-based plans.
     if plan.block_size is None and plan.duration_seconds is None:
         return [(0, frames)]
 
-    if plan.block_size is not None:
-        return [
-            (index, frames[index:index + plan.block_size])
-            for index in range(0, len(frames), plan.block_size)
+    segment_starts = [0]
+    if behavior == GROUPING_BEHAVIOR_GAP_AWARE:
+        midpoints = [
+            frame.end_time - timedelta(seconds=frame.exptime / 2)
+            for frame in frames
         ]
+        cadences = [
+            (current - previous).total_seconds()
+            for previous, current in zip(midpoints, midpoints[1:])
+        ]
+        pause_threshold = 3 * (statistics.median(cadences) if cadences else 0.0)
+        for index, (previous, current) in enumerate(zip(midpoints, midpoints[1:]), start=1):
+            if (current - previous).total_seconds() > pause_threshold:
+                segment_starts.append(index)
+    segment_starts.append(len(frames))
 
     blocks: list[tuple[int, list[FitsFrame]]] = []
-    start_index = 0
-    while start_index < len(frames):
-        first_frame = frames[start_index]
-        block_start = first_frame.date_obs - timedelta(seconds=first_frame.exptime)
-        end_index = start_index + 1
-        while end_index < len(frames):
-            covered_seconds = (frames[end_index].date_obs - block_start).total_seconds()
-            if covered_seconds > plan.duration_seconds:
-                break
-            end_index += 1
-        blocks.append((start_index, frames[start_index:end_index]))
-        start_index = end_index
+    for start, stop in zip(segment_starts, segment_starts[1:]):
+        segment = frames[start:stop]
+        if plan.block_size is not None:
+            blocks.extend(
+                (start + index, segment[index:index + plan.block_size])
+                for index in range(0, len(segment), plan.block_size)
+            )
+            continue
+
+        assert plan.duration_seconds is not None
+        index = 0
+        while index < len(segment):
+            first_frame = segment[index]
+            block_start = first_frame.end_time - timedelta(seconds=first_frame.exptime)
+            end_index = index + 1
+            while end_index < len(segment):
+                covered_seconds = (segment[end_index].end_time - block_start).total_seconds()
+                if covered_seconds > plan.duration_seconds:
+                    break
+                end_index += 1
+            blocks.append((start + index, segment[index:end_index]))
+            index = end_index
     return blocks
 
 
@@ -629,12 +715,12 @@ def compute_exposure_time_metadata(frames: list[FitsFrame]) -> ExposureTimeMetad
     if not frames:
         raise ValueError("Cannot compute exposure metadata for an empty frame list")
 
-    # Seestar DATE-OBS records the exposure end time. The exposure start is DATE-OBS - EXPTIME.
+    # FitsFrame stores the end time after resolving the original-header variant.
     start_times = [
-        frame.date_obs - timedelta(seconds=frame.exptime)
+        frame.end_time - timedelta(seconds=frame.exptime)
         for frame in frames
     ]
-    end_times = [frame.date_obs for frame in frames]
+    end_times = [frame.end_time for frame in frames]
     total_exposure = sum(frame.exptime for frame in frames)
     if total_exposure <= 0:
         raise ValueError("Non-positive total exposure computed for block")
@@ -692,6 +778,7 @@ def write_exposure_time_header(
                 source_header = fits.getheader(source_path)
         image_source = image_source_from_header(source_header) if source_header is not None else ""
         header["SSAP"] = (SSAP_HEADER_VALUE, "Created by Siril Seestar stack app")
+        header["SPORIGIN"] = ("CFA_STACK", "SeePhot provenance: CFA stack result")
         header["DATE-OBS"] = (iso_utc(metadata.start_time), "Start of first used exposure (UTC)")
         header["DATE-END"] = (iso_utc(metadata.end_time), "End of last used exposure (UTC)")
         header["DATE-AVG"] = (iso_utc(metadata.avg_time), "Exposure-weighted midpoint (UTC)")
@@ -803,10 +890,9 @@ def build_output_header(source_path: Path, channel_key: str) -> fits.Header:
     header = fits.getheader(source_path).copy()
     source_filter = header.get("FILTER")
     source_bayerpat = header.get("BAYERPAT")
-    source_end_time = parse_date_obs(header.get("DATE-OBS"), source_path)
-    source_exptime = parse_exptime_for_output(header)
+    source_frame = read_frame(source_path, lambda _message: None)
     time_metadata = compute_exposure_time_metadata([
-        FitsFrame(path=source_path, date_obs=source_end_time, exptime=source_exptime)
+        source_frame
     ])
     for key in BAYER_HEADER_KEYS:
         if key in header:
@@ -816,6 +902,7 @@ def build_output_header(source_path: Path, channel_key: str) -> fits.Header:
     if source_bayerpat:
         header["CFAORIG"] = (str(source_bayerpat), "Original CFA pattern")
     header["SSAP"] = (SSAP_HEADER_VALUE, "Created by Siril Seestar stack app")
+    header["SPORIGIN"] = ("CFA_CHANNEL", "SeePhot provenance: CFA channel result")
     header["DATE-OBS"] = (iso_utc(time_metadata.start_time), "Start of exposure (UTC)")
     header["DATE-END"] = (iso_utc(time_metadata.end_time), "End of exposure (UTC)")
     header["DATE-AVG"] = (iso_utc(time_metadata.avg_time), "Exposure midpoint (UTC)")
@@ -839,13 +926,30 @@ def cfa_channel_label(channel_key: str) -> str:
     return str(CFA_CHANNELS[channel_key]["label"])
 
 
-def plan_result_dir(source_dir: Path, plan: StackPlan, channel_key: str | None = None) -> Path:
+def grouping_behavior_suffix(behavior: str) -> str:
+    if behavior == GROUPING_BEHAVIOR_CONTINUOUS:
+        return ""
+    if behavior == GROUPING_BEHAVIOR_GAP_AWARE:
+        return "_ga"
+    raise ValueError(f"Unsupported grouping behavior: {behavior}")
+
+
+def plan_result_dir(
+    source_dir: Path,
+    plan: StackPlan,
+    channel_key: str | None = None,
+    grouping_behavior: str = GROUPING_BEHAVIOR_CONTINUOUS,
+) -> Path:
     channel_suffix = cfa_channel_suffix(channel_key) if channel_key is not None else ""
-    return source_dir.parent / f"{source_dir.name}{channel_suffix}-stack{plan.suffix}"
+    return source_dir.parent / f"{source_dir.name}{channel_suffix}-stack{plan.suffix}{grouping_behavior_suffix(grouping_behavior)}"
 
 
-def plan_temp_dir(source_dir: Path, plan: StackPlan) -> Path:
-    return source_dir.parent / f"{source_dir.name}-tmp{plan.suffix}"
+def plan_temp_dir(
+    source_dir: Path,
+    plan: StackPlan,
+    grouping_behavior: str = GROUPING_BEHAVIOR_CONTINUOUS,
+) -> Path:
+    return source_dir.parent / f"{source_dir.name}-tmp{plan.suffix}{grouping_behavior_suffix(grouping_behavior)}"
 
 
 def cfa_split_temp_dir(source_dir: Path) -> Path:
@@ -865,12 +969,13 @@ def result_dirs_for_run(
     selected_plans: tuple[StackPlan, ...],
     selected_channels: tuple[str, ...],
     needs_cfa_split: bool,
+    grouping_behavior: str = GROUPING_BEHAVIOR_CONTINUOUS,
 ) -> list[Path]:
     result_dirs: list[Path] = []
     result_channels: tuple[str | None, ...] = selected_channels if needs_cfa_split else (None,)
     for plan in selected_plans:
         for channel_key in result_channels:
-            result_dirs.append(plan_result_dir(source_dir, plan, channel_key))
+            result_dirs.append(plan_result_dir(source_dir, plan, channel_key, grouping_behavior))
 
     if needs_cfa_split and KEEP_CHANNEL_IMAGES:
         for channel_key in selected_channels:
@@ -884,10 +989,11 @@ def existing_result_dirs_for_run(
     selected_plans: tuple[StackPlan, ...],
     selected_channels: tuple[str, ...],
     needs_cfa_split: bool,
+    grouping_behavior: str = GROUPING_BEHAVIOR_CONTINUOUS,
 ) -> list[Path]:
     return [
         path
-        for path in result_dirs_for_run(source_dir, selected_plans, selected_channels, needs_cfa_split)
+        for path in result_dirs_for_run(source_dir, selected_plans, selected_channels, needs_cfa_split, grouping_behavior)
         if path.exists()
     ]
 
@@ -926,8 +1032,8 @@ def build_register_command(log_callback) -> str:
         interpolation = "lanczos4"
         if VERBOSE_COMMAND_LOG:
             log_callback(
-                "[INFO] Interpolation automatisch auf lanczos4 gesetzt, "
-                "weil 'none' nur mit shift sinnvoll ist."
+                "[INFO] Interpolation automatically changed to lanczos4 because "
+                "'none' is only appropriate for shift registration."
             )
     parts.append(f"-interp={interpolation}")
     return " ".join(parts)
@@ -995,6 +1101,32 @@ def should_log_progress(index: int, total: int) -> bool:
     return index == 1 or index == total or index % PROGRESS_LOG_INTERVAL == 0
 
 
+def connect_siril_interface(
+    siril: object,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Connect to Siril, tolerating a connection still being released."""
+
+    for attempt in range(1, SIRIL_CONNECT_ATTEMPTS + 1):
+        try:
+            siril.connect()
+            return
+        except Exception as exc:
+            message = str(exc).lower()
+            transient_connection = (
+                "already connected to siril" in message
+                or (os.name == "nt" and "pipe is busy" in message)
+            )
+            if not transient_connection or attempt >= SIRIL_CONNECT_ATTEMPTS:
+                raise
+            if log is not None:
+                log(
+                    "[INFO] The previous Siril connection is still being released; "
+                    f"retrying ({attempt}/{SIRIL_CONNECT_ATTEMPTS - 1})."
+                )
+            time.sleep(SIRIL_CONNECT_RETRY_DELAY_SECONDS)
+
+
 class StackWorker(QThread):
     log = pyqtSignal(str)
     finished = pyqtSignal(bool, str, str)
@@ -1006,6 +1138,7 @@ class StackWorker(QThread):
         selected_channels: tuple[str, ...],
         allow_overwrite: bool = DEFAULT_OVERWRITE_RESULTS,
         require_lightcurve_filter: bool = False,
+        grouping_behavior: str = GROUPING_BEHAVIOR_CONTINUOUS,
     ):
         super().__init__()
         self.source_dir = Path(source_dir).expanduser()
@@ -1013,8 +1146,9 @@ class StackWorker(QThread):
         self.selected_channels = selected_channels
         self.allow_overwrite = allow_overwrite
         self.require_lightcurve_filter = require_lightcurve_filter
+        self.grouping_behavior = grouping_behavior
         self.cfa_split_dirs: tuple[Path, ...] | None = None
-        self.plan_temp_dirs = tuple(plan_temp_dir(self.source_dir, plan) for plan in selected_plans)
+        self.plan_temp_dirs = tuple(plan_temp_dir(self.source_dir, plan, grouping_behavior) for plan in selected_plans)
         self.stats = RunStats()
 
     def emit_log(self, message: str) -> None:
@@ -1080,6 +1214,7 @@ class StackWorker(QThread):
                 f"Select the folder that contains the individual original Seestar FITS frames."
             )
         self.stats.source_frames = len(source_frames)
+        self.emit_log(f"[INFO] {timing_summary(source_frames)}")
 
         needs_cfa_split = frames_need_cfa_split(source_frames)
         if needs_cfa_split and not self.selected_channels:
@@ -1092,7 +1227,7 @@ class StackWorker(QThread):
         self.preflight_output_dirs(needs_cfa_split)
 
         siril = s.SirilInterface()
-        siril.connect()
+        connect_siril_interface(siril, self.emit_log)
         if VERBOSE_COMMAND_LOG:
             self.emit_log("[OK] Connected to Siril.")
         self.move_siril_to_safe_directory(siril)
@@ -1268,6 +1403,7 @@ class StackWorker(QThread):
             self.selected_plans,
             self.selected_channels,
             needs_cfa_split,
+            self.grouping_behavior,
         ):
             if result_dir.exists() and not self.allow_overwrite:
                 raise FileExistsError(
@@ -1277,7 +1413,7 @@ class StackWorker(QThread):
             assert_can_create_directory(result_dir)
 
         for plan in self.selected_plans:
-            assert_can_create_directory(plan_temp_dir(self.source_dir, plan))
+            assert_can_create_directory(plan_temp_dir(self.source_dir, plan, self.grouping_behavior))
 
         if needs_cfa_split:
             assert_can_create_directory(cfa_split_temp_dir(self.source_dir))
@@ -1330,8 +1466,8 @@ class StackWorker(QThread):
         frames: list[FitsFrame],
         channel_key: str | None,
     ) -> Path:
-        tmp_dir = plan_temp_dir(self.source_dir, plan)
-        result_dir = plan_result_dir(self.source_dir, plan, channel_key)
+        tmp_dir = plan_temp_dir(self.source_dir, plan, self.grouping_behavior)
+        result_dir = plan_result_dir(self.source_dir, plan, channel_key, self.grouping_behavior)
         completed = False
 
         self.prepare_result_dir(result_dir)
@@ -1348,7 +1484,7 @@ class StackWorker(QThread):
             self.run_cmd(siril, f"requires {SIRIL_REQUIRES}")
             self.run_cmd(siril, OUTPUT_BITS_COMMAND)
 
-            blocks = split_into_blocks(frames, plan)
+            blocks = split_into_blocks(frames, plan, self.grouping_behavior)
             total_blocks = len(blocks)
             for block_number, (index, block) in enumerate(blocks, start=1):
                 if not block:
@@ -1491,6 +1627,7 @@ class StackWindow(QWidget):
         allowed_channels: tuple[str, ...] | None = None,
         lightcurve_mode: bool = False,
         busy_context: dict[str, object] | None = None,
+        default_grouping_behavior: str = GROUPING_BEHAVIOR_CONTINUOUS,
     ):
         super().__init__()
         self.setObjectName(MAIN_WINDOW_OBJECT_NAME)
@@ -1499,6 +1636,12 @@ class StackWindow(QWidget):
         self.lightcurve_mode = lightcurve_mode
         self.allowed_channels = self.normalized_allowed_channels(allowed_channels)
         self.busy_context = busy_context or {}
+        if default_grouping_behavior not in {
+            GROUPING_BEHAVIOR_CONTINUOUS,
+            GROUPING_BEHAVIOR_GAP_AWARE,
+        }:
+            raise ValueError(f"Unsupported grouping behavior: {default_grouping_behavior}")
+        self.default_grouping_behavior = default_grouping_behavior
         self.init_ui()
 
     def normalized_allowed_channels(self, allowed_channels: tuple[str, ...] | None) -> tuple[str, ...]:
@@ -1537,7 +1680,7 @@ class StackWindow(QWidget):
 
         if self.lightcurve_mode:
             lightcurve_note = QLabel(
-                "Light Curve mode: Only L or G outputs are used for V-calibrated Light Curves."
+                "SeePhot: Only L or G outputs are used for V-calibrated Light Curves."
             )
             lightcurve_note.setWordWrap(True)
             layout.addWidget(lightcurve_note)
@@ -1564,6 +1707,14 @@ class StackWindow(QWidget):
         if DEFAULT_PLAN_MODE == "frames":
             self.plan_mode_combo.setCurrentIndex(1)
         self.plan_mode_combo.currentIndexChanged.connect(self.update_plan_spinboxes)
+
+        self.grouping_behavior_combo = QComboBox()
+        self.grouping_behavior_combo.addItem("Continuous", GROUPING_BEHAVIOR_CONTINUOUS)
+        self.grouping_behavior_combo.addItem("Gap-aware", GROUPING_BEHAVIOR_GAP_AWARE)
+        self.grouping_behavior_combo.setCurrentIndex(
+            self.grouping_behavior_combo.findData(self.default_grouping_behavior)
+        )
+        self.grouping_behavior_combo.currentIndexChanged.connect(self.update_grouping_behavior_tooltip)
 
         self.plan_one_spin = QSpinBox()
         self.plan_one_spin.setRange(1, 100000)
@@ -1593,6 +1744,10 @@ class StackWindow(QWidget):
         plan_layout.addWidget(QLabel("Group 3"), 3, 0)
         plan_layout.addWidget(all_label, 3, 1)
         plan_layout.addWidget(self.plan_all_check, 3, 2)
+        behavior_label = QLabel("Mode")
+        behavior_label.setToolTip("Choose how observation pauses affect stack boundaries.")
+        plan_layout.addWidget(behavior_label, 4, 0)
+        plan_layout.addWidget(self.grouping_behavior_combo, 4, 1, 1, 2)
         plan_group.setLayout(plan_layout)
 
         cfa_group = QGroupBox("CFA Photometry Channels")
@@ -1612,12 +1767,15 @@ class StackWindow(QWidget):
         layout.addWidget(plan_group)
 
         button_row = QHBoxLayout()
+        self.overview_button = QPushButton("Overview")
+        self.overview_button.clicked.connect(self.show_overview)
         self.help_button = QPushButton("Help")
         self.help_button.clicked.connect(self.show_help)
         self.stack_button = QPushButton("Start")
         self.stack_button.clicked.connect(self.start_stack)
         button_row.addWidget(self.stack_button)
         button_row.addStretch(1)
+        button_row.addWidget(self.overview_button)
         button_row.addWidget(self.help_button)
         self.close_button = QPushButton("Close")
         self.close_button.clicked.connect(self.close)
@@ -1630,11 +1788,14 @@ class StackWindow(QWidget):
 
         self.setLayout(layout)
         self.update_plan_spinboxes()
+        self.update_grouping_behavior_tooltip()
+        self.append_log(f"SeePhot CFA version: {SCRIPT_VERSION}")
 
     def set_run_controls_enabled(self, enabled: bool) -> None:
         self.source_edit.setEnabled(enabled)
         self.browse_button.setEnabled(enabled)
         self.plan_mode_combo.setEnabled(enabled)
+        self.grouping_behavior_combo.setEnabled(enabled)
         self.plan_one_spin.setEnabled(enabled)
         self.plan_two_spin.setEnabled(enabled)
         self.plan_one_check.setEnabled(enabled)
@@ -1678,6 +1839,13 @@ class StackWindow(QWidget):
         self.source_edit.setText(self.source_dir)
         return True
 
+    def set_grouping_behavior(self, behavior: str) -> bool:
+        index = self.grouping_behavior_combo.findData(behavior)
+        if index < 0:
+            return False
+        self.grouping_behavior_combo.setCurrentIndex(index)
+        return True
+
     def dialog_start_directory(self) -> str:
         current_path = self.sync_source_dir_from_edit()
         if current_path is None:
@@ -1709,6 +1877,22 @@ class StackWindow(QWidget):
 
     def current_plan_mode(self) -> str:
         return str(self.plan_mode_combo.currentData())
+
+    def current_grouping_behavior(self) -> str:
+        return str(self.grouping_behavior_combo.currentData())
+
+    def update_grouping_behavior_tooltip(self) -> None:
+        if self.current_grouping_behavior() == GROUPING_BEHAVIOR_GAP_AWARE:
+            text = (
+                "Gap-aware: Recommended for light-curve photometry. A gap longer than 3 × median input cadence "
+                "ends the current stack. No stack crosses that pause."
+            )
+        else:
+            text = (
+                "Continuous: frames continue into the next stack "
+                "even when an observation pause occurs."
+            )
+        self.grouping_behavior_combo.setToolTip(text)
 
     def build_available_plans(self) -> tuple[StackPlan, StackPlan, StackPlan]:
         return build_stack_plans(self.current_plan_mode(), self.current_plan_values())
@@ -1792,6 +1976,7 @@ class StackWindow(QWidget):
             selected_plans,
             selected_channels,
             needs_cfa_split,
+            self.current_grouping_behavior(),
         )
         if existing_dirs:
             reply = QMessageBox.question(
@@ -1815,6 +2000,8 @@ class StackWindow(QWidget):
                 return
 
         self.log_view.clear()
+        self.append_log(f"SeePhot CFA version: {SCRIPT_VERSION}")
+        self.append_log(f"[INFO] Stack mode: {self.grouping_behavior_combo.currentText()}.")
         self.set_run_controls_enabled(False)
         self.worker = StackWorker(
             source_dir,
@@ -1822,16 +2009,17 @@ class StackWindow(QWidget):
             selected_channels,
             allow_overwrite,
             require_lightcurve_filter=self.lightcurve_mode,
+            grouping_behavior=self.current_grouping_behavior(),
         )
         self.worker.log.connect(self.append_log)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
 
-    def build_help_text(self) -> str:
+    def build_overview_text(self) -> str:
         lightcurve_note = ""
         if self.lightcurve_mode:
             lightcurve_note = (
-                "Light Curve mode:\n"
+                "SeePhot:\n"
                 "- This window was opened from SeePhot.\n"
                 "- Only L or G outputs are used for V-calibrated Light Curves.\n\n"
             )
@@ -1865,9 +2053,13 @@ class StackWindow(QWidget):
             f"- Time-based blocks also need at least {MIN_STACK_COMPLETION_FRACTION * 100:g}% "
             "of the requested duration.\n"
             "- End-of-sequence blocks are accepted when these criteria are met.\n\n"
+            "Stack mode:\n"
+            "- Continuous keeps grouping across observation pauses.\n"
+            "- Pause-aware ends a stack at a pause longer than 3 × median input cadence.\n\n"
             "FITS headers:\n"
             "- DATE-OBS is required; files without DATE-OBS are skipped.\n"
-            "- Seestar DATE-OBS is treated as exposure end time.\n"
+            "- With DATE-EXP, DATE-OBS is the exposure start and DATE-EXP the end.\n"
+            "- Without DATE-EXP, DATE-OBS is treated as the exposure end.\n"
             "- Generated files use DATE-OBS = UTC exposure start and DATE-END = UTC exposure end.\n"
             "- DATE-AVG and MJD-AVG store the exposure-weighted midpoint for photometry.\n"
             "- Stack EXPTIME is the summed exposure time of the used frames, excluding gaps.\n"
@@ -1877,10 +2069,38 @@ class StackWindow(QWidget):
             "channel frames, stack results, skipped blocks and warnings."
         )
 
+    def build_help_text(self) -> str:
+        return (
+            "Select the folder containing the original Seestar FITS frames.\n"
+            "Choose grouping by seconds or frames, enable the required groups and CFA "
+            "channels, then click 'Start'.\n\n"
+            "Continuous grouping spans observation pauses; Gap-aware grouping starts a new "
+            "block after a long pause. Existing result folders are changed only after you "
+            "confirm the overwrite prompt.\n\n"
+            "Progress, skipped inputs, warnings, and the final summary appear in the log. "
+            "For details about outputs, timing, and CFA processing, click 'Overview'."
+        )
+
+    def show_overview(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SeePhot Stack Overview")
+        dialog.resize(760, 520)
+
+        layout = QVBoxLayout(dialog)
+        text_view = QTextEdit()
+        text_view.setReadOnly(True)
+        text_view.setPlainText(self.build_overview_text())
+        layout.addWidget(text_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
     def show_help(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("SeePhot Stack Help")
-        dialog.resize(760, 520)
+        dialog.resize(620, 320)
 
         layout = QVBoxLayout(dialog)
         text_view = QTextEdit()
@@ -2005,15 +2225,14 @@ def acquire_single_instance_lock() -> SingleInstanceLock | None:
 
     def lock_is_stale() -> bool:
         try:
-            stat = SINGLE_INSTANCE_LOCK_PATH.stat()
+            pid_text = SINGLE_INSTANCE_LOCK_PATH.read_text(encoding="ascii").strip()
         except FileNotFoundError:
             return False
-        if time.time() - stat.st_mtime > SINGLE_INSTANCE_LOCK_MAX_AGE_SECONDS:
+        except OSError:
             return True
         try:
-            pid_text = SINGLE_INSTANCE_LOCK_PATH.read_text(encoding="ascii").strip()
             pid = int(pid_text.splitlines()[0])
-        except (OSError, ValueError, IndexError):
+        except (ValueError, IndexError):
             return True
         if pid <= 0:
             return True

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import csv
+import hashlib
 import html
 import importlib.util
 import math
@@ -23,12 +24,20 @@ import tempfile
 import urllib.parse
 import urllib.request
 import warnings
-from collections import Counter
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+
+# The result contract has no Siril or Qt dependency and supplies the shared
+# instrument definitions needed by Main before optional packages are prepared.
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+import sp_mod_results as lightcurve_results
 
 warnings.filterwarnings(
     "ignore",
@@ -38,10 +47,11 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.4.12-pre"
+SCRIPT_VERSION = "0.8.20"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
+
 
 # ---------------------------------------------------------------------------
 # Stage 1 configuration
@@ -52,8 +62,9 @@ SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
 # GUI window defaults.
 WINDOW_TITLE = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
 MAIN_WINDOW_OBJECT_NAME = "seephot_seestar_lightcurve_main_window"
-SINGLE_INSTANCE_LOCK_PATH = Path(tempfile.gettempdir()) / "seephot_seestar_lightcurve.lock"
-SINGLE_INSTANCE_LOCK_MAX_AGE_SECONDS = 12 * 60 * 60
+SINGLE_INSTANCE_LOCK_PATH = Path(tempfile.gettempdir()) / "seephot_seestar.lock"
+SIRIL_CONNECT_ATTEMPTS = 6
+SIRIL_CONNECT_RETRY_DELAY_SECONDS = 0.2
 WINDOW_WIDTH = 860
 WINDOW_HEIGHT = 700
 MAIN_SPLITTER_START_SIZES = (420, 210)
@@ -89,8 +100,19 @@ CONTAMINATED_TARGET_DIAGNOSTIC_PURPOSE = "REJECTED_TARGET_CONTAMINATION_DIAGNOST
 FITS_SUFFIXES = {".fit", ".fits"}
 MODE_LIGHTCURVE = "lightcurve"
 MODE_SINGLE_MEASUREMENT = "single_measurement"
-SERIES_MODE_VSX_TYPE_SUGGESTION = "EA,EB,EW,RR*,HADS"
-SINGLE_MODE_VSX_TYPE_SUGGESTION = "RVA,RVB,CWA,DCEP"
+EXTREMUM_MODEL_ROBUST_GCV_SPLINE = "robust_gcv_spline"
+EXTREMUM_MODEL_AUTOMATIC = "automatic"
+EXTREMUM_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Robust cubic spline (recommended)", EXTREMUM_MODEL_ROBUST_GCV_SPLINE),
+    ("Parabola", "parabola"),
+    ("Asymptotic parabola", "asymptotic_parabola"),
+    ("Parabolic spline", "parabolic_spline"),
+    ("Automatic model comparison (classic)", EXTREMUM_MODEL_AUTOMATIC),
+)
+SERIES_MODE_VSX_TYPE_SUGGESTION = "EA*,EB*,EW*,RR*,HADS"
+SINGLE_MODE_VSX_TYPE_SUGGESTION = (
+    "M,RVA*,RVB*,CWA*,DCEP*,N,NA*,NB*,NC*,NR*"
+)
 VSX_FILTER_PRESETS: tuple[tuple[str, str], ...] = (
     ("No filter", ""),
     ("Short period", SERIES_MODE_VSX_TYPE_SUGGESTION),
@@ -111,21 +133,8 @@ TMP_DIRECTORY_NAME = "siril_lightcurve_tmp"
 RESULTS_DIRECTORY_NAME = "results"
 DIAGNOSTICS_DIRECTORY_NAME = "diagnostics"
 TEMP_CLEANUP_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8)
-DEFAULT_RESULT_TELESCOPE = "Seestar S50"
-RESULT_TELESCOPE_SPECS: dict[str, dict[str, object]] = {
-    "Seestar S30": {
-        "sensor": "Sony IMX662",
-        "pixel_scale_arcsec_px": 3.99,
-    },
-    "Seestar S30pro": {
-        "sensor": "Sony IMX585",
-        "pixel_scale_arcsec_px": 3.76,
-    },
-    "Seestar S50": {
-        "sensor": "Sony IMX462",
-        "pixel_scale_arcsec_px": 2.39,
-    },
-}
+DEFAULT_RESULT_TELESCOPE = lightcurve_results.DEFAULT_RESULT_TELESCOPE
+RESULT_TELESCOPE_SPECS = lightcurve_results.RESULT_TELESCOPE_SPECS
 
 # VSX target search defaults.
 # Limit magnitude is passed to Siril's VSX conesearch.
@@ -215,6 +224,10 @@ SINGLE_FIELD_ZP_NEIGHBOR_RADIUS_FACTOR = 1.25
 SINGLE_FIELD_ZP_NEIGHBOR_MAX_MAG_DELTA = 3.0
 TARGET_BLEND_SAME_SOURCE_MAX_SEPARATION_ARCSEC = 2.0
 TARGET_BLEND_ERROR_LIMIT_MAG = 0.05
+SERIES_TARGET_BLEND_WARNING_LIMIT_MAG = 0.05
+SERIES_TARGET_BLEND_ERROR_LIMIT_MAG = 0.10
+TARGET_BLEND_HISTORICAL_MAGNITUDE_MISMATCH_MAG = 3.0
+TARGET_BLEND_GAIA_QUERY_MAX_ROWS = 1000
 GAIA_TARGET_MATCH_SHADOW_NO_MATCH = "NO_MATCH"
 GAIA_TARGET_MATCH_SHADOW_MATCHED = "MATCHED"
 GAIA_TARGET_MATCH_SHADOW_AMBIGUOUS = "AMBIGUOUS"
@@ -261,6 +274,12 @@ APASS_DR10_SOURCE_NAME = "APASS_DR10"
 UCAC4_TAP_URL = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"
 UCAC4_SOURCE_NAME = "UCAC4"
 GAIA_DR3_SOURCE_NAME = "Gaia_DR3"
+GAIA_ARI_TAP_URL = "https://gaia.ari.uni-heidelberg.de/tap"
+GAIA_ARI_SOURCE_TABLE = "gaiadr3.gaia_source_lite"
+GAIA_FIELD_MAXREC = 5_000_000
+GAIA_LINEARITY_SAMPLE_SIZE = 750
+GAIA_FIELD_MAG_BIN_EDGES = (5.0, 8.0, 10.0, 12.0, 14.0, 15.0, 16.0, 17.0, 18.0, 18.5)
+GAIA_FIELD_COLOR_BIN_EDGES = (-0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.75)
 COMPARISON_CATALOG_AUTO_NAME = "Auto (APASS_DR10 -> UCAC4)"
 COMPARISON_CATALOG_QUERY_CHOICES = (APASS_DR10_SOURCE_NAME, UCAC4_SOURCE_NAME)
 # Comparison/check-star catalog selection for series photometry.
@@ -297,13 +316,15 @@ COMPARISON_CATALOG_COLUMNS = (
 )
 
 # Result CSV filter metadata.
-# SeePhot_CFA.py writes FILTER=L/G for light-curve inputs. These are the only
-# calibrated light-curve sources accepted by this app.
+# SeePhot_CFA.py writes FILTER=L/G for derived light-curve inputs. Native
+# Johnson V frames retain V through measurement, result CSV and AAVSO export.
 IMAGE_SOURCE_TO_AAVSO_FILTER = {
     "L": "CV",
     "G": "TG",
+    "V": "V",
 }
 VALID_AAVSO_FILTERS = frozenset(IMAGE_SOURCE_TO_AAVSO_FILTER.values())
+BINNING_IMAGE_SOURCES = frozenset({"L", "G"})
 AAVSO_APPS_URL = "https://apps.aavso.org/v2/"
 
 # Aperture photometry geometry.
@@ -351,13 +372,18 @@ REFERENCE_ANNULUS_IMPACT_WARNING_MAG = 0.02
 REFERENCE_ANNULUS_IMPACT_INVALID_MAG = 0.05
 TARGET_ANNULUS_IMPACT_WARNING_MAG = 0.05
 TARGET_ANNULUS_IMPACT_INVALID_MAG = 0.10
+# A single-image target may mask isolated bright annulus islands only after an
+# explicit user confirmation.  At least roughly two thirds of the ring must
+# remain, keeping the background estimate supported by hundreds of pixels for
+# the normal SeePhot ringset while also covering crowded single-image fields.
+SINGLE_ANNULUS_MASK_MIN_REMAINING_FRACTION = 0.65
+SINGLE_ANNULUS_MASK_DILATION_PX = 2
 
 MAX_REFERENCE_FRAME_CANDIDATES = 31
 
 # Plot defaults.
 PLOT_RUNNING_MEAN_FRACTION = 0.08
 MIN_PLOT_RUNNING_MEAN_WINDOW = 5
-SHOW_PLOT_BINNING_CONTROLS = False
 
 # Calibration quality filtering.
 # Reject frames whose comparison-star zero-point scatter is a strong robust
@@ -366,6 +392,27 @@ SHOW_PLOT_BINNING_CONTROLS = False
 # This keeps the threshold adaptive for both clean and noisy sessions.
 ZERO_POINT_SCATTER_OUTLIER_SIGMA = 8.0
 MIN_ZERO_POINT_SCATTER_FILTER_FRAMES = 12
+
+# Fast series-level guard against broad, spatially limited obstructions.  The
+# target annulus background and comparison-star annulus backgrounds already
+# exist after aperture photometry, so this adds no FITS reads or measurements.
+SERIES_LOCAL_BACKGROUND_MIN_FRAMES = 12
+SERIES_LOCAL_BACKGROUND_MIN_COMPS = 3
+SERIES_LOCAL_BACKGROUND_WARNING_FRACTION = 0.10
+SERIES_LOCAL_BACKGROUND_INVALID_FRACTION = 0.20
+SERIES_LOCAL_BACKGROUND_WARNING_SIGMA = 5.0
+SERIES_LOCAL_BACKGROUND_INVALID_SIGMA = 8.0
+SERIES_LOCAL_BACKGROUND_SIGMA_FLOOR_FRACTION = 0.005
+SERIES_LOCAL_BACKGROUND_METHOD_ID = "target-comp-background-ratio-v1"
+
+# Reject only isolated, physically implausible one-frame target impulses.  The
+# two bracketing measurements must agree, so sustained or monotonic changes
+# are not treated as artifacts.
+SERIES_TEMPORAL_SPIKE_MIN_MAG = 1.00
+SERIES_TEMPORAL_SPIKE_MIN_SIGMA = 8.0
+SERIES_TEMPORAL_SPIKE_MAX_NEIGHBOR_DELTA_MAG = 0.20
+SERIES_TEMPORAL_SPIKE_MAX_GAP_FACTOR = 3.0
+SERIES_TEMPORAL_SPIKE_METHOD_ID = "bracketed-single-frame-calibrated-mag-v1"
 
 # FITS WCS keywords that must not survive into registered work frames before
 # a fresh plate-solve run. Registration changes the pixel grid, so inherited
@@ -416,9 +463,11 @@ ensure_importable_module("PyQt6")
 ensure_importable_module("astropy")
 ensure_importable_module("numpy")
 ensure_importable_module("matplotlib")
+ensure_importable_module("pyvo")
 
 import astropy.units as u  # noqa: E402
 import numpy as np  # noqa: E402
+import pyvo  # noqa: E402
 from astropy.coordinates import SkyCoord  # noqa: E402
 from astropy.io import fits  # noqa: E402
 from astropy.io.fits.verify import VerifyWarning  # noqa: E402
@@ -477,6 +526,16 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QVBoxLayout,
     QWidget,
 )
+
+# These are required SeePhot components.  The script directory was added above
+# because Siril's embedded interpreter need not start there.
+import SeePhot_CFA as cfa_stack_app  # noqa: E402
+import sp_mod_analyze as analyze_tools  # noqa: E402
+import sp_mod_auto as automatic_tools  # noqa: E402
+import sp_mod_batch as batch_tools  # noqa: E402
+import sp_mod_binning as measurement_binning  # noqa: E402
+import sp_mod_linearity as linearity_tools  # noqa: E402
+import sp_mod_profiling as profiling_tools  # noqa: E402
 
 
 def configure_app_theme(app: QApplication) -> None:
@@ -926,6 +985,9 @@ class ApertureMeasurement:
     annulus_delta_inst_mag: float = float("nan")
     annulus_rejected_pixel_count: int = 0
     annulus_rejected_pixel_fraction: float = 0.0
+    annulus_masked: bool = False
+    annulus_masked_pixel_count: int = 0
+    annulus_masked_pixel_fraction: float = 0.0
     flux_error: float = float("nan")
     snr: float = float("nan")
     inst_mag_error: float | None = None
@@ -940,6 +1002,17 @@ class ApertureMeasurement:
     image_source: str = ""
     aavso_filter: str = ""
     quality_status: str = ""
+
+
+@dataclass(frozen=True)
+class SingleAnnulusMaskCandidate:
+    """One safe automatic exclusion mask for a single target annulus."""
+
+    exclusion_mask: np.ndarray
+    island_count: int
+    masked_pixel_count: int
+    masked_pixel_fraction: float
+    remaining_pixel_fraction: float
 
 
 @dataclass(frozen=True)
@@ -1095,6 +1168,28 @@ class CalibrationWriteStats:
 
 
 @dataclass(frozen=True)
+class SeriesLocalBackgroundAssessment:
+    """Summary of the target-to-comparison background-ratio quality guard."""
+
+    method: str
+    eligible_count: int
+    warning_count: int
+    invalid_count: int
+    baseline_ratio: float | None
+    robust_sigma: float | None
+
+
+@dataclass(frozen=True)
+class SeriesTemporalSpikeAssessment:
+    """Summary of the bracketed one-frame target impulse guard."""
+
+    method: str
+    eligible_count: int
+    rejected_count: int
+    median_cadence_seconds: float | None
+
+
+@dataclass(frozen=True)
 class BrightLinearityAssessment:
     """Coarse live estimate of whether a target is brighter than the calibrated range."""
 
@@ -1222,7 +1317,7 @@ def scan_fits_directory(directory: Path) -> InputScan:
 
 
 def normalize_image_source(value: object) -> str:
-    """Return canonical source channel L/G from FITS header metadata."""
+    """Return canonical source channel L/G/V from FITS header metadata."""
 
     text = str(value or "").strip().upper()
     if not text:
@@ -1277,14 +1372,18 @@ def infer_image_filter_metadata(
             if not source:
                 return None
             sample_sources.add(source)
-            origin = str(header.get("SSAP", "")).strip()
+            origin = str(header.get("SPORIGIN", header.get("SSAP", ""))).strip()
             if origin:
                 origin_markers.add(origin)
         except Exception:
             continue
     if len(sample_sources) == 1:
         source = next(iter(sample_sources))
-        origin = next(iter(origin_markers)) if len(origin_markers) == 1 else ""
+        origin = (
+            next(iter(origin_markers))
+            if len(origin_markers) == 1
+            else ("MIXED_DERIVED_ORIGIN" if len(origin_markers) > 1 else "")
+        )
         return source, aavso_filter_for_image_source(source), origin
     if len(sample_sources) > 1:
         return None
@@ -1302,11 +1401,81 @@ def infer_image_filter_metadata(
                     header = fits.getheader(first_fits)
                 source = image_source_from_header(header)
                 if source:
-                    origin = str(header.get("SSAP", "")).strip()
+                    origin = str(header.get("SPORIGIN", header.get("SSAP", ""))).strip()
                     return source, aavso_filter_for_image_source(source), origin
             except Exception:
                 pass
     return None
+
+
+def frame_series_provenance(sample_files: list[Path] | tuple[Path, ...]) -> str:
+    """Classify a series without relying on its directory or file name.
+
+    Measurement binning accepts only photometry-ready L/G images that each
+    represent exactly one input exposure. Raw CFA is not a photometry input;
+    CFA stacks are rejected because NCOMBINE is greater than one.
+    """
+
+    if not sample_files:
+        return "UNVERIFIED"
+    kinds: set[str] = set()
+    for path in sample_files:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FITSFixedWarning)
+                warnings.simplefilter("ignore", VerifyWarning)
+                header = fits.getheader(path)
+        except Exception:
+            return "UNVERIFIED"
+        origin = str(header.get("SPORIGIN", "")).strip().upper()
+        image_source = image_source_from_header(header)
+        try:
+            ncombine = int(header.get("NCOMBINE", 0))
+        except (TypeError, ValueError):
+            ncombine = 0
+        if image_source not in BINNING_IMAGE_SOURCES:
+            kinds.add("UNVERIFIED")
+        elif origin == "CFA_STACK" or ncombine != 1:
+            kinds.add("DERIVED_FITS")
+        else:
+            kinds.add("SINGLE_FRAME_LG_SERIES")
+    return next(iter(kinds)) if len(kinds) == 1 else "UNVERIFIED"
+
+
+def uniform_stack_image_count(sample_files: list[Path] | tuple[Path, ...]) -> int | None:
+    """Return the common original-image count of one CFA stack, if known."""
+
+    counts: set[int] = set()
+    for path in sample_files:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FITSFixedWarning)
+                warnings.simplefilter("ignore", VerifyWarning)
+                header = fits.getheader(path)
+            count = int(header.get("NCOMBINE", 0))
+        except (OSError, TypeError, ValueError):
+            return None
+        if count <= 1:
+            return None
+        counts.add(count)
+    return next(iter(counts)) if len(counts) == 1 else None
+
+
+def input_series_fingerprint(paths: list[Path] | tuple[Path, ...]) -> str:
+    """Return a stable fingerprint of the selected FITS input series.
+
+    The fingerprint records each input's name, byte size and nanosecond mtime.
+    It is intentionally cheap enough for a full Seestar series and is checked
+    before a later binning run; a changed source requires fresh photometry.
+    """
+
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        stat_result = path.stat()
+        digest.update(
+            f"{path.name}\x1f{stat_result.st_size}\x1f{stat_result.st_mtime_ns}\n".encode("utf-8")
+        )
+    return digest.hexdigest()
 
 
 def read_float_header_value(header: fits.Header, keys: tuple[str, ...], label: str) -> float:
@@ -1321,15 +1490,52 @@ def read_float_header_value(header: fits.Header, keys: tuple[str, ...], label: s
     raise KeyError(f"Missing FITS header value for {label}: tried {', '.join(keys)}")
 
 
+def read_plate_solve_center_deg(header: fits.Header) -> tuple[float, float]:
+    """Return the approximate image center in decimal degrees.
+
+    AstroDrive/OSL headers store ``RA`` in decimal hours while also supplying
+    the same telescope position as ``RA-TEL`` in decimal degrees.  Recognize
+    that relationship explicitly; otherwise retain SeePhot's established
+    interpretation of numeric ``RA``/``DEC`` values as decimal degrees.
+    """
+
+    ra_value = read_float_header_value(header, ("RA", "OBJCTRA"), "right ascension")
+    dec_value = read_float_header_value(header, ("DEC", "OBJCTDEC"), "declination")
+
+    if "RA-TEL" in header and "DEC-TEL" in header:
+        try:
+            telescope_ra_deg = float(header["RA-TEL"])
+            telescope_dec_deg = float(header["DEC-TEL"])
+        except (TypeError, ValueError):
+            pass
+        else:
+            ra_from_hours_deg = (ra_value * 15.0) % 360.0
+            ra_difference_deg = (
+                (telescope_ra_deg - ra_from_hours_deg + 180.0) % 360.0
+            ) - 180.0
+            if (
+                0.0 <= ra_value <= 24.0
+                and 0.0 <= telescope_ra_deg < 360.0
+                and -90.0 <= telescope_dec_deg <= 90.0
+                and math.isclose(ra_difference_deg, 0.0, abs_tol=1e-4)
+                and math.isclose(telescope_dec_deg, dec_value, abs_tol=1e-4)
+            ):
+                return telescope_ra_deg, telescope_dec_deg
+
+    return ra_value, dec_value
+
+
 def read_plate_solve_hints(path: Path) -> PlateSolveHints:
     """Read plate solving hints from a Seestar FITS header."""
 
     with fits.open(path) as hdul:
         header = hdul[0].header
 
+    ra_deg, dec_deg = read_plate_solve_center_deg(header)
+
     return PlateSolveHints(
-        ra_deg=read_float_header_value(header, ("RA", "OBJCTRA"), "right ascension"),
-        dec_deg=read_float_header_value(header, ("DEC", "OBJCTDEC"), "declination"),
+        ra_deg=ra_deg,
+        dec_deg=dec_deg,
         focal_mm=read_float_header_value(
             header,
             ("FOCALLEN", "FOCALLENGTH", "FOCAL"),
@@ -1359,6 +1565,8 @@ def normalize_result_telescope(value: object) -> str:
     compact = re.sub(r"[^a-z0-9]+", "", text.casefold())
     if "s30pro" in compact:
         return "Seestar S30pro"
+    if "s50pro" in compact:
+        return "Seestar S50Pro"
     if "s30" in compact:
         return "Seestar S30"
     if "s50" in compact:
@@ -1373,9 +1581,14 @@ def normalize_result_sensor(value: object) -> str:
     if not text or text.casefold() in {"unknown", "n/a", "none"}:
         return ""
     compact = re.sub(r"[^a-z0-9]+", "", text.casefold())
-    for model in ("IMX585", "IMX662", "IMX462"):
+    for model, manufacturer in (
+        ("IMX585", "Sony"),
+        ("IMX662", "Sony"),
+        ("IMX462", "Sony"),
+        ("OS08B10", "OmniVision"),
+    ):
         if model.casefold() in compact:
-            return f"Sony {model}"
+            return f"{manufacturer} {model}"
     return text
 
 
@@ -1685,6 +1898,9 @@ EXTREMUM_MINIMUM_TIME_BALANCE = 0.35
 EXTREMUM_MINIMUM_PROMINENCE_BALANCE = 0.20
 EXTREMUM_MINIMUM_PROMINENCE_FLOOR = 0.01
 EXTREMUM_MINIMUM_PROMINENCE_RMS_FACTOR = 0.50
+EXTREMUM_FLANK_MEAN_MINIMUM_BLOCK_POINTS = 3
+EXTREMUM_FLANK_MEAN_MINIMUM_WEAK_SIGNIFICANCE = 1.0
+EXTREMUM_FLANK_MEAN_MINIMUM_STRONG_SIGNIFICANCE = 2.5
 EXTREMUM_SMALL_WINDOW_MAX_POINTS = 10
 EXTREMUM_SMALL_WINDOW_MAX_CADENCE_SPAN = 10.0
 EXTREMUM_CONTEXT_WIDTH_FACTOR = 1.0
@@ -1694,13 +1910,14 @@ EXTREMUM_CONTEXT_RELAXED_MIN_POINTS = 16
 EXTREMUM_CONTEXT_RELAXED_MIN_PROMINENCE_TO_SCATTER = 0.70
 EXTREMUM_VERTEX_EXTREME_MAG_TOLERANCE_FLOOR = 0.02
 EXTREMUM_VERTEX_EXTREME_ERROR_FACTOR = 1.5
-EXTREMUM_SPLINE_SMOOTHING_PER_POINT = 2.00
 EXTREMUM_SPLINE_DENSE_SAMPLES = 1200
-EXTREMUM_SPLINE_ERROR_SAMPLES = 200
-EXTREMUM_SPLINE_ERROR_RANDOM_SEED = 20260701
 EXTREMUM_SPLINE_WRONG_DIRECTION_MIN_POINTS = 20
 EXTREMUM_SPLINE_MAX_WRONG_DIRECTION_FRACTION = 0.43
 EXTREMUM_SPLINE_REQUIRED_EXTREMUM_COUNT = 1
+EXTREMUM_MAX_VERTEX_GAP_CADENCES = 8.0
+EXTREMUM_ROBUST_GCV_MIN_POINTS = 5
+EXTREMUM_ROBUST_GCV_ITERATIONS = 4
+EXTREMUM_ROBUST_GCV_HUBER_THRESHOLD = 1.5
 EXTREMUM_ASYMPTOTIC_PARABOLA_MIN_POINTS = 7
 EXTREMUM_PARABOLIC_SPLINE_MIN_POINTS = 15
 EXTREMUM_MODEL_MIN_OUTER_POINTS = 2
@@ -1794,26 +2011,6 @@ class ExtremumFitContextQuality:
 
 
 @dataclass(frozen=True)
-class ExtremumSplineFit:
-    """Automatic smoothed spline candidate for asymmetric extrema."""
-
-    parameter_count: int
-    vertex_jd: float
-    vertex_mag: float
-    vertex_jd_error: float
-    vertex_mag_error: float
-    fit_plot_jd: tuple[float, ...]
-    fit_plot_mag: tuple[float, ...]
-    rms: float
-    weighted_rms: float
-    smoothing: float
-    left_points: int
-    right_points: int
-    left_coverage: float
-    right_coverage: float
-
-
-@dataclass(frozen=True)
 class ExtremumCurveCandidate:
     """One fitted curve model considered for the final extremum result."""
 
@@ -1846,6 +2043,8 @@ class ExtremumPchipAnchor:
     mag_tolerance: float
     left_points: int
     right_points: int
+
+
 
 
 def select_extremum_fit_points(
@@ -2189,12 +2388,26 @@ def accepted_extremum_fit(
         fit_vertex_mag_error = float(vertex_mag_error)
 
     warnings_text: list[str] = []
-    inlier_count = int(np.count_nonzero(parabola.inlier_mask))
+    inlier_count = (
+        int(len(x))
+        if model_name == "robust_gcv_spline"
+        else int(np.count_nonzero(parabola.inlier_mask))
+    )
     rejected_count = int(len(x) - inlier_count)
     if rejected_count:
         warnings_text.append(f"{rejected_count} outlier(s) rejected")
     if model_name != "parabola":
         warnings_text.append(f"model={model_name}")
+    if model_metrics and model_name == "robust_gcv_spline":
+        downweighted = int(model_metrics.get("robust_downweighted_points", 0))
+        if downweighted:
+            warnings_text.append(
+                f"{downweighted} measurement(s) robustly downweighted, none removed"
+            )
+    if model_metrics and model_metrics.get("model_bootstrap_stable") is False:
+        warnings_text.append(
+            "bootstrap timing is unstable; reported uncertainty is provisional"
+        )
     extremum_type = "Maximum" if a > 0 else "Minimum"
     if fit_plot_jd is None or fit_plot_mag is None:
         fit_x_plot = np.linspace(float(np.min(x)), float(np.max(x)), 160)
@@ -2436,6 +2649,8 @@ def fit_extremum_parabola_with_current_clipping(
         vertex_jd=float(vertex_jd),
         vertex_mag=float(vertex_mag),
     )
+
+
 
 
 def _weighted_linear_curve_fit(
@@ -3029,131 +3244,191 @@ def observed_extreme_metrics(
     }
 
 
-def fit_extremum_spline_candidate(
+
+
+def _fit_robust_gcv_spline_curve(
+    x_values: object,
+    y_values: object,
+    error_values: object,
+):
+    """Fit the reviewed natural cubic GCV spline with robust reweighting."""
+
+    from scipy.interpolate import make_smoothing_spline
+
+    x = np.asarray(x_values, dtype=np.float64)
+    y = np.asarray(y_values, dtype=np.float64)
+    errors = np.asarray(error_values, dtype=np.float64)
+    if len(x) < EXTREMUM_ROBUST_GCV_MIN_POINTS or y.shape != x.shape or errors.shape != x.shape:
+        raise ValueError(
+            f"At least {EXTREMUM_ROBUST_GCV_MIN_POINTS} matching measurements are required."
+        )
+    order = np.argsort(x, kind="stable")
+    x, y, errors = x[order], y[order], errors[order]
+    if len(np.unique(x)) != len(x):
+        raise ValueError("Measurement times must be distinct.")
+    center = float(np.mean(x))
+    span = float(np.ptp(x))
+    if not np.isfinite(span) or span <= 0:
+        raise ValueError("The selected measurements have no usable time span.")
+    normalized_x = (x - center) / span
+    valid_errors = np.isfinite(errors) & (errors > 0)
+    typical_error = (
+        float(np.median(errors[valid_errors])) if np.any(valid_errors) else 1.0
+    )
+    safe_errors = np.where(valid_errors, errors, typical_error)
+    base_weights = 1.0 / np.square(safe_errors)
+    base_weights /= float(np.median(base_weights))
+    robust_weights = np.ones_like(y)
+    spline = None
+    fitted_robust_weights = None
+    residual_scale = float("nan")
+    for _iteration in range(EXTREMUM_ROBUST_GCV_ITERATIONS):
+        fitted_robust_weights = robust_weights.copy()
+        spline = make_smoothing_spline(
+            normalized_x,
+            y,
+            w=base_weights * robust_weights,
+            lam=None,
+        )
+        residuals = y - spline(normalized_x)
+        residual_center = float(np.median(residuals))
+        residual_scale = 1.4826 * float(
+            np.median(np.abs(residuals - residual_center))
+        )
+        if not residual_scale > np.finfo(np.float64).eps:
+            break
+        standardized = np.abs(residuals - residual_center) / (
+            EXTREMUM_ROBUST_GCV_HUBER_THRESHOLD * residual_scale
+        )
+        robust_weights = np.ones_like(standardized)
+        outside = standardized > 1.0
+        robust_weights[outside] = 1.0 / standardized[outside]
+    if spline is None:
+        raise ValueError("The automatic smoothing spline could not be fitted.")
+    if fitted_robust_weights is not None and not np.array_equal(
+        fitted_robust_weights,
+        robust_weights,
+    ):
+        spline = make_smoothing_spline(
+            normalized_x,
+            y,
+            w=base_weights * robust_weights,
+            lam=None,
+        )
+        residuals = y - spline(normalized_x)
+        residual_center = float(np.median(residuals))
+        residual_scale = 1.4826 * float(
+            np.median(np.abs(residuals - residual_center))
+        )
+    return spline, x, y, errors, center, span, base_weights, robust_weights, residual_scale
+
+
+def _robust_gcv_spline_extrema(spline, center: float, span: float):
+    """Return all strictly interior stationary points of a fitted GCV spline."""
+
+    from scipy.interpolate import PPoly
+
+    polynomial = PPoly.from_spline(spline)
+    roots = polynomial.derivative().roots(extrapolate=False)
+    lower = float(spline.t[spline.k])
+    upper = float(spline.t[-spline.k - 1])
+    extrema: list[tuple[float, float, float]] = []
+    for root in np.unique(roots[np.isfinite(roots)]):
+        root = float(root)
+        if not lower < root < upper:
+            continue
+        curvature = float(polynomial.derivative(2)(root))
+        if not np.isfinite(curvature) or abs(curvature) <= 1e-12:
+            continue
+        extrema.append(
+            (
+                float(center + span * root),
+                float(spline(root)),
+                curvature,
+            )
+        )
+    return tuple(extrema)
+
+
+def fit_extremum_robust_gcv_spline_candidate(
     fit_input: ExtremumFitInput,
     parabola: ExtremumParabolaFit,
-) -> ExtremumSplineFit | None:
-    """Fit a smoothed cubic spline and return the matching inner extremum."""
+) -> ExtremumCurveCandidate | None:
+    """Return the expected extremum of the automatic robust GCV spline."""
 
     try:
-        from scipy.interpolate import UnivariateSpline
-    except Exception:
+        (
+            spline,
+            x,
+            y,
+            _errors,
+            center,
+            span,
+            base_weights,
+            robust_weights,
+            residual_scale,
+        ) = _fit_robust_gcv_spline_curve(
+            fit_input.x,
+            fit_input.y,
+            fit_input.yerr,
+        )
+    except (ImportError, ValueError, np.linalg.LinAlgError):
         return None
-
-    x = fit_input.x
-    y = fit_input.y
-    if len(x) < max(7, EXTREMUM_MINIMUM_FIT_POINTS):
+    extrema = _robust_gcv_spline_extrema(spline, center, span)
+    expected_sign = 1.0 if parabola.coefficients[0] > 0 else -1.0
+    matching = [item for item in extrema if expected_sign * item[2] > 0]
+    if not matching:
         return None
-
-    inlier_mask = parabola.inlier_mask
-    inlier_x = x[inlier_mask]
-    inlier_y = y[inlier_mask]
-    sigma = parabola.sigma[inlier_mask]
-    if len(inlier_x) < max(7, EXTREMUM_MINIMUM_FIT_POINTS):
+    vertex_jd, vertex_mag, _curvature = (
+        min(matching, key=lambda item: item[1])
+        if expected_sign > 0
+        else max(matching, key=lambda item: item[1])
+    )
+    side_support = _candidate_side_support(x, vertex_jd)
+    if side_support is None:
         return None
-
-    sort_order = np.argsort(inlier_x)
-    inlier_x = inlier_x[sort_order]
-    inlier_y = inlier_y[sort_order]
-    sigma = sigma[sort_order]
-    if len(np.unique(inlier_x)) != len(inlier_x):
-        return None
-
-    x0 = float(np.mean(inlier_x))
-    centered_minutes = (inlier_x - x0) * 1440.0
-    weights = 1.0 / sigma
-    smoothing = EXTREMUM_SPLINE_SMOOTHING_PER_POINT * float(len(inlier_x))
-    try:
-        spline = UnivariateSpline(centered_minutes, inlier_y, w=weights, k=3, s=smoothing)
-    except Exception:
-        return None
-
-    dense_minutes = np.linspace(float(np.min(centered_minutes)), float(np.max(centered_minutes)), EXTREMUM_SPLINE_DENSE_SAMPLES)
-    try:
-        dense_mag = spline(dense_minutes)
-    except Exception:
-        return None
-
-    a, _b, _c = parabola.coefficients
-    extremum_type = "Maximum" if a > 0 else "Minimum"
-    if extremum_type == "Maximum":
-        dense_index = int(np.argmin(dense_mag))
-    else:
-        dense_index = int(np.argmax(dense_mag))
-    vertex_minutes = float(dense_minutes[dense_index])
-    vertex_jd = x0 + vertex_minutes / 1440.0
-    vertex_mag = float(dense_mag[dense_index])
-
-    left_x = inlier_x[inlier_x < vertex_jd]
-    right_x = inlier_x[inlier_x > vertex_jd]
-    if len(left_x) < EXTREMUM_MINIMUM_SIDE_POINTS or len(right_x) < EXTREMUM_MINIMUM_SIDE_POINTS:
-        return None
-    left_coverage = float(vertex_jd - np.min(left_x))
-    right_coverage = float(np.max(right_x) - vertex_jd)
-    selected_width = float(fit_input.xmax - fit_input.xmin)
-    minimum_side_coverage = EXTREMUM_MINIMUM_SIDE_COVERAGE_FRACTION * selected_width
-    if (
-        selected_width <= 0
-        or left_coverage < minimum_side_coverage
-        or right_coverage < minimum_side_coverage
-    ):
-        return None
-
-    residuals = inlier_y - spline(centered_minutes)
-    rms = float(np.sqrt(np.mean(residuals**2)))
-    weighted_rms = float(np.sqrt(np.average(residuals**2, weights=weights**2)))
-    monte_carlo_jd: list[float] = []
-    monte_carlo_mag: list[float] = []
-    rng = np.random.default_rng(EXTREMUM_SPLINE_ERROR_RANDOM_SEED)
-    for _sample_index in range(EXTREMUM_SPLINE_ERROR_SAMPLES):
-        try:
-            sampled_y = inlier_y + rng.normal(0.0, sigma)
-            sampled_spline = UnivariateSpline(centered_minutes, sampled_y, w=weights, k=3, s=smoothing)
-            sampled_dense_mag = sampled_spline(dense_minutes)
-        except Exception:
-            continue
-        if not np.isfinite(sampled_dense_mag).any():
-            continue
-        if extremum_type == "Maximum":
-            sampled_index = int(np.nanargmin(sampled_dense_mag))
-        else:
-            sampled_index = int(np.nanargmax(sampled_dense_mag))
-        sampled_minutes = float(dense_minutes[sampled_index])
-        sampled_jd = x0 + sampled_minutes / 1440.0
-        sampled_mag = float(sampled_dense_mag[sampled_index])
-        if np.isfinite(sampled_jd) and np.isfinite(sampled_mag):
-            monte_carlo_jd.append(float(sampled_jd))
-            monte_carlo_mag.append(sampled_mag)
-    if len(monte_carlo_jd) >= 2:
-        vertex_jd_error = float(np.std(np.array(monte_carlo_jd, dtype=np.float64), ddof=1))
-    else:
-        vertex_jd_error = float("nan")
-    if len(monte_carlo_mag) >= 2:
-        vertex_mag_error = float(np.std(np.array(monte_carlo_mag, dtype=np.float64), ddof=1))
-    else:
-        vertex_mag_error = float("nan")
-    fit_jd = tuple(float(x0 + value / 1440.0) for value in dense_minutes)
-    fit_mag = tuple(float(value) for value in dense_mag)
-    return ExtremumSplineFit(
-        parameter_count=int(len(spline.get_coeffs())),
+    left_points, right_points, left_coverage, right_coverage = side_support
+    normalized_x = (x - center) / span
+    residuals = y - spline(normalized_x)
+    combined_weights = base_weights * robust_weights
+    dense_normalized = np.linspace(
+        float((x[0] - center) / span),
+        float((x[-1] - center) / span),
+        EXTREMUM_SPLINE_DENSE_SAMPLES,
+    )
+    dense_jd = center + span * dense_normalized
+    dense_mag = spline(dense_normalized)
+    return ExtremumCurveCandidate(
+        model_name="robust_gcv_spline",
+        parameter_count=int(len(spline.c)),
         vertex_jd=float(vertex_jd),
-        vertex_mag=vertex_mag,
-        vertex_jd_error=vertex_jd_error,
-        vertex_mag_error=vertex_mag_error,
-        fit_plot_jd=fit_jd,
-        fit_plot_mag=fit_mag,
-        rms=rms,
-        weighted_rms=weighted_rms,
-        smoothing=smoothing,
-        left_points=int(len(left_x)),
-        right_points=int(len(right_x)),
+        vertex_mag=float(vertex_mag),
+        vertex_jd_error=float("nan"),
+        vertex_mag_error=float("nan"),
+        fit_plot_jd=tuple(float(value) for value in dense_jd),
+        fit_plot_mag=tuple(float(value) for value in dense_mag),
+        rms=float(np.sqrt(np.mean(residuals**2))),
+        weighted_rms=float(
+            np.sqrt(np.sum(combined_weights * residuals**2) / np.sum(combined_weights))
+        ),
+        left_points=left_points,
+        right_points=right_points,
         left_coverage=left_coverage,
         right_coverage=right_coverage,
+        metadata={
+            "smoothing_selection": "gcv",
+            "spline_center_jd": float(center),
+            "spline_time_span_days": float(span),
+            "robust_iterations": EXTREMUM_ROBUST_GCV_ITERATIONS,
+            "robust_residual_scale": float(residual_scale),
+            "robust_downweighted_points": int(np.count_nonzero(robust_weights < 0.8)),
+            "robust_weights": tuple(float(value) for value in robust_weights),
+        },
     )
 
 
 def spline_wrong_direction_metrics(
-    spline: ExtremumSplineFit,
+    spline: ExtremumCurveCandidate,
     extremum_type: str,
 ) -> dict[str, object]:
     """Return how often a spline fit moves against the expected extremum flank."""
@@ -3190,10 +3465,10 @@ def spline_wrong_direction_metrics(
 
 
 def spline_shape_metrics(
-    spline: ExtremumSplineFit,
+    spline: ExtremumCurveCandidate,
     edge_excursion_minimum: float,
 ) -> dict[str, object]:
-    """Count significant turning points while ignoring sub-noise edge hooks."""
+    """Report raw, edge-filtered, and noise-prominent turning-point counts."""
 
     fit_mag = np.array(spline.fit_plot_mag, dtype=np.float64)
     finite_mag = fit_mag[np.isfinite(fit_mag)]
@@ -3201,8 +3476,11 @@ def spline_shape_metrics(
         return {
             "spline_extremum_count": 0,
             "spline_raw_extremum_count": 0,
+            "spline_prominent_extremum_count": 0,
+            "spline_relevant_extremum_count": 0,
             "spline_ignored_edge_extremum_count": 0,
             "spline_ignored_edge_excursion_max": 0.0,
+            "spline_ignored_subnoise_extremum_count": 0,
             "spline_edge_excursion_minimum": float(edge_excursion_minimum),
             "spline_shape_epsilon": float("nan"),
         }
@@ -3218,8 +3496,11 @@ def spline_shape_metrics(
         return {
             "spline_extremum_count": 0,
             "spline_raw_extremum_count": 0,
+            "spline_prominent_extremum_count": 0,
+            "spline_relevant_extremum_count": 0,
             "spline_ignored_edge_extremum_count": 0,
             "spline_ignored_edge_excursion_max": 0.0,
+            "spline_ignored_subnoise_extremum_count": 0,
             "spline_edge_excursion_minimum": float(edge_excursion_minimum),
             "spline_shape_epsilon": epsilon,
         }
@@ -3232,6 +3513,25 @@ def spline_shape_metrics(
         )
         if previous_sign != current_sign
     ]
+    from scipy.signal import find_peaks
+
+    significant_maxima, _maxima_properties = find_peaks(
+        fit_mag,
+        prominence=float(edge_excursion_minimum),
+    )
+    significant_minima, _minima_properties = find_peaks(
+        -fit_mag,
+        prominence=float(edge_excursion_minimum),
+    )
+    significant_turning_indices = {
+        min(turning_indices, key=lambda turning: abs(turning - int(index)))
+        for index in (*significant_maxima, *significant_minima)
+    }
+    primary_turning_index = min(
+        turning_indices,
+        key=lambda index: abs(float(spline.fit_plot_jd[index]) - spline.vertex_jd),
+    )
+    relevant_turning_indices = significant_turning_indices | {primary_turning_index}
     meaningful_turning_indices = set(turning_indices)
     ignored_edge_excursions: list[float] = []
     if len(turning_indices) > 1:
@@ -3257,11 +3557,17 @@ def spline_shape_metrics(
     return {
         "spline_extremum_count": len(meaningful_turning_indices),
         "spline_raw_extremum_count": len(turning_indices),
+        "spline_prominent_extremum_count": len(significant_turning_indices),
+        "spline_relevant_extremum_count": len(relevant_turning_indices),
         "spline_ignored_edge_extremum_count": len(ignored_edge_excursions),
         "spline_ignored_edge_excursion_max": (
             max(ignored_edge_excursions)
             if ignored_edge_excursions
             else 0.0
+        ),
+        "spline_ignored_subnoise_extremum_count": max(
+            0,
+            len(turning_indices) - len(relevant_turning_indices),
         ),
         "spline_edge_excursion_minimum": float(edge_excursion_minimum),
         "spline_shape_epsilon": epsilon,
@@ -3271,8 +3577,14 @@ def spline_shape_metrics(
 def fit_extremum_pchip_anchor(
     fit_input: ExtremumFitInput,
     parabola: ExtremumParabolaFit,
+    preferred_jd: float | None = None,
 ) -> ExtremumPchipAnchor | None:
-    """Return a shape-preserving extremum anchor for candidate checks."""
+    """Return a shape-preserving extremum anchor for candidate checks.
+
+    ``preferred_jd`` is an independently found nightly candidate, when one is
+    available. It prevents a raw PCHIP wiggle at an isolated noisy point from
+    replacing the selected event.
+    """
 
     try:
         from scipy.interpolate import PchipInterpolator
@@ -3332,11 +3644,16 @@ def fit_extremum_pchip_anchor(
                 turning_candidates.append(index)
         previous_sign = current_sign
     if turning_candidates:
+        target_jd = (
+            float(preferred_jd)
+            if preferred_jd is not None and np.isfinite(preferred_jd)
+            else float(parabola.vertex_jd)
+        )
         dense_index = min(
             turning_candidates,
             key=lambda index: abs(
                 float(x0 + float(dense_minutes[index]) / 1440.0)
-                - parabola.vertex_jd
+                - target_jd
             ),
         )
     elif extremum_type == "Maximum":
@@ -3434,28 +3751,6 @@ def _parabola_curve_candidate(
     )
 
 
-def _smoothing_spline_curve_candidate(
-    spline: ExtremumSplineFit,
-) -> ExtremumCurveCandidate:
-    """Expose the legacy smoothed cubic spline as a fallback candidate."""
-
-    return ExtremumCurveCandidate(
-        model_name="smoothing_spline",
-        parameter_count=int(spline.parameter_count),
-        vertex_jd=float(spline.vertex_jd),
-        vertex_mag=float(spline.vertex_mag),
-        vertex_jd_error=float(spline.vertex_jd_error),
-        vertex_mag_error=float(spline.vertex_mag_error),
-        fit_plot_jd=spline.fit_plot_jd,
-        fit_plot_mag=spline.fit_plot_mag,
-        rms=float(spline.rms),
-        weighted_rms=float(spline.weighted_rms),
-        left_points=int(spline.left_points),
-        right_points=int(spline.right_points),
-        left_coverage=float(spline.left_coverage),
-        right_coverage=float(spline.right_coverage),
-        metadata={"smoothing": float(spline.smoothing)},
-    )
 
 
 def _bootstrap_weighted_linear_solution(
@@ -3674,35 +3969,25 @@ def _bootstrap_refit_extremum_candidate(
         if piecewise is None:
             return None
         return float(x0 + piecewise[0] / 1440.0), float(piecewise[1])
-    if candidate.model_name == "smoothing_spline":
+    if candidate.model_name == "robust_gcv_spline":
         try:
-            from scipy.interpolate import UnivariateSpline
-
-            centered_minutes = (x_values - x0) * 1440.0
-            spline = UnivariateSpline(
-                centered_minutes,
-                sample_values,
-                w=1.0 / sigma_values,
-                k=3,
-                s=float(candidate.metadata["smoothing"]),
+            spline, fitted_x, _y, _errors, center, span, *_rest = (
+                _fit_robust_gcv_spline_curve(x_values, sample_values, sigma_values)
             )
-            dense_minutes = np.linspace(
-                float(np.min(centered_minutes)),
-                float(np.max(centered_minutes)),
-                EXTREMUM_SPLINE_DENSE_SAMPLES,
-            )
-            dense_mag = spline(dense_minutes)
+            extrema = _robust_gcv_spline_extrema(spline, center, span)
         except Exception:
             return None
-        dense_index = (
-            int(np.argmin(dense_mag))
+        matching = [item for item in extrema if expected_sign * item[2] > 0]
+        if not matching:
+            return None
+        selected = (
+            min(matching, key=lambda item: item[1])
             if expected_sign > 0
-            else int(np.argmax(dense_mag))
+            else max(matching, key=lambda item: item[1])
         )
-        return (
-            float(x0 + float(dense_minutes[dense_index]) / 1440.0),
-            float(dense_mag[dense_index]),
-        )
+        if not float(fitted_x[0]) < selected[0] < float(fitted_x[-1]):
+            return None
+        return float(selected[0]), float(selected[1])
     return None
 
 
@@ -3713,11 +3998,24 @@ def estimate_extremum_candidate_bootstrap(
 ) -> dict[str, object]:
     """Estimate extremum accuracy by deterministic full-refit bootstrap."""
 
-    inlier_mask = np.asarray(parabola.inlier_mask, dtype=bool)
+    inlier_mask = (
+        np.ones(len(fit_input.x), dtype=bool)
+        if candidate.model_name == "robust_gcv_spline"
+        else np.asarray(parabola.inlier_mask, dtype=bool)
+    )
     inlier_x = np.asarray(fit_input.x[inlier_mask], dtype=np.float64)
     inlier_y = np.asarray(fit_input.y[inlier_mask], dtype=np.float64)
-    sigma = np.asarray(parabola.sigma[inlier_mask], dtype=np.float64)
     inlier_yerr = np.asarray(fit_input.yerr[inlier_mask], dtype=np.float64)
+    if candidate.model_name == "robust_gcv_spline":
+        valid_errors = np.isfinite(inlier_yerr) & (inlier_yerr > 0)
+        typical_error = (
+            float(np.median(inlier_yerr[valid_errors]))
+            if np.any(valid_errors)
+            else 1.0
+        )
+        sigma = np.where(valid_errors, inlier_yerr, typical_error)
+    else:
+        sigma = np.asarray(parabola.sigma[inlier_mask], dtype=np.float64)
     sort_order = np.argsort(inlier_x)
     inlier_x = inlier_x[sort_order]
     inlier_y = inlier_y[sort_order]
@@ -3735,17 +4033,30 @@ def estimate_extremum_candidate_bootstrap(
     )
     reduced_chi_square = float("nan")
     if has_reported_errors:
-        reduced_chi_square = float(
-            np.sum((residuals / sigma) ** 2) / degrees_of_freedom
-        )
-        noise_multiplier = max(
-            1.0,
-            float(np.sqrt(reduced_chi_square))
-            if np.isfinite(reduced_chi_square) and reduced_chi_square > 0
-            else 1.0,
-        )
-        noise_sigma = sigma * noise_multiplier
-        noise_method = "reported_errors_scaled_by_reduced_chi_square"
+        if candidate.model_name == "robust_gcv_spline":
+            residual_scale = float(
+                candidate.metadata.get("robust_residual_scale", float("nan"))
+            )
+            residual_floor = (
+                residual_scale
+                if np.isfinite(residual_scale) and residual_scale > 0
+                else 0.0
+            )
+            noise_sigma = np.maximum(sigma, residual_floor)
+            noise_multiplier = float(np.median(noise_sigma / sigma))
+            noise_method = "reported_errors_with_robust_residual_floor"
+        else:
+            reduced_chi_square = float(
+                np.sum((residuals / sigma) ** 2) / degrees_of_freedom
+            )
+            noise_multiplier = max(
+                1.0,
+                float(np.sqrt(reduced_chi_square))
+                if np.isfinite(reduced_chi_square) and reduced_chi_square > 0
+                else 1.0,
+            )
+            noise_sigma = sigma * noise_multiplier
+            noise_method = "reported_errors_scaled_by_reduced_chi_square"
     else:
         centered_residuals = residuals - float(np.median(residuals))
         residual_rms = float(np.sqrt(np.mean(centered_residuals**2)))
@@ -3770,7 +4081,7 @@ def estimate_extremum_candidate_bootstrap(
         EXTREMUM_MINIMUM_SIDE_COVERAGE_FRACTION * selected_width
     )
     for _sample_index in range(EXTREMUM_MODEL_BOOTSTRAP_SAMPLES):
-        sampled_y = model_values + rng.normal(0.0, noise_sigma)
+        sampled_y = model_values + expected_sign * rng.normal(0.0, noise_sigma)
         refitted = _bootstrap_refit_extremum_candidate(
             candidate,
             inlier_x,
@@ -3843,6 +4154,7 @@ def estimate_extremum_candidate_bootstrap(
         "bootstrap_noise_multiplier": noise_multiplier,
         "bootstrap_noise_sigma_median": float(np.median(noise_sigma)),
         "bootstrap_reduced_chi_square": reduced_chi_square,
+        "bootstrap_input_points": int(len(inlier_x)),
     }
 
 
@@ -3886,19 +4198,21 @@ def fit_extremum_curve_candidates(
         else:
             candidates.append(candidate)
 
-    spline = fit_extremum_spline_candidate(fit_input, parabola)
-    if spline is None:
+    robust_spline = fit_extremum_robust_gcv_spline_candidate(fit_input, parabola)
+    if robust_spline is None:
         availability.append(
             {
-                "model": "smoothing_spline",
+                "model": "robust_gcv_spline",
                 "accepted": False,
                 "decision": "unavailable",
-                "reason": "smoothed spline unavailable or unsupported",
+                "reason": "automatic robust GCV spline unavailable or unsupported",
             }
         )
     else:
-        candidates.append(_smoothing_spline_curve_candidate(spline))
+        candidates.append(robust_spline)
     return tuple(candidates), tuple(availability)
+
+
 
 
 def _extremum_candidate_information_score(
@@ -4028,6 +4342,25 @@ def validate_extremum_candidate(
         and candidate.left_coverage >= minimum_side_coverage
         and candidate.right_coverage >= minimum_side_coverage
     )
+    sorted_x = np.unique(np.sort(np.asarray(fit_input.x, dtype=np.float64)))
+    positive_cadence = np.diff(sorted_x)
+    positive_cadence = positive_cadence[positive_cadence > 0]
+    median_cadence = (
+        float(np.median(positive_cadence)) if len(positive_cadence) else 0.0
+    )
+    insertion_index = int(np.searchsorted(sorted_x, candidate.vertex_jd))
+    if 0 < insertion_index < len(sorted_x) and median_cadence > 0:
+        vertex_gap = float(
+            sorted_x[insertion_index] - sorted_x[insertion_index - 1]
+        )
+        vertex_gap_cadences = vertex_gap / median_cadence
+    else:
+        vertex_gap = float("nan")
+        vertex_gap_cadences = float("inf")
+    vertex_gap_ok = bool(
+        np.isfinite(vertex_gap_cadences)
+        and vertex_gap_cadences <= EXTREMUM_MAX_VERTEX_GAP_CADENCES
+    )
     valid_shape_errors = parabola.sigma[
         parabola.inlier_mask
         & np.isfinite(parabola.sigma)
@@ -4046,7 +4379,7 @@ def validate_extremum_candidate(
     shape = spline_shape_metrics(candidate, edge_excursion_minimum)
     direction = spline_wrong_direction_metrics(candidate, extremum_type)
     single_extremum = bool(
-        int(shape["spline_extremum_count"])
+        int(shape["spline_relevant_extremum_count"])
         == EXTREMUM_SPLINE_REQUIRED_EXTREMUM_COUNT
     )
     direction_ok = bool(
@@ -4059,6 +4392,13 @@ def validate_extremum_candidate(
         and np.isfinite(anchor_time_tolerance)
         and anchor_time_delta <= anchor_time_tolerance
     )
+    anchor_validation = "required"
+    if candidate.model_name == "robust_gcv_spline":
+        # The selected spline is itself the form model.  A noisy local PCHIP
+        # remains useful diagnostics, but must not veto a single, well-supported
+        # spline extremum merely because its vertex is slightly displaced.
+        anchor_time_ok = True
+        anchor_validation = "diagnostic_only"
     anchor_mag_ok = bool(
         np.isfinite(anchor_mag_delta)
         and np.isfinite(anchor_mag_tolerance)
@@ -4068,6 +4408,7 @@ def validate_extremum_candidate(
         vertex_in_range
         and magnitude_in_range
         and side_support_ok
+        and vertex_gap_ok
         and single_extremum
         and direction_ok
         and anchor_time_ok
@@ -4080,8 +4421,10 @@ def validate_extremum_candidate(
         reasons.append("vertex magnitude outside measured range")
     if not side_support_ok:
         reasons.append("insufficient flank support")
+    if not vertex_gap_ok:
+        reasons.append("extremum lies in an unobserved time gap")
     if not single_extremum:
-        reasons.append("not exactly one significant extremum")
+        reasons.append("not exactly one significant interior extremum")
     if not direction_ok:
         reasons.append("wrong-direction flank structure")
     if not anchor_time_ok:
@@ -4123,9 +4466,14 @@ def validate_extremum_candidate(
         "anchor_mag_delta": anchor_mag_delta,
         "anchor_mag_tolerance": anchor_mag_tolerance,
         "anchor_mag_ok": anchor_mag_ok,
+        "anchor_validation": anchor_validation,
         "vertex_in_range": vertex_in_range,
         "magnitude_in_range": magnitude_in_range,
         "side_support_ok": side_support_ok,
+        "vertex_gap": vertex_gap,
+        "vertex_gap_cadences": vertex_gap_cadences,
+        "maximum_vertex_gap_cadences": EXTREMUM_MAX_VERTEX_GAP_CADENCES,
+        "vertex_gap_ok": vertex_gap_ok,
         "single_extremum": single_extremum,
         "direction_ok": direction_ok,
         **shape,
@@ -4138,6 +4486,8 @@ def select_extremum_candidate(
     fit_input: ExtremumFitInput,
     parabola: ExtremumParabolaFit,
     quality: ExtremumFitQualityMetrics,
+    preferred_anchor_jd: float | None = None,
+    required_model_name: str | None = None,
 ) -> tuple[
     ExtremumCurveCandidate | None,
     tuple[dict[str, object], ...],
@@ -4145,12 +4495,56 @@ def select_extremum_candidate(
 ]:
     """Validate all fitted models uniformly, then select the best valid one."""
 
-    anchor = fit_extremum_pchip_anchor(fit_input, parabola)
-    candidates, unavailable_checks = fit_extremum_curve_candidates(
+    anchor = fit_extremum_pchip_anchor(
         fit_input,
         parabola,
-        quality,
+        preferred_jd=preferred_anchor_jd,
     )
+    if required_model_name is None:
+        candidates, unavailable_checks = fit_extremum_curve_candidates(
+            fit_input,
+            parabola,
+            quality,
+        )
+    elif required_model_name in {
+        "parabola",
+        "asymptotic_parabola",
+        "parabolic_spline",
+        "robust_gcv_spline",
+    }:
+        required_fitters = {
+            "parabola": lambda: _parabola_curve_candidate(
+                fit_input, parabola, quality
+            ),
+            "asymptotic_parabola": lambda: (
+                fit_extremum_asymptotic_parabola_candidate(fit_input, parabola)
+            ),
+            "parabolic_spline": lambda: (
+                fit_extremum_parabolic_spline_candidate(fit_input, parabola)
+            ),
+            "robust_gcv_spline": lambda: (
+                fit_extremum_robust_gcv_spline_candidate(fit_input, parabola)
+            ),
+        }
+        required_candidate = required_fitters[required_model_name]()
+        candidates = (() if required_candidate is None else (required_candidate,))
+        unavailable_checks = (
+            (
+                {
+                    "model": required_model_name,
+                    "accepted": False,
+                    "decision": "unavailable",
+                    "reason": (
+                        f"requested model {required_model_name} unavailable or "
+                        "insufficiently supported"
+                    ),
+                },
+            )
+            if required_candidate is None
+            else ()
+        )
+    else:
+        raise ValueError(f"unsupported required extremum model: {required_model_name}")
     checks: list[dict[str, object]] = []
     valid: list[
         tuple[float, int, int, ExtremumCurveCandidate, dict[str, object]]
@@ -4187,15 +4581,26 @@ def select_extremum_candidate(
                 timing_accuracy * 86400.0
             )
             selection_eligible = bool(
-                bootstrap.get("bootstrap_stable")
-                and np.isfinite(timing_accuracy)
-                and timing_accuracy >= 0
+                required_model_name is not None
+                or (
+                    bootstrap.get("bootstrap_stable")
+                    and np.isfinite(timing_accuracy)
+                    and timing_accuracy >= 0
+                )
             )
             check["selection_eligible"] = selection_eligible
+            check["manual_model_bootstrap_warning"] = bool(
+                required_model_name is not None
+                and not bootstrap.get("bootstrap_stable")
+            )
             if selection_eligible:
                 valid.append(
                     (
-                        max(timing_accuracy, EXTREMUM_MODEL_SELECTION_EPSILON),
+                        (
+                            max(timing_accuracy, EXTREMUM_MODEL_SELECTION_EPSILON)
+                            if np.isfinite(timing_accuracy)
+                            else float("inf")
+                        ),
                         candidate.parameter_count,
                         order,
                         candidate,
@@ -4215,24 +4620,56 @@ def select_extremum_candidate(
         best_timing_error * EXTREMUM_MODEL_BOOTSTRAP_EQUIVALENCE_RATIO,
         best_timing_error + EXTREMUM_MODEL_SELECTION_EPSILON,
     )
-    equivalent = [item for item in valid if item[0] <= equivalent_limit]
-    (
-        selected_timing_error,
-        _parameter_count,
-        _order,
-        selected,
-        selected_check,
-    ) = min(
-        equivalent,
-        key=lambda item: (item[1], item[0], item[2]),
+    preferred_gcv = next(
+        (
+            item
+            for item in valid
+            if required_model_name is None
+            and item[3].model_name == "robust_gcv_spline"
+        ),
+        None,
     )
+    if preferred_gcv is not None:
+        (
+            selected_timing_error,
+            _parameter_count,
+            _order,
+            selected,
+            selected_check,
+        ) = preferred_gcv
+        automatic_selection_metric = "preferred_stable_robust_gcv_spline"
+    else:
+        equivalent = [item for item in valid if item[0] <= equivalent_limit]
+        (
+            selected_timing_error,
+            _parameter_count,
+            _order,
+            selected,
+            selected_check,
+        ) = min(
+            equivalent,
+            key=lambda item: (item[1], item[0], item[2]),
+        )
+        automatic_selection_metric = "bootstrap_timing_accuracy"
     for check in checks:
-        check["selection_metric"] = "bootstrap_timing_accuracy"
+        check["selection_metric"] = (
+            "manual_model"
+            if required_model_name is not None
+            else automatic_selection_metric
+        )
         check["best_bootstrap_timing_accuracy"] = best_timing_error
         check["bootstrap_equivalence_limit"] = equivalent_limit
         if check is selected_check:
             check["decision"] = "selected"
-            if selected_timing_error <= best_timing_error:
+            if required_model_name is not None:
+                check["reason"] = (
+                    "requested model passed geometry checks; bootstrap timing is unstable"
+                    if check.get("manual_model_bootstrap_warning")
+                    else "requested model passed geometry and stability checks"
+                )
+            elif preferred_gcv is not None:
+                check["reason"] = "preferred stable robust GCV spline"
+            elif selected_timing_error <= best_timing_error:
                 check["reason"] = "smallest stable bootstrap timing accuracy"
             else:
                 check["reason"] = (
@@ -4242,8 +4679,12 @@ def select_extremum_candidate(
         elif check.get("selection_eligible"):
             check["decision"] = "not_selected"
             check["reason"] = (
-                "valid but outside the selected bootstrap timing-accuracy "
-                "rule"
+                "valid but stable robust GCV spline is preferred"
+                if preferred_gcv is not None
+                else (
+                    "valid but outside the selected bootstrap timing-accuracy "
+                    "rule"
+                )
             )
     return selected, tuple(checks), anchor
 
@@ -4333,12 +4774,96 @@ def measure_extremum_support_quality(
     )
 
 
+def measure_extremum_flank_mean_evidence(
+    fit_input: ExtremumFitInput,
+    parabola: ExtremumParabolaFit,
+    reference_jd: float,
+) -> dict[str, object]:
+    """Measure a weak extremum from averaged inner and outer flank blocks."""
+
+    x = np.asarray(fit_input.x, dtype=np.float64)
+    y = np.asarray(fit_input.y, dtype=np.float64)
+    inlier_mask = np.asarray(parabola.inlier_mask, dtype=bool)
+    direction = 1.0 if float(parabola.coefficients[0]) > 0 else -1.0
+
+    side_results: dict[str, object] = {}
+    significance_values: list[float] = []
+    supported = True
+    for side, side_mask in (
+        ("left", inlier_mask & (x < reference_jd)),
+        ("right", inlier_mask & (x > reference_jd)),
+    ):
+        side_indices = np.flatnonzero(side_mask)
+        side_indices = side_indices[
+            np.argsort(np.abs(x[side_indices] - reference_jd), kind="stable")
+        ]
+        block_points = int(len(side_indices) // 2)
+        side_results[f"flank_mean_{side}_points"] = int(len(side_indices))
+        side_results[f"flank_mean_{side}_block_points"] = block_points
+        if block_points < EXTREMUM_FLANK_MEAN_MINIMUM_BLOCK_POINTS:
+            supported = False
+            side_results[f"flank_mean_{side}_excursion"] = float("nan")
+            side_results[f"flank_mean_{side}_standard_error"] = float("nan")
+            side_results[f"flank_mean_{side}_significance"] = float("nan")
+            continue
+
+        inner_values = y[side_indices[:block_points]]
+        outer_values = y[side_indices[-block_points:]]
+        signed_excursion = direction * float(
+            np.mean(outer_values) - np.mean(inner_values)
+        )
+        standard_error = float(
+            np.hypot(
+                np.std(inner_values, ddof=1) / np.sqrt(block_points),
+                np.std(outer_values, ddof=1) / np.sqrt(block_points),
+            )
+        )
+        if standard_error > np.finfo(np.float64).eps:
+            significance = signed_excursion / standard_error
+        elif signed_excursion > 0:
+            significance = float("inf")
+        else:
+            significance = 0.0
+        side_results[f"flank_mean_{side}_excursion"] = signed_excursion
+        side_results[f"flank_mean_{side}_standard_error"] = standard_error
+        side_results[f"flank_mean_{side}_significance"] = float(significance)
+        significance_values.append(float(significance))
+        supported = supported and signed_excursion > 0
+
+    if len(significance_values) != 2:
+        supported = False
+    else:
+        supported = bool(
+            supported
+            and min(significance_values)
+            >= EXTREMUM_FLANK_MEAN_MINIMUM_WEAK_SIGNIFICANCE
+            and max(significance_values)
+            >= EXTREMUM_FLANK_MEAN_MINIMUM_STRONG_SIGNIFICANCE
+        )
+    side_results.update(
+        {
+            "flank_mean_minimum_block_points": (
+                EXTREMUM_FLANK_MEAN_MINIMUM_BLOCK_POINTS
+            ),
+            "flank_mean_minimum_weak_significance": (
+                EXTREMUM_FLANK_MEAN_MINIMUM_WEAK_SIGNIFICANCE
+            ),
+            "flank_mean_minimum_strong_significance": (
+                EXTREMUM_FLANK_MEAN_MINIMUM_STRONG_SIGNIFICANCE
+            ),
+            "flank_mean_support": supported,
+        }
+    )
+    return side_results
+
+
 def assess_extremum_support(
     jd_values: object,
     mag_values: object,
     mag_errors: object,
     xmin: float,
     xmax: float,
+    preferred_reference_jd: float | None = None,
 ) -> ExtremumSupportAssessment:
     """Reject unsupported selections without choosing or preferring a model."""
 
@@ -4412,8 +4937,24 @@ def assess_extremum_support(
             parabola=parabola,
         )
 
-    anchor = fit_extremum_pchip_anchor(fit_input, parabola)
-    if anchor is not None and xmin <= anchor.anchor_jd <= xmax:
+    anchor = fit_extremum_pchip_anchor(
+        fit_input,
+        parabola,
+        preferred_jd=preferred_reference_jd,
+    )
+    if (
+        preferred_reference_jd is not None
+        and np.isfinite(preferred_reference_jd)
+        and xmin <= preferred_reference_jd <= xmax
+    ):
+        reference_jd = float(preferred_reference_jd)
+        centered_reference = reference_jd - parabola.x0
+        a, b, c = parabola.coefficients
+        reference_mag = float(
+            a * centered_reference**2 + b * centered_reference + c
+        )
+        reference_source = "night_candidate"
+    elif anchor is not None and xmin <= anchor.anchor_jd <= xmax:
         reference_jd = float(anchor.anchor_jd)
         reference_mag = float(anchor.anchor_mag)
         reference_source = "pchip_local_extremum"
@@ -4482,6 +5023,12 @@ def assess_extremum_support(
         "minimum_prominence": quality.minimum_prominence,
         "prominence_balance": quality.prominence_balance,
     }
+    flank_mean_evidence = measure_extremum_flank_mean_evidence(
+        fit_input,
+        parabola,
+        reference_jd,
+    )
+    metrics.update(flank_mean_evidence)
     if (
         len(quality.left_x) < EXTREMUM_MINIMUM_SIDE_POINTS
         or len(quality.right_x) < EXTREMUM_MINIMUM_SIDE_POINTS
@@ -4539,10 +5086,19 @@ def assess_extremum_support(
             anchor=anchor,
             show_attempt=True,
         )
-    if (
+    edge_prominence_supported = bool(
         min(quality.left_prominence, quality.right_prominence)
-        < 0.98 * quality.minimum_prominence
-    ):
+        >= 0.98 * quality.minimum_prominence
+    )
+    mean_prominence_supported = bool(
+        flank_mean_evidence["flank_mean_support"]
+    )
+    metrics["prominence_support_method"] = (
+        "edge_amplitude"
+        if edge_prominence_supported
+        else "flank_block_means" if mean_prominence_supported else "none"
+    )
+    if not edge_prominence_supported and not mean_prominence_supported:
         return rejected(
             "Extremum too weak. Include both flanks clearly.",
             (
@@ -4692,6 +5248,8 @@ def calculate_extremum_fit(
     mag_errors: object,
     xmin: float,
     xmax: float,
+    preferred_reference_jd: float | None = None,
+    required_model_name: str | None = None,
 ) -> ExtremumFitCalculation:
     """Run extremum support assessment, model fitting, and model selection."""
 
@@ -4701,6 +5259,7 @@ def calculate_extremum_fit(
         mag_errors,
         xmin,
         xmax,
+        preferred_reference_jd=preferred_reference_jd,
     )
     if not support.accepted:
         return rejected_extremum_fit(
@@ -4726,6 +5285,8 @@ def calculate_extremum_fit(
         support.fit_input,
         parabola,
         quality,
+        preferred_anchor_jd=preferred_reference_jd,
+        required_model_name=required_model_name,
     )
     if selected is None:
         has_valid_curve = any(
@@ -4751,9 +5312,14 @@ def calculate_extremum_fit(
         return rejected_extremum_fit(
             support.fit_input,
             (
-                "No curve model yields a stable extremum time for this selection."
-                if has_valid_curve
-                else "No curve model yields a plausible extremum for this selection."
+                f"The selected curve model ({required_model_name}) does not yield "
+                "one plausible extremum for this selection."
+                if required_model_name is not None
+                else (
+                    "No curve model yields a stable extremum time for this selection."
+                    if has_valid_curve
+                    else "No curve model yields a plausible extremum for this selection."
+                )
             ),
             (
                 "no model with stable bootstrap timing accuracy"
@@ -4772,18 +5338,29 @@ def calculate_extremum_fit(
         for check in model_checks
         if check.get("decision") != "unavailable"
     )
+    selection_method = (
+        "manual_model"
+        if required_model_name is not None
+        else (
+            "preferred_stable_robust_gcv_spline"
+            if selected.model_name == "robust_gcv_spline"
+            else "minimum_stable_bootstrap_timing_accuracy"
+        )
+    )
     result_metadata: dict[str, object] = {
         "fit_model_candidates": candidate_names,
         "fit_model_parameter_count": selected.parameter_count,
-        "fit_model_selection": "minimum_stable_bootstrap_timing_accuracy",
+        "fit_model_selection": selection_method,
+        "fit_required_model": required_model_name or "",
         "fit_model_bootstrap_samples": EXTREMUM_MODEL_BOOTSTRAP_SAMPLES,
         "fit_model_bootstrap_equivalence_ratio": (
             EXTREMUM_MODEL_BOOTSTRAP_EQUIVALENCE_RATIO
         ),
         "fit_coefficients": selected.metadata.get(
             "linear_coefficients",
-            parabola.coefficients,
+            None if selected.model_name == "robust_gcv_spline" else parabola.coefficients,
         ),
+        "fit_x0_jd": selected.metadata.get("spline_center_jd", parabola.x0),
         "fit_support_reference_jd": support.metrics["reference_jd"],
         "fit_support_reference_mag": support.metrics["reference_mag"],
         "fit_support_reference_source": support.metrics["reference_source"],
@@ -4852,7 +5429,11 @@ def calculate_extremum_fit(
             "bootstrap_success_fraction",
             float("nan"),
         ),
-        "model_selection_metric": "bootstrap_timing_accuracy",
+        "model_bootstrap_stable": selected_check.get(
+            "bootstrap_stable",
+            False,
+        ),
+        "model_selection_metric": selection_method,
         **selected.metadata,
     }
     return accepted_extremum_fit(
@@ -4878,6 +5459,21 @@ def calculate_extremum_fit(
         result_model_metadata=result_metadata,
         model_checks=model_checks,
     )
+
+
+
+
+def extremum_fit_solid_plot_values(fit_jd, fit_mag, observed_jd):
+    """Hide only the solid stroke across gaps; a dashed model remains continuous."""
+    x = np.asarray(fit_jd, dtype=float)
+    solid = np.asarray(fit_mag, dtype=float).copy()
+    observed = np.asarray(observed_jd, dtype=float)
+    if len(observed) >= 2:
+        cadence = float(np.median(np.diff(observed)))
+        for left, right in zip(observed[:-1], observed[1:]):
+            if right - left > 3 * cadence:
+                solid[(x > left) & (x < right)] = np.nan
+    return solid
 
 
 def read_result_metadata_header(path: Path) -> dict[str, str]:
@@ -5126,20 +5722,15 @@ def result_instrument_defaults() -> tuple[str, dict[str, dict[str, object]], str
 
 
 def load_lightcurve_results_module() -> object:
-    """Load neutral result-folder helpers from the flat Siril script directory."""
+    """Return the required, centrally imported result-file contract."""
 
-    module_path = Path(__file__).with_name("sp_mod_results.py")
-    spec = importlib.util.spec_from_file_location("sp_mod_results", module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not create import spec for {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(spec.name, None)
-        raise
-    return module
+    return lightcurve_results
+
+
+def load_measurement_binning_module() -> object:
+    """Return the required, centrally imported binning implementation."""
+
+    return measurement_binning
 
 
 def result_row_float(row: dict[str, object], key: str) -> float | None:
@@ -5294,17 +5885,16 @@ def local_derived_export_files(
     """Return local AAVSO/BAV derivatives without any archive or DB semantics."""
 
     matches: list[Path] = []
-    aavso_path = (
-        result_csv.parent
-        / "AAVSO"
-        / (result_csv.stem.replace("_result_curve", "") + "_aavso_extended.txt")
-    )
+    results_module = load_lightcurve_results_module()
+    aavso_path_builder = getattr(results_module, "aavso_report_path", None)
+    if not callable(aavso_path_builder):
+        raise RuntimeError("Central result-file contract is unavailable.")
+    aavso_path = Path(aavso_path_builder(result_csv))
     if aavso_path.is_file() or aavso_path.is_symlink():
         matches.append(aavso_path)
 
     bav_directory = result_csv.parent / "BAV"
     if bav_directory.is_dir():
-        results_module = load_lightcurve_results_module()
         bav_files = getattr(results_module, "bav_report_files", None)
         if not callable(bav_files):
             raise RuntimeError("Could not safely identify local BAV files for this result.")
@@ -6159,7 +6749,7 @@ WHERE 1=CONTAINS(
     request = urllib.request.Request(
         APASS_DR10_TAP_URL,
         data=payload,
-        headers={"User-Agent": f"SeestarLightcurve/{SCRIPT_VERSION}"},
+        headers={"User-Agent": f"SeePhot/{SCRIPT_VERSION}"},
     )
     last_exc: Exception | None = None
     for attempt in range(1, APASS_DR10_QUERY_RETRIES + 1):
@@ -6227,7 +6817,7 @@ ORDER BY Vmag
     request = urllib.request.Request(
         UCAC4_TAP_URL,
         data=payload,
-        headers={"User-Agent": f"SeestarLightcurve/{SCRIPT_VERSION}"},
+        headers={"User-Agent": f"SeePhot/{SCRIPT_VERSION}"},
     )
     if progress is not None:
         progress(
@@ -6309,8 +6899,12 @@ def query_gaia_dr3_target_neighbors(
     min_mag = 0.0
     max_mag = 21.0
     query = f"""
-SELECT TOP 200 Source, RA_ICRS, DE_ICRS, Gmag, BPmag, RPmag,
-       Dup, IPDfmp, IPDfow
+SELECT TOP {TARGET_BLEND_GAIA_QUERY_MAX_ROWS} Source, RA_ICRS, DE_ICRS, Gmag, BPmag, RPmag,
+       Dup, IPDfmp, IPDfow,
+       DISTANCE(
+         POINT('ICRS', RA_ICRS, DE_ICRS),
+         POINT('ICRS', {ra_deg:.8f}, {dec_deg:.8f})
+       ) AS target_distance_deg
 FROM "I/355/gaiadr3"
 WHERE 1=CONTAINS(
   POINT('ICRS', RA_ICRS, DE_ICRS),
@@ -6318,7 +6912,7 @@ WHERE 1=CONTAINS(
 )
   AND Gmag IS NOT NULL
   AND Gmag BETWEEN {min_mag:.2f} AND {max_mag:.2f}
-ORDER BY Gmag
+ORDER BY target_distance_deg
 """
     payload = urllib.parse.urlencode(
         {
@@ -6332,7 +6926,7 @@ ORDER BY Gmag
     request = urllib.request.Request(
         UCAC4_TAP_URL,
         data=payload,
-        headers={"User-Agent": f"SeestarLightcurve/{SCRIPT_VERSION}"},
+        headers={"User-Agent": f"SeePhot/{SCRIPT_VERSION}"},
     )
     last_exc: Exception | None = None
     for attempt in range(1, TARGET_BLEND_VIZIER_QUERY_RETRIES + 1):
@@ -6363,6 +6957,205 @@ ORDER BY Gmag
         "Gaia DR3 target-blend query failed after "
         f"{TARGET_BLEND_VIZIER_QUERY_RETRIES} attempt(s): {last_exc}"
     ) from last_exc
+
+
+def gaia_field_query_radius_deg(frame: ReferenceFrame) -> float:
+    """Return a cone radius that encloses the complete WCS pixel footprint."""
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        with fits.open(frame.path) as hdul:
+            wcs = WCS(hdul[0].header).celestial
+    center = SkyCoord(frame.ra_deg * u.deg, frame.dec_deg * u.deg, frame="icrs")
+    corners = wcs.pixel_to_world(
+        np.asarray([0.0, frame.width - 1.0, frame.width - 1.0, 0.0]),
+        np.asarray([0.0, 0.0, frame.height - 1.0, frame.height - 1.0]),
+    )
+    radius_deg = float(np.max(center.separation(corners).deg))
+    return radius_deg * 1.000001 + 1e-9
+
+
+def build_gaia_ari_field_adql(
+    frame: ReferenceFrame,
+    min_g_mag: float,
+    max_g_mag: float,
+) -> str:
+    """Build the ARI Gaia sync query used by the linearity tool."""
+
+    radius_deg = gaia_field_query_radius_deg(frame)
+    return f"""
+SELECT
+    source_id,
+    ra,
+    dec,
+    phot_g_mean_mag,
+    phot_bp_mean_mag,
+    phot_rp_mean_mag,
+    bp_rp
+FROM {GAIA_ARI_SOURCE_TABLE}
+WHERE
+    1 = CONTAINS(
+        POINT('ICRS', ra, dec),
+        CIRCLE('ICRS', {frame.ra_deg:.10f}, {frame.dec_deg:.10f}, {radius_deg:.10f})
+    )
+    AND phot_g_mean_mag BETWEEN {min_g_mag:.6f} AND {max_g_mag:.6f}
+    AND phot_bp_mean_mag IS NOT NULL
+    AND phot_rp_mean_mag IS NOT NULL
+""".strip()
+
+
+def _gaia_ari_row_value(row: object, name: str) -> object | None:
+    value = row[name]
+    if np.ma.is_masked(value):
+        return None
+    return value
+
+
+def gaia_objects_from_ari_table(table: object) -> list[CatalogObject]:
+    """Convert the Gaia archive column contract into SeePhot catalog objects."""
+
+    required_columns = (
+        "source_id",
+        "ra",
+        "dec",
+        "phot_g_mean_mag",
+        "phot_bp_mean_mag",
+        "phot_rp_mean_mag",
+        "bp_rp",
+    )
+    column_names = tuple(getattr(table, "colnames", ()))
+    missing = [name for name in required_columns if name not in column_names]
+    if missing:
+        raise RuntimeError(f"ARI Gaia TAP response is missing column(s): {', '.join(missing)}")
+    objects: list[CatalogObject] = []
+    for row in table:
+        values = {name: _gaia_ari_row_value(row, name) for name in required_columns}
+        if any(values[name] is None for name in required_columns):
+            continue
+        source_id = str(values["source_id"])
+        objects.append(
+            CatalogObject(
+                {
+                    "id": source_id,
+                    "Name": source_id,
+                    "gaia_source_id": source_id,
+                    "catalog_source": GAIA_DR3_SOURCE_NAME,
+                    "ra": str(values["ra"]),
+                    "dec": str(values["dec"]),
+                    "gaia_g_mag": str(values["phot_g_mean_mag"]),
+                    "gaia_bp_mag": str(values["phot_bp_mean_mag"]),
+                    "gaia_rp_mag": str(values["phot_rp_mean_mag"]),
+                }
+            )
+        )
+    return objects
+
+
+def filter_and_sample_gaia_ari_table(
+    frame: ReferenceFrame,
+    table: object,
+    max_sources: int = GAIA_LINEARITY_SAMPLE_SIZE,
+) -> tuple[object, int]:
+    """Vector-filter the WCS footprint and take a bounded balanced sample."""
+
+    if max_sources < 1:
+        raise ValueError("Gaia linearity sample size must be positive.")
+    gaia_objects_from_ari_table(table[:0])
+    if len(table) == 0:
+        return table, 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        with fits.open(frame.path) as hdul:
+            wcs = WCS(hdul[0].header).celestial
+    ra = np.asarray(np.ma.filled(table["ra"], np.nan), dtype=float)
+    dec = np.asarray(np.ma.filled(table["dec"], np.nan), dtype=float)
+    g_mag = np.asarray(np.ma.filled(table["phot_g_mean_mag"], np.nan), dtype=float)
+    bp_rp = np.asarray(np.ma.filled(table["bp_rp"], np.nan), dtype=float)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        x, y = wcs.world_to_pixel_values(ra, dec)
+    valid = (
+        np.isfinite(x)
+        & np.isfinite(y)
+        & np.isfinite(g_mag)
+        & np.isfinite(bp_rp)
+        & (x >= 0.0)
+        & (x < frame.width)
+        & (y >= 0.0)
+        & (y < frame.height)
+        & (bp_rp >= GAIA_FIELD_COLOR_BIN_EDGES[0])
+        & (bp_rp <= GAIA_FIELD_COLOR_BIN_EDGES[-1])
+    )
+    inside_indices = np.flatnonzero(valid)
+    inside_count = int(inside_indices.size)
+    if inside_count <= max_sources:
+        return table[inside_indices], inside_count
+
+    x_bin = np.minimum(3, np.asarray(x[inside_indices] * 4.0 / frame.width, dtype=int))
+    y_bin = np.minimum(3, np.asarray(y[inside_indices] * 4.0 / frame.height, dtype=int))
+    magnitude_bin = np.clip(
+        np.digitize(g_mag[inside_indices], GAIA_FIELD_MAG_BIN_EDGES) - 1,
+        0,
+        len(GAIA_FIELD_MAG_BIN_EDGES) - 2,
+    )
+    color_bin = np.clip(
+        np.digitize(bp_rp[inside_indices], GAIA_FIELD_COLOR_BIN_EDGES) - 1,
+        0,
+        len(GAIA_FIELD_COLOR_BIN_EDGES) - 2,
+    )
+    stratum = (
+        ((y_bin * 4 + x_bin) * (len(GAIA_FIELD_MAG_BIN_EDGES) - 1) + magnitude_bin)
+        * (len(GAIA_FIELD_COLOR_BIN_EDGES) - 1)
+        + color_bin
+    )
+    source_ids = np.asarray(table["source_id"])[inside_indices]
+    by_stratum = np.lexsort((source_ids, stratum))
+    sorted_strata = stratum[by_stratum]
+    group_starts = np.r_[True, sorted_strata[1:] != sorted_strata[:-1]]
+    start_positions = np.maximum.accumulate(
+        np.where(group_starts, np.arange(inside_count), 0)
+    )
+    levels = np.arange(inside_count) - start_positions
+    balanced_order = np.lexsort((sorted_strata, levels))
+    selected_indices = inside_indices[by_stratum[balanced_order[:max_sources]]]
+    return table[selected_indices], inside_count
+
+
+def query_gaia_dr3_region(
+    frame: ReferenceFrame,
+    progress: Callable[[str], None] | None = None,
+    min_g_mag: float = 5.0,
+    max_g_mag: float = 18.5,
+    maxrec: int = GAIA_FIELD_MAXREC,
+) -> list[CatalogObject]:
+    """Query Gaia DR3 synchronously through ARI TAP for one solved image."""
+
+    if not min_g_mag < max_g_mag:
+        raise ValueError("Gaia magnitude limits must satisfy min_g_mag < max_g_mag.")
+    if maxrec < 1:
+        raise ValueError("Gaia TAP MAXREC must be positive.")
+    query = build_gaia_ari_field_adql(frame, min_g_mag, max_g_mag)
+    if progress is not None:
+        progress(
+            "Querying Gaia DR3 through ARI TAP sync "
+            f"(G={min_g_mag:.1f}..{max_g_mag:.1f}, MAXREC={maxrec})."
+        )
+    try:
+        service = pyvo.dal.TAPService(GAIA_ARI_TAP_URL)
+        result = service.run_sync(query, maxrec=maxrec)
+        table = result.to_table()
+    except Exception as exc:
+        raise RuntimeError(f"ARI Gaia DR3 TAP sync query failed: {exc}") from exc
+    if progress is not None:
+        progress(f"ARI Gaia DR3 query complete: {len(table)} source(s); filtering locally.")
+    selected_table, inside_count = filter_and_sample_gaia_ari_table(frame, table)
+    objects = gaia_objects_from_ari_table(selected_table)
+    if progress is not None:
+        progress(
+            f"Gaia footprint contains {inside_count} usable source(s); "
+            f"selected {len(objects)} balanced reference(s) for aperture measurement."
+        )
+    return objects
 
 
 def query_target_blend_catalog(
@@ -6396,8 +7189,55 @@ def catalog_query_error_message(catalog_source: str, exc: Exception) -> str:
     return f"{catalog_source} catalog query failed: {text}"
 
 
+def vsx_api_magnitude_parts(value: str) -> tuple[str, str, str]:
+    """Split one live-VSX magnitude into number, qualifier, and passband."""
+
+    match = re.match(r"^\s*([<>=:]?)\s*(\d+(?:\.\d*)?|\.\d+)\s*([<>=:]?)\s*(.*?)\s*$", value)
+    if match is None:
+        return value.strip(), "", ""
+    leading, magnitude, trailing, band = match.groups()
+    return magnitude, leading or trailing, band.strip()
+
+
+def parse_aavso_vsx_api_xml(payload: str) -> list[CatalogObject]:
+    """Convert direct AAVSO VSX XML to the internal VSX object shape."""
+
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError as exc:
+        raise RuntimeError(f"AAVSO VSX returned invalid XML: {exc}") from exc
+    rows: list[CatalogObject] = []
+    for element in root.findall("VSXObject"):
+        source = {child.tag: (child.text or "").strip() for child in element}
+        max_mag, max_qualifier, max_band = vsx_api_magnitude_parts(source.get("MaxMag", ""))
+        min_mag, min_qualifier, min_band = vsx_api_magnitude_parts(source.get("MinMag", ""))
+        rows.append(CatalogObject({
+            "OID": source.get("OID", ""), "Name": source.get("Name", ""),
+            "Type": source.get("VariabilityType", ""), "Period": source.get("Period", ""),
+            "Epoch": source.get("Epoch", ""), "max": max_mag, "u_max": max_qualifier,
+            "n_max": max_band, "min": min_mag, "u_min": min_qualifier,
+            "n_min": min_band, "RAJ2000": source.get("RA2000", ""),
+            "DEJ2000": source.get("Declination2000", ""),
+        }))
+    return rows
+
+
+def query_aavso_vsx_region(frame: ReferenceFrame) -> list[CatalogObject]:
+    """Query the live AAVSO VSX field API with the maximum-magnitude limit."""
+
+    radius_deg = reference_frame_search_radius_arcmin(frame) / 60.0
+    url = "https://vsx.aavso.org/index.php?" + urllib.parse.urlencode({
+        "view": "api.list", "ra": f"{frame.ra_deg:.8f}", "dec": f"{frame.dec_deg:.8f}",
+        "radius": f"{radius_deg:.8f}", "tomag": f"{DEFAULT_VSX_LIMIT_MAG:.2f}", "format": "xml",
+    })
+    request = urllib.request.Request(url, headers={"User-Agent": f"SeePhot/{SCRIPT_VERSION}"})
+    with urllib.request.urlopen(request, timeout=45) as response:
+        payload = response.read().decode("utf-8", "replace")
+    return parse_aavso_vsx_api_xml(payload)
+
+
 def query_vizier_vsx_region_tap(frame: ReferenceFrame) -> list[CatalogObject]:
-    """Query VizieR VSX via TAP for type and period metadata in the reference field."""
+    """Query the remote CDS VizieR VSX mirror via TAP."""
 
     radius_deg = reference_frame_search_radius_arcmin(frame) / 60.0
     query = f"""
@@ -6410,17 +7250,12 @@ WHERE 1=CONTAINS(
   AND max <= {DEFAULT_VSX_LIMIT_MAG:.2f}
 """
     payload = urllib.parse.urlencode(
-        {
-            "REQUEST": "doQuery",
-            "LANG": "ADQL",
-            "FORMAT": "tsv",
-            "QUERY": query,
-        }
+        {"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "tsv", "QUERY": query}
     ).encode("utf-8")
     request = urllib.request.Request(
         "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync",
         data=payload,
-        headers={"User-Agent": f"SeestarLightcurve/{SCRIPT_VERSION}"},
+        headers={"User-Agent": f"SeePhot/{SCRIPT_VERSION}"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         text = response.read().decode("utf-8", "replace")
@@ -6428,120 +7263,74 @@ WHERE 1=CONTAINS(
 
 
 def query_vizier_vsx_region_astroquery(frame: ReferenceFrame) -> list[CatalogObject]:
-    """Query VizieR VSX through astroquery as a fallback for TAP outages."""
+    """Query the remote CDS VizieR VSX mirror through Astroquery."""
 
     try:
         ensure_importable_module("astroquery")
         from astroquery.vizier import Vizier
     except Exception as exc:
         raise RuntimeError(f"astroquery.vizier is not available: {exc}") from exc
-
     radius_deg = reference_frame_search_radius_arcmin(frame) / 60.0
     center = SkyCoord(frame.ra_deg * u.deg, frame.dec_deg * u.deg, frame="icrs")
     vizier = Vizier(
         columns=[
-            "OID",
-            "Name",
-            "Type",
-            "Period",
-            "Epoch",
-            "l_max",
-            "max",
-            "u_max",
-            "n_max",
-            "f_min",
-            "l_min",
-            "min",
-            "u_min",
-            "n_min",
-            "RAJ2000",
-            "DEJ2000",
+            "OID", "Name", "Type", "Period", "Epoch", "l_max", "max", "u_max",
+            "n_max", "f_min", "l_min", "min", "u_min", "n_min", "RAJ2000", "DEJ2000",
         ],
         column_filters={"max": f"<={DEFAULT_VSX_LIMIT_MAG:.2f}"},
         row_limit=-1,
     )
-    tables = vizier.query_region(
-        center,
-        radius=radius_deg * u.deg,
-        catalog="B/vsx/vsx",
-    )
+    tables = vizier.query_region(center, radius=radius_deg * u.deg, catalog="B/vsx/vsx")
     if not tables:
         return []
-    table = tables[0]
     rows: list[CatalogObject] = []
-    for table_row in table:
+    for table_row in tables[0]:
         values: dict[str, str] = {}
-        for column in table.colnames:
+        for column in table_row.colnames:
             value = table_row[column]
-            if hasattr(value, "mask") and bool(value.mask):
-                text = ""
-            else:
-                text = str(value).strip()
-            values[column] = text
+            values[column] = "" if hasattr(value, "mask") and bool(value.mask) else str(value).strip()
         rows.append(CatalogObject(values))
     return rows
 
 
-def query_vizier_vsx_region(
+def query_vsx_region(
     frame: ReferenceFrame,
     progress: Callable[[str], None] | None = None,
 ) -> list[CatalogObject]:
-    """Query VizieR VSX with retries and an independent astroquery fallback."""
+    """Query live AAVSO VSX, then two independent remote VizieR routes."""
 
-    tap_exc: Exception | None = None
-    for attempt in range(1, VSX_QUERY_ATTEMPTS + 1):
-        try:
-            rows = query_vizier_vsx_region_tap(frame)
-            if progress is not None:
-                progress(f"VizieR VSX TAP returned {len(rows)} object(s).")
-            return rows
-        except Exception as exc:
-            tap_exc = exc
-            if progress is not None:
-                progress(
-                    "WARNING: VizieR VSX TAP request "
-                    f"{attempt}/{VSX_QUERY_ATTEMPTS} failed: {exc}"
-                )
+    methods = (
+        ("live AAVSO VSX", query_aavso_vsx_region),
+        ("remote VizieR VSX TAP", query_vizier_vsx_region_tap),
+        ("remote VizieR VSX Astroquery", query_vizier_vsx_region_astroquery),
+    )
+    errors: list[str] = []
+    received_empty_response = False
+    for source_name, method in methods:
+        for attempt in range(1, VSX_QUERY_ATTEMPTS + 1):
+            try:
+                rows = method(frame)
+                if rows:
+                    if progress is not None:
+                        progress(f"{source_name} returned {len(rows)} object(s).")
+                    return rows
+                received_empty_response = True
+                if progress is not None:
+                    progress(
+                        f"WARNING: {source_name} returned no catalog rows on request "
+                        f"{attempt}/{VSX_QUERY_ATTEMPTS}."
+                    )
+            except Exception as exc:
+                errors.append(f"{source_name}: {exc}")
+                if progress is not None:
+                    progress(
+                        f"WARNING: {source_name} request {attempt}/{VSX_QUERY_ATTEMPTS} failed: {exc}"
+                    )
             if attempt < VSX_QUERY_ATTEMPTS:
                 time.sleep(VSX_QUERY_RETRY_DELAY_SECONDS)
-
-    if progress is not None:
-        progress("Trying the independent astroquery VizieR VSX fallback.")
-
-    astroquery_exc: Exception | None = None
-    for attempt in range(1, VSX_QUERY_ATTEMPTS + 1):
-        try:
-            rows = query_vizier_vsx_region_astroquery(frame)
-            if rows:
-                if progress is not None:
-                    progress(f"Astroquery VizieR VSX fallback returned {len(rows)} object(s).")
-                return rows
-            if progress is not None:
-                next_step = (
-                    "retrying because VizieR can represent a service error as an empty result"
-                    if attempt < VSX_QUERY_ATTEMPTS
-                    else "no rows remained after the final fallback request"
-                )
-                progress(
-                    "WARNING: Astroquery VizieR VSX fallback returned no table rows "
-                    f"on request {attempt}/{VSX_QUERY_ATTEMPTS}; {next_step}."
-                )
-        except Exception as exc:
-            astroquery_exc = exc
-            if progress is not None:
-                progress(
-                    "WARNING: Astroquery VizieR VSX fallback request "
-                    f"{attempt}/{VSX_QUERY_ATTEMPTS} failed: {exc}"
-                )
-        if attempt < VSX_QUERY_ATTEMPTS:
-            time.sleep(VSX_QUERY_RETRY_DELAY_SECONDS)
-
-    if astroquery_exc is not None:
-        raise RuntimeError(
-            f"VizieR VSX TAP failed: {tap_exc}; "
-            f"astroquery fallback failed: {astroquery_exc}"
-        ) from astroquery_exc
-    return []
+    if received_empty_response:
+        return []
+    raise RuntimeError("VSX catalog unavailable after all online retries: " + "; ".join(errors))
 
 
 def query_vizier_vsx_oid(obj: CatalogObject) -> str:
@@ -6571,7 +7360,7 @@ WHERE 1=CONTAINS(
     request = urllib.request.Request(
         "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync",
         data=payload,
-        headers={"User-Agent": f"SeestarLightcurve/{SCRIPT_VERSION}"},
+        headers={"User-Agent": f"SeePhot/{SCRIPT_VERSION}"},
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         text = response.read().decode("utf-8", "replace")
@@ -6626,9 +7415,9 @@ def vizier_vsx_objects_for_table(
     reference_frame: ReferenceFrame,
     progress: Callable[[str], None] | None = None,
 ) -> list[CatalogObject]:
-    """Return VSX objects from VizieR in the same shape the table expects."""
+    """Return live AAVSO VSX objects in the shape the table expects."""
 
-    rows = query_vizier_vsx_region(reference_frame, progress)
+    rows = query_vsx_region(reference_frame, progress)
     objects: list[CatalogObject] = []
     for row in rows:
         values = dict(row.values)
@@ -7500,8 +8289,11 @@ def target_blend_policy_assessment(
     magnitude_assessment: GaiaMagnitudeSystemShadowAssessment,
     blend_assessment: GaiaBlendShadowAssessment,
     pixel_scale_arcsec: float,
+    target_catalog_mag: float | None = None,
+    warning_limit_mag: float | None = None,
+    invalid_limit_mag: float = TARGET_BLEND_ERROR_LIMIT_MAG,
 ) -> TargetBlendAssessment:
-    """Convert the summed Gaia model into the productive 0.05-mag policy."""
+    """Convert the summed Gaia model into the selected quality policy."""
 
     strongest = max(
         (
@@ -7522,6 +8314,45 @@ def target_blend_policy_assessment(
     neighbor_mag = None if neighbor is None else neighbor.gaia_magnitude_float("g")
     target_mag = magnitude_assessment.target_g_mag
 
+    if target_match.status == GAIA_TARGET_MATCH_SHADOW_NO_MATCH:
+        return TargetBlendAssessment(
+            QUALITY_STATUS_OK,
+            "OK",
+            False,
+            (
+                "Target blend assessment: INFO; no Gaia DR3 target source was "
+                "positionally associated. The Gaia blend check is skipped; "
+                "measurement remains usable."
+            ),
+            evidence_complete=False,
+        )
+
+    if (
+        target_catalog_mag is not None
+        and np.isfinite(target_catalog_mag)
+        and target_mag is not None
+        and np.isfinite(target_mag)
+        and abs(float(target_catalog_mag) - float(target_mag))
+        >= TARGET_BLEND_HISTORICAL_MAGNITUDE_MISMATCH_MAG
+    ):
+        return TargetBlendAssessment(
+            QUALITY_STATUS_OK,
+            "OK",
+            False,
+            (
+                "Target blend assessment: INFO; the historical Gaia brightness "
+                "differs strongly from the configured current target brightness. "
+                "The Gaia blend check is skipped for this potentially strongly "
+                "variable object; measurement remains usable."
+            ),
+            neighbor,
+            separation_px,
+            separation_arcsec,
+            neighbor_mag,
+            target_mag,
+            evidence_complete=False,
+        )
+
     no_neighbors = (
         target_match.status == GAIA_TARGET_MATCH_SHADOW_MATCHED
         and magnitude_assessment.status == GAIA_MAGNITUDE_SHADOW_NO_NEIGHBORS
@@ -7541,14 +8372,50 @@ def target_blend_policy_assessment(
             evidence_complete=True,
         )
 
-    evidence_complete = (
-        target_match.status == GAIA_TARGET_MATCH_SHADOW_MATCHED
-        and magnitude_assessment.status == GAIA_MAGNITUDE_SHADOW_COMPARABLE
+    quantitative_model_complete = (
+        magnitude_assessment.status == GAIA_MAGNITUDE_SHADOW_COMPARABLE
         and blend_assessment.status == GAIA_BLEND_SHADOW_MODELED
         and blend_assessment.unavailable_count == 0
         and blend_assessment.total_aperture_flux_ratio is not None
         and blend_assessment.magnitude_impact_mag is not None
     )
+    evidence_complete = (
+        target_match.status == GAIA_TARGET_MATCH_SHADOW_MATCHED
+        and quantitative_model_complete
+    )
+    if quantitative_model_complete:
+        impact = float(blend_assessment.magnitude_impact_mag)
+        summed_flux_ratio = float(blend_assessment.total_aperture_flux_ratio)
+        if impact >= invalid_limit_mag:
+            ambiguity_note = (
+                " The Gaia target association is ambiguous, but every additional "
+                "matched source is retained as a modeled neighbor; ambiguity must "
+                "not suppress a conservative contamination rejection."
+                if target_match.status == GAIA_TARGET_MATCH_SHADOW_AMBIGUOUS
+                else ""
+            )
+            return TargetBlendAssessment(
+                QUALITY_STATUS_INVALID,
+                "TARGET_BLEND_MODELED_CONTAMINATION",
+                False,
+                (
+                    "Target blend assessment: INVALID after measurement; summed "
+                    "Gaia-neighbor impact="
+                    f"{format_practical_blend_magnitude(impact)} reaches the unchanged "
+                    f"error limit {invalid_limit_mag:.2f} mag "
+                    "(summed aperture flux="
+                    f"{format_practical_blend_flux_ratio(summed_flux_ratio)})."
+                    f"{ambiguity_note}"
+                ),
+                neighbor,
+                separation_px,
+                separation_arcsec,
+                neighbor_mag,
+                target_mag,
+                summed_flux_ratio,
+                impact,
+                evidence_complete,
+            )
     if not evidence_complete:
         return TargetBlendAssessment(
             QUALITY_STATUS_WARNING,
@@ -7573,16 +8440,17 @@ def target_blend_policy_assessment(
 
     impact = float(blend_assessment.magnitude_impact_mag)
     summed_flux_ratio = float(blend_assessment.total_aperture_flux_ratio)
-    if impact >= TARGET_BLEND_ERROR_LIMIT_MAG:
+    if warning_limit_mag is not None and impact >= warning_limit_mag:
         return TargetBlendAssessment(
-            QUALITY_STATUS_INVALID,
-            "TARGET_BLEND_MODELED_CONTAMINATION",
+            QUALITY_STATUS_WARNING,
+            "TARGET_BLEND_MODELED_CONTAMINATION_WARNING",
             False,
             (
-                "Target blend assessment: INVALID after measurement; summed "
+                "Target blend assessment: WARNING after measurement; summed "
                 "Gaia-neighbor impact="
-                f"{format_practical_blend_magnitude(impact)} reaches the unchanged "
-                f"error limit {TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag "
+                f"{format_practical_blend_magnitude(impact)} reaches the "
+                f"warning limit {warning_limit_mag:.2f} mag but remains below "
+                f"the error limit {invalid_limit_mag:.2f} mag "
                 "(summed aperture flux="
                 f"{format_practical_blend_flux_ratio(summed_flux_ratio)})."
             ),
@@ -7602,8 +8470,8 @@ def target_blend_policy_assessment(
         False,
         (
             "Target blend assessment: OK; summed Gaia-neighbor "
-            f"impact={format_practical_blend_magnitude(impact)} is below the unchanged error limit "
-            f"{TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag "
+            f"impact={format_practical_blend_magnitude(impact)} is below the error limit "
+            f"{invalid_limit_mag:.2f} mag "
             "(summed aperture flux="
             f"{format_practical_blend_flux_ratio(summed_flux_ratio)})."
         ),
@@ -7623,6 +8491,8 @@ def assess_target_catalog_blend(
     frame: ReferenceFrame,
     aperture_settings: ApertureSettings,
     progress: Callable[[str], None] | None = None,
+    warning_limit_mag: float | None = None,
+    invalid_limit_mag: float = TARGET_BLEND_ERROR_LIMIT_MAG,
 ) -> TargetBlendAssessment:
     """Assess the summed Gaia-neighbor impact without skipping measurement."""
 
@@ -7674,6 +8544,9 @@ def assess_target_catalog_blend(
         magnitude_assessment,
         blend_assessment,
         pixel_scale,
+        target.magnitude_float(),
+        warning_limit_mag,
+        invalid_limit_mag,
     )
 
 
@@ -7914,6 +8787,77 @@ def select_single_field_zp_candidates(
             f"rejected {format_counter(rejected)})."
         )
     return selected
+
+
+def select_single_field_zp_candidates_with_ucac4_fallback(
+    objects: list[CatalogObject],
+    reference_frame: ReferenceFrame,
+    aperture_settings: ApertureSettings,
+    progress: Callable[[str], None] | None = None,
+    ucac4_query: Callable[
+        [ReferenceFrame, float | None, float, Callable[[str], None] | None],
+        list[CatalogObject],
+    ] | None = None,
+) -> list[CatalogObject]:
+    """Select Field-ZP references, trying UCAC4 after a weak APASS prefilter.
+
+    A full APASS cone result can still leave too few sources inside the usable
+    image area.  In Auto mode, evaluate UCAC4 with the identical field and
+    quality filters and retain the stronger of the two independent pools.
+    """
+
+    candidates = select_single_field_zp_candidates(
+        objects,
+        reference_frame,
+        aperture_settings,
+        progress,
+    )
+    minimum_independent_references = (
+        SINGLE_FIELD_ZP_MIN_USED_REFERENCES + SINGLE_FIELD_ZP_CHECK_MIN_EXTRA_REFERENCES
+    )
+    if (
+        len(candidates) >= minimum_independent_references
+        or not should_try_post_vetting_ucac4(None, objects, 0)
+    ):
+        return candidates
+
+    if progress is not None:
+        progress(
+            "APASS DR10 Field-ZP prefilter left only "
+            f"{len(candidates)} suitable reference(s); trying UCAC4."
+        )
+    query = ucac4_query or query_ucac4_region
+    try:
+        ucac4_objects = query(reference_frame, None, 99.0, progress)
+    except Exception as exc:
+        if progress is not None:
+            progress(f"WARNING: UCAC4 Field-ZP fallback failed: {exc}")
+        return candidates
+
+    ucac4_progress = (
+        (lambda message: progress(f"UCAC4 {message}"))
+        if progress is not None
+        else None
+    )
+    ucac4_candidates = select_single_field_zp_candidates(
+        ucac4_objects,
+        reference_frame,
+        aperture_settings,
+        ucac4_progress,
+    )
+    if len(ucac4_candidates) > len(candidates):
+        if progress is not None:
+            progress(
+                "Using UCAC4 Field-ZP references after prefilter: "
+                f"{len(ucac4_candidates)} vs APASS DR10 {len(candidates)}."
+            )
+        return ucac4_candidates
+    if progress is not None:
+        progress(
+            "Keeping APASS DR10 Field-ZP references after UCAC4 prefilter: "
+            f"{len(candidates)} vs UCAC4 {len(ucac4_candidates)}."
+        )
+    return candidates
 
 
 def single_field_zp_reference_quality(measurement: ApertureMeasurement) -> tuple[bool, str]:
@@ -9247,6 +10191,72 @@ def annulus_contamination_problem_from_values(
     return ""
 
 
+def single_annulus_mask_candidate(
+    cutout: np.ndarray,
+    annulus_pixels: np.ndarray,
+    background: float,
+    sigma_threshold: float = SERIES_COMP_ANNULUS_CONTAMINATION_SIGMA,
+    min_island_pixels: int = SERIES_COMP_ANNULUS_MIN_ISLAND_PIXELS,
+    dilation_px: int = SINGLE_ANNULUS_MASK_DILATION_PX,
+    min_remaining_fraction: float = SINGLE_ANNULUS_MASK_MIN_REMAINING_FRACTION,
+) -> SingleAnnulusMaskCandidate | None:
+    """Return a conservative bright-island mask, or ``None`` when unsafe.
+
+    All sufficiently large connected bright islands are included.  The dilation
+    excludes visible star wings as well as detected cores, and the shared area
+    limit prevents a crowded or structured ring from being reduced too far.
+    """
+
+    values = cutout[annulus_pixels]
+    values = values[np.isfinite(values)]
+    sigma = robust_background_sigma(values)
+    if values.size == 0 or not np.isfinite(sigma) or sigma <= 0 or not np.isfinite(background):
+        return None
+    bright = annulus_pixels & np.isfinite(cutout) & (cutout > background + sigma_threshold * sigma)
+    visited = np.zeros(bright.shape, dtype=bool)
+    islands: list[list[tuple[int, int]]] = []
+    for start_y, start_x in np.argwhere(bright):
+        if visited[start_y, start_x]:
+            continue
+        component: list[tuple[int, int]] = []
+        stack = [(int(start_y), int(start_x))]
+        visited[start_y, start_x] = True
+        while stack:
+            yy, xx = stack.pop()
+            component.append((yy, xx))
+            for ny in range(max(0, yy - 1), min(bright.shape[0], yy + 2)):
+                for nx in range(max(0, xx - 1), min(bright.shape[1], xx + 2)):
+                    if not visited[ny, nx] and bright[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+        if len(component) >= min_island_pixels:
+            islands.append(component)
+    if not islands:
+        return None
+
+    excluded = np.zeros_like(annulus_pixels, dtype=bool)
+    for island in islands:
+        for yy, xx in island:
+            y0, y1 = max(0, yy - dilation_px), min(excluded.shape[0], yy + dilation_px + 1)
+            x0, x1 = max(0, xx - dilation_px), min(excluded.shape[1], xx + dilation_px + 1)
+            excluded[y0:y1, x0:x1] = True
+    excluded &= annulus_pixels
+    annulus_count = int(np.count_nonzero(annulus_pixels))
+    masked_count = int(np.count_nonzero(excluded))
+    if annulus_count == 0 or masked_count == 0:
+        return None
+    remaining_fraction = (annulus_count - masked_count) / float(annulus_count)
+    if remaining_fraction < min_remaining_fraction:
+        return None
+    return SingleAnnulusMaskCandidate(
+        excluded,
+        len(islands),
+        masked_count,
+        masked_count / float(annulus_count),
+        remaining_fraction,
+    )
+
+
 def estimate_reference_fwhm(path: Path) -> float | None:
     """Estimate a robust stellar FWHM from the reference frame data."""
 
@@ -9928,14 +10938,275 @@ def combine_quality_note(existing: str, extra: str) -> str:
     return f"{existing}; {extra}"
 
 
+def apply_series_local_background_quality(
+    measurements: list[ApertureMeasurement],
+) -> tuple[list[ApertureMeasurement], SeriesLocalBackgroundAssessment]:
+    """Reject broad local shading from already measured annulus backgrounds.
+
+    The per-frame target background is divided by the median background of the
+    valid comparison stars.  A robust per-series baseline removes persistent
+    field gradients and target nebulosity.  Only large fractional departures
+    that are also robust statistical outliers affect quality.
+    """
+
+    by_frame: dict[int, list[tuple[int, ApertureMeasurement]]] = defaultdict(list)
+    for index, measurement in enumerate(measurements):
+        by_frame[measurement.frame_index].append((index, measurement))
+
+    samples: list[tuple[int, float, int]] = []
+    for frame_items in by_frame.values():
+        targets = [
+            (index, item)
+            for index, item in frame_items
+            if item.role == "target"
+            and item.valid
+            and np.isfinite(item.background_median)
+            and item.background_median > 0
+        ]
+        comparisons = [
+            item
+            for _index, item in frame_items
+            if item.role == "comparison"
+            and item.valid
+            and np.isfinite(item.background_median)
+            and item.background_median > 0
+        ]
+        if len(targets) != 1 or len(comparisons) < SERIES_LOCAL_BACKGROUND_MIN_COMPS:
+            continue
+        target_index, target = targets[0]
+        comparison_background = float(
+            np.median(
+                np.array(
+                    [item.background_median for item in comparisons],
+                    dtype=np.float64,
+                )
+            )
+        )
+        if not np.isfinite(comparison_background) or comparison_background <= 0:
+            continue
+        samples.append(
+            (
+                target_index,
+                float(target.background_median / comparison_background),
+                len(comparisons),
+            )
+        )
+
+    empty = SeriesLocalBackgroundAssessment(
+        method=SERIES_LOCAL_BACKGROUND_METHOD_ID,
+        eligible_count=len(samples),
+        warning_count=0,
+        invalid_count=0,
+        baseline_ratio=None,
+        robust_sigma=None,
+    )
+    if len(samples) < SERIES_LOCAL_BACKGROUND_MIN_FRAMES:
+        return measurements, empty
+
+    ratios = np.array([ratio for _index, ratio, _count in samples], dtype=np.float64)
+    baseline = float(np.median(ratios))
+    mad = float(np.median(np.abs(ratios - baseline)))
+    robust_sigma = max(
+        1.4826 * mad,
+        abs(baseline) * SERIES_LOCAL_BACKGROUND_SIGMA_FLOOR_FRACTION,
+    )
+    if not np.isfinite(baseline) or baseline <= 0 or not np.isfinite(robust_sigma):
+        return measurements, empty
+
+    assessed = list(measurements)
+    warning_count = 0
+    invalid_count = 0
+    for target_index, ratio, comparison_count in samples:
+        fractional_departure = abs(ratio / baseline - 1.0)
+        sigma_departure = abs(ratio - baseline) / robust_sigma
+        invalid = (
+            fractional_departure >= SERIES_LOCAL_BACKGROUND_INVALID_FRACTION
+            and sigma_departure >= SERIES_LOCAL_BACKGROUND_INVALID_SIGMA
+        )
+        warning = (
+            fractional_departure >= SERIES_LOCAL_BACKGROUND_WARNING_FRACTION
+            and sigma_departure >= SERIES_LOCAL_BACKGROUND_WARNING_SIGMA
+        )
+        if not invalid and not warning:
+            continue
+        target = assessed[target_index]
+        if invalid:
+            status = QUALITY_STATUS_INVALID
+            flag = "LOCAL_BACKGROUND_ANOMALY"
+            invalid_count += 1
+        else:
+            status = QUALITY_STATUS_WARNING
+            flag = "LOCAL_BACKGROUND_ANOMALY_WARNING"
+            warning_count += 1
+        note = (
+            "local target/comparison background ratio anomaly: "
+            f"ratio={ratio:.4f}, baseline={baseline:.4f}, "
+            f"departure={fractional_departure * 100.0:.1f}%, "
+            f"robust_z={sigma_departure:.1f}, comparisons={comparison_count}"
+        )
+        assessed[target_index] = replace(
+            target,
+            valid=target.valid and not invalid,
+            quality_status=status,
+            quality_flag=combine_quality_flag(target.quality_flag, flag),
+            note=combine_quality_note(target.note, note),
+        )
+
+    return assessed, SeriesLocalBackgroundAssessment(
+        method=SERIES_LOCAL_BACKGROUND_METHOD_ID,
+        eligible_count=len(samples),
+        warning_count=warning_count,
+        invalid_count=invalid_count,
+        baseline_ratio=baseline,
+        robust_sigma=robust_sigma,
+    )
+
+
+def apply_series_temporal_spike_quality(
+    measurements: list[ApertureMeasurement],
+) -> tuple[list[ApertureMeasurement], SeriesTemporalSpikeAssessment]:
+    """Reject isolated calibrated target impulses bracketed by agreeing neighbors."""
+
+    by_frame: dict[int, list[tuple[int, ApertureMeasurement]]] = defaultdict(list)
+    for index, measurement in enumerate(measurements):
+        by_frame[measurement.frame_index].append((index, measurement))
+
+    samples: list[tuple[int, int, float, float, float]] = []
+    for frame_index, frame_items in by_frame.items():
+        targets = [
+            (index, item)
+            for index, item in frame_items
+            if item.role == "target"
+            and item.valid
+            and item.inst_mag is not None
+            and item.inst_mag_error is not None
+            and np.isfinite(item.jd)
+            and np.isfinite(item.inst_mag)
+            and np.isfinite(item.inst_mag_error)
+            and item.inst_mag_error > 0
+        ]
+        comparisons = [
+            item
+            for _index, item in frame_items
+            if item.role == "comparison"
+            and item.valid
+            and item.catalog_mag is not None
+            and item.inst_mag is not None
+            and np.isfinite(item.catalog_mag)
+            and np.isfinite(item.inst_mag)
+        ]
+        if len(targets) != 1 or len(comparisons) < MIN_VALID_COMP_STARS:
+            continue
+        target_index, target = targets[0]
+        zero_points = np.array(
+            [float(item.catalog_mag) - float(item.inst_mag) for item in comparisons],
+            dtype=np.float64,
+        )
+        zero_point = float(np.median(zero_points))
+        scatter = float(np.std(zero_points, ddof=1)) if len(zero_points) > 1 else 0.0
+        zero_point_error = scatter / float(np.sqrt(len(zero_points)))
+        calibrated_error = float(
+            np.sqrt(float(target.inst_mag_error) ** 2 + zero_point_error**2)
+        )
+        calibrated_mag = float(target.inst_mag) + zero_point
+        if not np.isfinite(calibrated_mag) or not np.isfinite(calibrated_error):
+            continue
+        samples.append(
+            (target_index, frame_index, float(target.jd), calibrated_mag, calibrated_error)
+        )
+
+    samples.sort(key=lambda item: item[2])
+    deltas = [
+        later[2] - earlier[2]
+        for earlier, later in zip(samples, samples[1:])
+        if later[2] > earlier[2]
+    ]
+    median_cadence = float(np.median(np.array(deltas))) if deltas else None
+    empty = SeriesTemporalSpikeAssessment(
+        method=SERIES_TEMPORAL_SPIKE_METHOD_ID,
+        eligible_count=len(samples),
+        rejected_count=0,
+        median_cadence_seconds=(
+            None if median_cadence is None else median_cadence * 86400.0
+        ),
+    )
+    if len(samples) < 3 or median_cadence is None or median_cadence <= 0:
+        return measurements, empty
+
+    assessed = list(measurements)
+    rejected_count = 0
+    max_gap = SERIES_TEMPORAL_SPIKE_MAX_GAP_FACTOR * median_cadence
+    for previous, current, following in zip(samples, samples[1:], samples[2:]):
+        previous_gap = current[2] - previous[2]
+        following_gap = following[2] - current[2]
+        if previous_gap <= 0 or following_gap <= 0:
+            continue
+        if previous_gap > max_gap or following_gap > max_gap:
+            continue
+        neighbor_delta = abs(previous[3] - following[3])
+        if neighbor_delta > SERIES_TEMPORAL_SPIKE_MAX_NEIGHBOR_DELTA_MAG:
+            continue
+        fraction = previous_gap / (previous_gap + following_gap)
+        predicted_mag = previous[3] + fraction * (following[3] - previous[3])
+        residual = current[3] - predicted_mag
+        residual_error = float(
+            np.sqrt(
+                current[4] ** 2
+                + ((1.0 - fraction) * previous[4]) ** 2
+                + (fraction * following[4]) ** 2
+            )
+        )
+        if not np.isfinite(residual_error) or residual_error <= 0:
+            continue
+        significance = abs(residual) / residual_error
+        if (
+            abs(residual) < SERIES_TEMPORAL_SPIKE_MIN_MAG
+            or significance < SERIES_TEMPORAL_SPIKE_MIN_SIGMA
+        ):
+            continue
+        target = assessed[current[0]]
+        note = (
+            "isolated temporal target impulse: "
+            f"residual={residual:+.4f} mag, significance={significance:.1f} sigma, "
+            f"bracketing neighbor delta={neighbor_delta:.4f} mag, "
+            f"gaps={previous_gap * 86400.0:.1f}/{following_gap * 86400.0:.1f} s"
+        )
+        assessed[current[0]] = replace(
+            target,
+            valid=False,
+            quality_status=QUALITY_STATUS_INVALID,
+            quality_flag=combine_quality_flag(
+                target.quality_flag,
+                "TEMPORAL_TARGET_SPIKE",
+            ),
+            note=combine_quality_note(target.note, note),
+        )
+        rejected_count += 1
+
+    return assessed, SeriesTemporalSpikeAssessment(
+        method=SERIES_TEMPORAL_SPIKE_METHOD_ID,
+        eligible_count=len(samples),
+        rejected_count=rejected_count,
+        median_cadence_seconds=median_cadence * 86400.0,
+    )
+
+
 def apply_target_blend_assessment(
     measurement: ApertureMeasurement,
     assessment: TargetBlendAssessment,
 ) -> ApertureMeasurement:
     """Apply only the catalog-blend quality decision to a completed measurement."""
 
-    if measurement.role != "target" or assessment.status == QUALITY_STATUS_OK:
+    if measurement.role != "target":
         return measurement
+    if assessment.status == QUALITY_STATUS_OK:
+        if assessment.flag == "OK":
+            return measurement
+        return replace(
+            measurement,
+            quality_flag=combine_quality_flag(measurement.quality_flag, assessment.flag),
+            note=combine_quality_note(measurement.note, assessment.message),
+        )
     current_status = measurement_quality_status(measurement)
     if current_status == QUALITY_STATUS_INVALID:
         return replace(
@@ -10385,6 +11656,7 @@ def aperture_measurement_from_loaded_frame(
     catalog_g_minus_r: float | None = None,
     image_source: str = "",
     aavso_filter: str = "",
+    annulus_exclusion_mask: np.ndarray | None = None,
 ) -> ApertureMeasurement:
     """Measure one object in an already-loaded FITS frame."""
 
@@ -10476,6 +11748,14 @@ def aperture_measurement_from_loaded_frame(
         annulus_inner,
         annulus_outer,
     )
+    masked_pixel_count = 0
+    masked_pixel_fraction = 0.0
+    if annulus_exclusion_mask is not None:
+        if annulus_exclusion_mask.shape != bg_mask.shape:
+            raise ValueError("annulus exclusion mask does not match the photometry cutout")
+        masked_pixel_count = int(np.count_nonzero(bg_mask & annulus_exclusion_mask))
+        masked_pixel_fraction = masked_pixel_count / float(np.count_nonzero(bg_mask))
+        bg_mask &= ~annulus_exclusion_mask
     ap_values = cutout[ap_mask]
     bg_values = cutout[bg_mask]
     ap_values = ap_values[np.isfinite(ap_values)]
@@ -10588,6 +11868,16 @@ def aperture_measurement_from_loaded_frame(
         centroid_offset=centroid_offset,
         aperture_radius=aperture_radius,
     )
+    if masked_pixel_count and quality.valid:
+        quality = PhotometryQualityDecision(
+            QUALITY_STATUS_WARNING,
+            "BACKGROUND_MASKED",
+            True,
+            (
+                "bright annulus source region(s) masked after user confirmation; "
+                f"{masked_pixel_count} pixel(s) ({masked_pixel_fraction:.1%}) excluded"
+            ),
+        )
     if quality.valid:
         inst_mag = float(-2.5 * np.log10(net_flux / exptime))
     else:
@@ -10629,6 +11919,9 @@ def aperture_measurement_from_loaded_frame(
         annulus_delta_inst_mag=annulus_delta_inst_mag,
         annulus_rejected_pixel_count=annulus_rejected_count,
         annulus_rejected_pixel_fraction=annulus_rejected_fraction,
+        annulus_masked=bool(masked_pixel_count),
+        annulus_masked_pixel_count=masked_pixel_count,
+        annulus_masked_pixel_fraction=masked_pixel_fraction,
         flux_error=flux_error,
         snr=snr,
         inst_mag_error=inst_mag_error,
@@ -10738,6 +12031,7 @@ def aperture_measurements_from_loaded_frame(
     aperture_radius: float = MANUAL_APERTURE_RADIUS_PX,
     annulus_inner: float = MANUAL_ANNULUS_INNER_PX,
     annulus_outer: float = MANUAL_ANNULUS_OUTER_PX,
+    annulus_exclusion_masks: dict[str, np.ndarray] | None = None,
 ) -> list[ApertureMeasurement]:
     """Measure multiple objects from one already loaded FITS frame."""
 
@@ -10768,6 +12062,7 @@ def aperture_measurements_from_loaded_frame(
             spec.get("catalog_g_minus_r") if isinstance(spec.get("catalog_g_minus_r"), float) else None,
             str(spec.get("image_source", "")),
             str(spec.get("aavso_filter", "")),
+            None if annulus_exclusion_masks is None else annulus_exclusion_masks.get(str(spec.get("object_id", ""))),
         )
         for spec in object_specs
     ]
@@ -10780,6 +12075,7 @@ def aperture_measurements_for_frame(
     aperture_radius: float = MANUAL_APERTURE_RADIUS_PX,
     annulus_inner: float = MANUAL_ANNULUS_INNER_PX,
     annulus_outer: float = MANUAL_ANNULUS_OUTER_PX,
+    annulus_exclusion_masks: dict[str, np.ndarray] | None = None,
 ) -> list[ApertureMeasurement]:
     """Measure multiple objects from one FITS frame with a single file read."""
 
@@ -10825,10 +12121,15 @@ def aperture_measurements_for_frame(
         aperture_radius,
         annulus_inner,
         annulus_outer,
+        annulus_exclusion_masks,
     )
 
 
-def write_instrumental_photometry(path: Path, measurements: list[ApertureMeasurement]) -> None:
+def write_instrumental_photometry(
+    path: Path,
+    measurements: list[ApertureMeasurement],
+    metadata: dict[str, object] | None = None,
+) -> None:
     """Write raw instrumental photometry measurements to CSV."""
 
     fieldnames = [
@@ -10877,6 +12178,9 @@ def write_instrumental_photometry(path: Path, measurements: list[ApertureMeasure
         "annulus_delta_inst_mag",
         "annulus_rejected_pixel_count",
         "annulus_rejected_pixel_fraction",
+        "annulus_masked",
+        "annulus_masked_pixel_count",
+        "annulus_masked_pixel_fraction",
         "quality_status",
         "quality_flag",
         "valid",
@@ -10884,6 +12188,8 @@ def write_instrumental_photometry(path: Path, measurements: list[ApertureMeasure
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as fh:
+        if metadata:
+            write_result_metadata_header(fh, metadata)
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for item in measurements:
@@ -10964,6 +12270,13 @@ def write_instrumental_photometry(path: Path, measurements: list[ApertureMeasure
                     "annulus_rejected_pixel_fraction": (
                         f"{item.annulus_rejected_pixel_fraction:.10f}"
                         if np.isfinite(item.annulus_rejected_pixel_fraction)
+                        else ""
+                    ),
+                    "annulus_masked": "1" if item.annulus_masked else "0",
+                    "annulus_masked_pixel_count": item.annulus_masked_pixel_count,
+                    "annulus_masked_pixel_fraction": (
+                        f"{item.annulus_masked_pixel_fraction:.10f}"
+                        if np.isfinite(item.annulus_masked_pixel_fraction)
                         else ""
                     ),
                     "quality_status": measurement_quality_status(item),
@@ -11364,6 +12677,9 @@ def write_single_field_zp_measurement_csv(
         "target_annulus_contamination",
         "target_annulus_delta_inst_mag",
         "target_annulus_rejected_pixel_count",
+        "target_annulus_masked",
+        "target_annulus_masked_pixel_count",
+        "target_annulus_masked_pixel_fraction",
         "calibrated_mag",
         "calibrated_mag_error",
         "calibration_method",
@@ -11414,6 +12730,12 @@ def write_single_field_zp_measurement_csv(
                 "target_annulus_contamination": target.annulus_contamination,
                 "target_annulus_delta_inst_mag": format_csv_float(target.annulus_delta_inst_mag, 10),
                 "target_annulus_rejected_pixel_count": target.annulus_rejected_pixel_count,
+                "target_annulus_masked": int(target.annulus_masked),
+                "target_annulus_masked_pixel_count": target.annulus_masked_pixel_count,
+                "target_annulus_masked_pixel_fraction": format_csv_float(
+                    target.annulus_masked_pixel_fraction,
+                    10,
+                ),
                 "calibrated_mag": format_csv_float(calibrated_mag),
                 "calibrated_mag_error": format_csv_float(calibrated_error),
                 "calibration_method": SINGLE_FIELD_ZP_METHOD_ID,
@@ -11618,12 +12940,10 @@ def result_row_is_valid(row: dict[str, str]) -> bool:
 def result_csv_contains_single_field_zp_rows(result_csv: Path) -> bool:
     """Return true when a result CSV is a Single Measurement Field-ZP result."""
 
-    if result_csv.name.endswith("_single_field_zp_measurement.csv"):
-        return True
     try:
-        with result_csv.open(newline="") as handle:
-            reader = csv_data_dict_reader(handle)
-            return any(is_single_field_zp_result_row(row) for row in reader)
+        results_module = load_lightcurve_results_module()
+        result_kind = results_module.result_kind_for_csv(result_csv)
+        return result_kind == results_module.RESULT_KIND_SINGLE
     except Exception:
         return False
 
@@ -11782,7 +13102,7 @@ def write_aavso_extended_report(
             if filt not in VALID_AAVSO_FILTERS:
                 raise ValueError(
                     f"{result_csv.name}: unsupported aavso_filter {filt!r}; "
-                    "only CV and TG are supported"
+                    "only CV, TG and V are supported"
                 )
             single_field_zp = is_single_field_zp_result_row(row)
             check_name = aavso_safe_id(
@@ -12178,81 +13498,6 @@ def running_mean_window_size(point_count: int) -> int:
     return max(1, window)
 
 
-def binned_lightcurve_points(
-    jd_values: np.ndarray,
-    mag_values: np.ndarray,
-    error_values: np.ndarray,
-    mode: str,
-    bin_value: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return plot-only binned points for display overlays."""
-
-    if len(jd_values) < 2 or mode == "off" or bin_value <= 1:
-        empty = np.array([], dtype=np.float64)
-        return empty, empty, empty
-
-    groups: list[np.ndarray] = []
-    if mode == "count":
-        bin_size = int(bin_value)
-        groups = [
-            np.arange(start, min(start + bin_size, len(jd_values)), dtype=np.int64)
-            for start in range(0, len(jd_values), bin_size)
-        ]
-    elif mode == "seconds":
-        bin_width_days = float(bin_value) / (24.0 * 60.0 * 60.0)
-        if bin_width_days <= 0:
-            empty = np.array([], dtype=np.float64)
-            return empty, empty, empty
-        bin_numbers = np.floor((jd_values - jd_values[0]) / bin_width_days).astype(np.int64)
-        for bin_number in np.unique(bin_numbers):
-            groups.append(np.flatnonzero(bin_numbers == bin_number))
-    else:
-        empty = np.array([], dtype=np.float64)
-        return empty, empty, empty
-
-    binned_jd: list[float] = []
-    binned_mag: list[float] = []
-    binned_error: list[float] = []
-    for indices in groups:
-        if len(indices) < 2:
-            continue
-        group_jd = jd_values[indices]
-        group_mag = mag_values[indices]
-        group_err = error_values[indices]
-        finite_mag = np.isfinite(group_mag)
-        if not finite_mag.any():
-            continue
-        group_jd = group_jd[finite_mag]
-        group_mag = group_mag[finite_mag]
-        group_err = group_err[finite_mag]
-        finite_err = np.isfinite(group_err) & (group_err > 0)
-        if finite_err.any():
-            weights = 1.0 / np.square(group_err[finite_err])
-            mean_mag = float(np.average(group_mag[finite_err], weights=weights))
-            formal_error = float(np.sqrt(1.0 / np.sum(weights)))
-        else:
-            mean_mag = float(np.mean(group_mag))
-            formal_error = float("nan")
-        scatter_error = float("nan")
-        if len(group_mag) > 1:
-            scatter_error = float(np.std(group_mag, ddof=1) / np.sqrt(len(group_mag)))
-        if np.isfinite(formal_error) and np.isfinite(scatter_error):
-            mean_error = max(formal_error, scatter_error)
-        elif np.isfinite(formal_error):
-            mean_error = formal_error
-        else:
-            mean_error = scatter_error
-        binned_jd.append(float(np.mean(group_jd)))
-        binned_mag.append(mean_mag)
-        binned_error.append(mean_error)
-
-    return (
-        np.array(binned_jd, dtype=np.float64),
-        np.array(binned_mag, dtype=np.float64),
-        np.array(binned_error, dtype=np.float64),
-    )
-
-
 def load_light_curve_plot_data(
     result_csv: Path,
     *,
@@ -12273,15 +13518,6 @@ def load_light_curve_plot_data(
         aavso_filter = row.get("aavso_filter", "").strip()
         if image_source or aavso_filter:
             break
-    if aavso_filter not in VALID_AAVSO_FILTERS:
-        raise ValueError("Unsupported result filter.\n\nOnly CV and TG are supported.")
-    if image_source and image_source not in IMAGE_SOURCE_TO_AAVSO_FILTER:
-        raise ValueError("Unsupported image source.\n\nOnly L and G are supported.")
-    if aavso_filter and image_source:
-        filter_label = f"{aavso_filter} ({image_source})"
-    else:
-        filter_label = aavso_filter or image_source
-
     points: list[tuple[float, float, float | None, float | None]] = []
     for row in rows:
         if not include_invalid and not result_row_is_valid(row):
@@ -12308,6 +13544,14 @@ def load_light_curve_plot_data(
 
     if not points:
         raise ValueError("No plottable rows found.")
+    if aavso_filter not in VALID_AAVSO_FILTERS:
+        raise ValueError("Unsupported result filter.\n\nOnly CV, TG and V are supported.")
+    if image_source and image_source not in IMAGE_SOURCE_TO_AAVSO_FILTER:
+        raise ValueError("Unsupported image source.\n\nOnly L, G and V are supported.")
+    if aavso_filter and image_source:
+        filter_label = f"{aavso_filter} ({image_source})"
+    else:
+        filter_label = aavso_filter or image_source
     points.sort(key=lambda item: item[0])
     jd_values = np.array([item[0] for item in points], dtype=np.float64)
     mag_values = np.array([item[1] for item in points], dtype=np.float64)
@@ -12345,25 +13589,9 @@ def draw_light_curve_figure(
     source_label: str,
     *,
     show_running_mean: bool,
-    bin_mode: str,
-    bin_value: int,
     include_check: bool,
 ) -> tuple[object, str]:
     """Draw the common normal/preview light-curve figure."""
-
-    if bin_mode != "off":
-        if len(data.jd_values) < 2:
-            raise ValueError("Binning needs at least two plotted points.")
-        if bin_mode == "count" and bin_value <= 1:
-            raise ValueError("Bin size must be greater than 1.")
-        if bin_mode == "count" and bin_value > len(data.jd_values):
-            raise ValueError("Bin size is larger than the data.")
-        if bin_mode == "seconds":
-            if data.exposure_seconds is None:
-                raise ValueError("Exposure time is missing.")
-            minimum_seconds = 3.0 * data.exposure_seconds
-            if bin_value < minimum_seconds:
-                raise ValueError(f"Time bin is too short.\n\nMinimum: {minimum_seconds:.1f} s")
 
     figure.clear()
     has_check = include_check and np.isfinite(data.check_delta_values).any()
@@ -12400,35 +13628,6 @@ def draw_light_curve_figure(
         )
         legend_needed = True
 
-    bin_status_text = ""
-    if bin_mode != "off":
-        bin_jd_values, bin_mag_values, bin_error_values = binned_lightcurve_points(
-            data.jd_values,
-            data.mag_values,
-            data.error_values,
-            bin_mode,
-            bin_value,
-        )
-        if len(bin_jd_values) > 0:
-            bin_label = f"{bin_value} point(s)" if bin_mode == "count" else f"{bin_value} s"
-            binned_yerr = bin_error_values if np.isfinite(bin_error_values).any() else None
-            axis.errorbar(
-                bin_jd_values,
-                bin_mag_values,
-                yerr=binned_yerr,
-                fmt="s",
-                markersize=4,
-                color="#d55e00",
-                ecolor="#d55e00",
-                elinewidth=0.9,
-                capsize=2,
-                label=f"Binned ({bin_label})",
-                zorder=4,
-            )
-            legend_needed = True
-            bin_status_text = f" Binned overlay: {len(bin_jd_values)} bin(s)."
-        else:
-            bin_status_text = " Binned overlay: no bins with at least two points."
     if legend_needed:
         axis.legend(loc="best", fontsize=8)
 
@@ -12440,8 +13639,6 @@ def draw_light_curve_figure(
     title = target_name or "Target"
     if data.filter_label:
         title = f"{title} - {data.filter_label}"
-    if source_label:
-        title = f"{title} - {source_label}"
     axis.set_title(title)
     axis.grid(True, alpha=0.3)
     if check_axis is not None:
@@ -12458,12 +13655,50 @@ def draw_light_curve_figure(
         check_axis.grid(True, alpha=0.3)
     else:
         axis.set_xlabel("Julian Date")
+        if include_check:
+            axis.text(
+                0.99,
+                0.01,
+                "No calibrated Check Star stored in this result",
+                transform=axis.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=8,
+                color="#a65f00",
+            )
     if len(data.jd_values) > 1:
         x_min = float(np.min(data.jd_values))
         x_max = float(np.max(data.jd_values))
         x_pad = max((x_max - x_min) * 0.03, 1e-6)
         axis.set_xlim(x_min - x_pad, x_max + x_pad)
-    return axis, bin_status_text
+    return axis, ""
+
+
+def connect_siril_interface(
+    siril: object,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Connect to Siril, tolerating a connection still being released."""
+
+    attempts = SIRIL_CONNECT_ATTEMPTS
+    for attempt in range(1, attempts + 1):
+        try:
+            siril.connect()
+            return
+        except Exception as exc:
+            message = str(exc).lower()
+            transient_connection = (
+                "already connected to siril" in message
+                or (os.name == "nt" and "pipe is busy" in message)
+            )
+            if not transient_connection or attempt >= attempts:
+                raise
+            if log is not None:
+                log(
+                    "The previous Siril connection is still being released; "
+                    f"retrying ({attempt}/{attempts - 1})."
+                )
+            time.sleep(SIRIL_CONNECT_RETRY_DELAY_SECONDS)
 
 
 class PlateSolveWorker(QThread):
@@ -12507,7 +13742,7 @@ class PlateSolveWorker(QThread):
         connected = False
         attempted = 0
         try:
-            siril.connect()
+            connect_siril_interface(siril, self.emit_log)
             connected = True
             siril.cmd(f'cd "{siril_path(self.work_dir)}"')
             for index, name in enumerate(stats.failed_files, start=1):
@@ -12695,6 +13930,29 @@ class PlateSolveWorker(QThread):
             self.result = (False, f"Prepare failed: {exc}")
 
 
+def solve_image_for_analyze(path: Path, progress: Callable[[str], None]) -> tuple[object, Path]:
+    """Plate-solve an Analyze image in a disposable copy, never in the original."""
+
+    hints = read_plate_solve_hints(path)
+    workspace = tempfile.TemporaryDirectory(prefix="seephot_analyze_platesolve_")
+    work_dir = Path(workspace.name)
+    copied_path = work_dir / f"{WORK_SEQUENCE_NAME}00001.fit"
+    try:
+        shutil.copy2(path, copied_path)
+        progress(f"No WCS found; plate-solving a temporary copy of {path.name}.")
+        worker = PlateSolveWorker(work_dir, hints)
+        worker.log.connect(progress)
+        worker.run()
+        success, message = worker.result or (False, "Analyze plate solve ended without a result.")
+        progress(message)
+        if not success or read_reference_frame(copied_path, 0) is None:
+            raise RuntimeError("Automatic plate solve did not produce a usable WCS image.")
+        return workspace, copied_path
+    except Exception:
+        workspace.cleanup()
+        raise
+
+
 class LightCurveWindow(QWidget):
     """Main GUI window for the first development milestone."""
 
@@ -12737,6 +13995,7 @@ class LightCurveWindow(QWidget):
         self.filtered_catalog_objects: list[CatalogObject] = []
         self.selected_target: SelectedTarget | None = None
         self.pending_single_vsx_selection: CatalogObject | None = None
+        self.single_target_precheck_ready = False
         self.comparison_stars: list[CatalogObject] = []
         self.check_star: CatalogObject | None = None
         self.comparison_selection_failure_reason = ""
@@ -12746,10 +14005,8 @@ class LightCurveWindow(QWidget):
 
         self.target_label = QLabel("Selected target: none")
         self.photometry_target_label = QLabel("Target: none")
-        self.photometry_target_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
         self.photometry_target_label.setMaximumWidth(320)
+        self.photometry_target_label.setToolTip("Target: none")
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -12808,6 +14065,7 @@ class LightCurveWindow(QWidget):
         self.loaded_lightcurve_source_label = ""
         self.current_result_origin = "none"
         self.varstars_status = "none"
+        self.last_vsx_failure_message = ""
         self.comp_status = "none"
         self.result_status = "none"
         self.fit_status = "none"
@@ -12817,19 +14075,25 @@ class LightCurveWindow(QWidget):
         self.busy_message = ""
         self._busy_locked_buttons: dict[QWidget, bool] = {}
         self.cfa_stack_window: QWidget | None = None
-        self.cfa_stack_module: object | None = None
         self.automatic_stack_worker: QThread | None = None
         self.cfa_stack_signal_connected = False
-        self.automatic_module: object | None = None
-        self.profiling_module: object | None = None
-        self.lightcurve_results_module: object | None = None
+        self.lightcurve_results_module = lightcurve_results
         self.result_browser_dialog: QDialog | None = None
         self.bav_result_browser_dialog: QDialog | None = None
         self.batch_tab: QWidget | None = None
+        self.batch_dialog: QDialog | None = None
         self.bav_tab: QWidget | None = None
+        self.archive_tab: QWidget | None = None
+        self.ext_scopes_tab: QWidget | None = None
 
+        version_log_line = (
+            f"{datetime.now().strftime('%H:%M:%S')}  SeePhot version: {SCRIPT_VERSION}"
+        )
+        self.log_lines.append(version_log_line)
+        self.log_view.append(version_log_line)
         self._build_ui()
         self.update_mode_dependent_controls()
+        self.refresh_action_availability()
         self.append_log("Running inside Siril Python.")
         self.close_siril_display_context("startup")
         if DEFAULT_FITS_DIRECTORY is not None and DEFAULT_FITS_DIRECTORY.is_dir():
@@ -12858,33 +14122,36 @@ class LightCurveWindow(QWidget):
         input_tab = QWidget()
         input_layout = QVBoxLayout(input_tab)
 
-        cfa_stack_script = Path(__file__).with_name("SeePhot_CFA.py")
-        automatic_script = Path(__file__).with_name("sp_mod_auto.py")
-        if cfa_stack_script.exists() or automatic_script.exists():
-            cfa_group = QGroupBox("1. Prepare Seestar FITS")
-            cfa_layout = QHBoxLayout(cfa_group)
-            if cfa_stack_script.exists():
-                self.cfa_stack_button = QPushButton("CFA Channels / Stack")
-                self.cfa_stack_button.clicked.connect(
-                    lambda: self.run_busy_action(
-                        "STACK_WINDOW_OPENING",
-                        "Opening CFA Channels / Stack window.",
-                        self.open_cfa_stack_window,
-                    )
-                )
-                cfa_layout.addWidget(self.cfa_stack_button)
-                self.append_log(f"CFA stack script available: {cfa_stack_script.name}.")
-            if automatic_script.exists():
-                self.automatic_button = QPushButton("Batch Mode")
-                self.automatic_button.clicked.connect(self.open_automatic_runner)
-                cfa_layout.addWidget(self.automatic_button)
-                self.append_log(
-                    f"Optional CFA/Stack Batch module available: {automatic_script.name}."
-                )
-            cfa_layout.addStretch(1)
-            input_layout.addWidget(cfa_group)
+        prepare_actions = QWidget()
+        prepare_actions_layout = QHBoxLayout(prepare_actions)
+        prepare_actions_layout.setContentsMargins(0, 0, 0, 0)
+        prepare_actions_layout.setSpacing(8)
+        cfa_group = QGroupBox("Process single directory")
+        cfa_layout = QHBoxLayout(cfa_group)
+        self.cfa_stack_button = QPushButton("CFA Channels / Stack")
+        self.cfa_stack_button.clicked.connect(
+            lambda: self.run_busy_action(
+                "STACK_WINDOW_OPENING",
+                "Opening CFA Channels / Stack window.",
+                self.open_cfa_stack_window,
+            )
+        )
+        cfa_layout.addWidget(self.cfa_stack_button)
+        cfa_layout.addStretch(1)
+        prepare_actions_layout.addWidget(cfa_group)
+        self.append_log("Required CFA/Stack component loaded.")
+        automatic_group = QGroupBox("Process multiple directories")
+        automatic_layout = QHBoxLayout(automatic_group)
+        self.automatic_button = QPushButton("Batch Mode")
+        self.automatic_button.clicked.connect(self.open_automatic_runner)
+        automatic_layout.addWidget(self.automatic_button)
+        automatic_layout.addStretch(1)
+        prepare_actions_layout.addWidget(automatic_group)
+        self.append_log("Required CFA/Stack Batch component loaded.")
+        prepare_actions_layout.addStretch(1)
+        input_layout.addWidget(prepare_actions)
 
-        source_group = QGroupBox("2. Detect Variables")
+        source_group = QGroupBox("Detect Variables")
         self.source_group = source_group
         source_layout = QFormLayout(source_group)
         source_layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -12921,17 +14188,6 @@ class LightCurveWindow(QWidget):
         detect_layout.addWidget(self.prepare_description_label, stretch=1)
         source_layout.addRow(detect_layout)
         input_layout.addWidget(source_group)
-
-        profiling_script = Path(__file__).with_name("sp_mod_profiling.py")
-        if profiling_script.exists():
-            profiling_group = QGroupBox("Stack Profiling")
-            profiling_layout = QHBoxLayout(profiling_group)
-            self.profiling_button = QPushButton("Analyze")
-            self.profiling_button.clicked.connect(self.open_profiling_runner)
-            profiling_layout.addWidget(self.profiling_button)
-            profiling_layout.addStretch(1)
-            input_layout.insertWidget(0, profiling_group)
-            self.append_log(f"Optional Stack Profiling module available: {profiling_script.name}.")
 
         input_layout.addStretch(1)
 
@@ -13046,10 +14302,20 @@ class LightCurveWindow(QWidget):
         lightcurve_tab = QWidget()
         self.lightcurve_tab = lightcurve_tab
         lightcurve_layout = QVBoxLayout(lightcurve_tab)
+        self.lightcurve_layout = lightcurve_layout
 
-        run_lightcurve_group = QGroupBox("Run")
+        target_actions = QWidget()
+        target_actions_layout = QHBoxLayout(target_actions)
+        target_actions_layout.setContentsMargins(0, 0, 0, 0)
+        target_actions_layout.setSpacing(8)
+        self.target_actions_layout = target_actions_layout
+
+        run_lightcurve_group = QGroupBox("Single target")
+        self.target_run_group = run_lightcurve_group
         run_lightcurve_layout = QVBoxLayout(run_lightcurve_group)
         run_lightcurve_controls = QHBoxLayout()
+        self.target_run_controls = run_lightcurve_controls
+        run_lightcurve_controls.addWidget(self.photometry_target_label)
         self.run_light_curve_button = QPushButton("Create Light Curve")
         self.run_light_curve_button.setEnabled(False)
         self.run_light_curve_button.clicked.connect(
@@ -13063,9 +14329,10 @@ class LightCurveWindow(QWidget):
         run_lightcurve_controls.addWidget(self.show_compstars_button)
 
         run_lightcurve_controls.addStretch(1)
-        run_lightcurve_controls.addWidget(self.photometry_target_label)
         run_lightcurve_layout.addLayout(run_lightcurve_controls)
-        lightcurve_layout.addWidget(run_lightcurve_group)
+        target_actions_layout.addWidget(run_lightcurve_group)
+        target_actions_layout.addStretch(1)
+        lightcurve_layout.addWidget(target_actions)
 
         single_result_group = QGroupBox("Result")
         self.single_result_group = single_result_group
@@ -13096,7 +14363,34 @@ class LightCurveWindow(QWidget):
         open_lightcurve_layout.addWidget(self.open_result_vsx_button)
 
         open_lightcurve_layout.addStretch(1)
-        lightcurve_layout.addWidget(open_lightcurve_group)
+        binning_group = QGroupBox("Result Binning")
+        binning_layout = QHBoxLayout(binning_group)
+        self.binning_mode_combo = QComboBox()
+        self.binning_mode_combo.addItem("N images", "count")
+        self.binning_mode_combo.addItem("Duration", "seconds")
+        self.binning_mode_combo.setFixedWidth(COMPACT_COMBO_WIDTH)
+        binning_layout.addWidget(self.binning_mode_combo)
+        self.binning_value_spin = QSpinBox()
+        self.binning_value_spin.setRange(2, 999999)
+        self.binning_value_spin.setValue(10)
+        self.binning_value_spin.setSuffix(" images")
+        self.binning_value_spin.setFixedWidth(SHORT_EDIT_WIDTH)
+        self.binning_mode_combo.currentIndexChanged.connect(self.update_binning_controls)
+        binning_layout.addWidget(self.binning_value_spin)
+        self.create_binned_curve_button = QPushButton("Create Binned Curve")
+        self.create_binned_curve_button.setToolTip(
+            "Create a separate flux-binned result from the complete instrumental CSV. "
+            "Only an explicitly marked original-image series is eligible; bins never cross gaps."
+        )
+        self.create_binned_curve_button.clicked.connect(self.create_binned_curve)
+        binning_layout.addWidget(self.create_binned_curve_button)
+        self.use_raw_curve_button = QPushButton("Use Raw Curve")
+        self.use_raw_curve_button.setToolTip("Make the unmodified source result the active curve again.")
+        self.use_raw_curve_button.clicked.connect(self.activate_raw_curve)
+        binning_layout.addWidget(self.use_raw_curve_button)
+        self.binning_eligibility_label = QLabel("Requires a newly created original-image result.")
+        binning_layout.addWidget(self.binning_eligibility_label, 1)
+        lightcurve_layout.addWidget(binning_group)
 
         plot_lightcurve_group = QGroupBox("Plot / Fit")
         self.plot_lightcurve_group = plot_lightcurve_group
@@ -13113,45 +14407,6 @@ class LightCurveWindow(QWidget):
         )
         plot_lightcurve_controls.addWidget(self.show_running_mean_checkbox)
 
-        self.plot_binning_label = QLabel("Binning:")
-        self.plot_binning_mode_combo = QComboBox()
-        self.plot_binning_mode_combo.addItem("Off", "off")
-        self.plot_binning_mode_combo.addItem("By count", "count")
-        self.plot_binning_mode_combo.addItem("By seconds", "seconds")
-        self.plot_binning_mode_combo.setFixedWidth(COMPACT_COMBO_WIDTH)
-        self.plot_binning_mode_combo.setToolTip(
-            "Overlay binned points in the plot. Original CSV data and extremum fitting are unchanged."
-        )
-        self.plot_binning_mode_combo.currentIndexChanged.connect(self.update_plot_binning_controls)
-
-        self.plot_binning_value_spin = QSpinBox()
-        self.plot_binning_value_spin.setRange(1, 99999)
-        self.plot_binning_value_spin.setValue(5)
-        self.plot_binning_value_spin.setFixedWidth(SHORT_EDIT_WIDTH)
-        self.plot_binning_value_spin.setEnabled(False)
-        self.plot_binning_value_spin.setToolTip("Binning value: number of points or seconds, depending on mode.")
-        if SHOW_PLOT_BINNING_CONTROLS:
-            plot_lightcurve_controls.addWidget(self.plot_binning_label)
-            plot_lightcurve_controls.addWidget(self.plot_binning_mode_combo)
-            plot_lightcurve_controls.addWidget(self.plot_binning_value_spin)
-
-        plot_lightcurve_controls.addStretch(1)
-        plot_lightcurve_layout.addLayout(plot_lightcurve_controls)
-
-        fit_lightcurve_controls = QHBoxLayout()
-
-        self.fit_extremum_button = QPushButton("Fit Min/Max")
-        self.fit_extremum_button.setEnabled(False)
-        self.fit_extremum_button.setToolTip("Drag a JD range in the plot, then fit the extremum in that range.")
-        self.fit_extremum_button.clicked.connect(
-            lambda: self.run_busy_action(
-                "FIT_RUNNING",
-                "Fitting selected min/max.",
-                self.fit_selected_extremum,
-            )
-        )
-        fit_lightcurve_controls.addWidget(self.fit_extremum_button)
-
         self.trim_lightcurve_button = QPushButton("Trim to Selection")
         self.trim_lightcurve_button.setEnabled(False)
         self.trim_lightcurve_button.setToolTip(
@@ -13166,7 +14421,34 @@ class LightCurveWindow(QWidget):
                 [self.trim_lightcurve_button],
             )
         )
-        fit_lightcurve_controls.addWidget(self.trim_lightcurve_button)
+        plot_lightcurve_controls.addWidget(self.trim_lightcurve_button)
+
+        plot_lightcurve_controls.addStretch(1)
+        plot_lightcurve_layout.addLayout(plot_lightcurve_controls)
+
+        fit_lightcurve_controls = QHBoxLayout()
+
+        fit_lightcurve_controls.addWidget(QLabel("Curve model:"))
+        self.extremum_model_combo = QComboBox()
+        for model_label, model_name in EXTREMUM_MODEL_OPTIONS:
+            self.extremum_model_combo.addItem(model_label, model_name)
+        self.extremum_model_combo.setToolTip(
+            "The recommended robust cubic spline chooses its smoothing automatically. "
+            "Other entries fit exactly the selected model; no silent fallback occurs."
+        )
+        fit_lightcurve_controls.addWidget(self.extremum_model_combo)
+
+        self.fit_extremum_button = QPushButton("Fit Min/Max")
+        self.fit_extremum_button.setEnabled(False)
+        self.fit_extremum_button.setToolTip("Drag a JD range in the plot, then fit the extremum in that range.")
+        self.fit_extremum_button.clicked.connect(
+            lambda: self.run_busy_action(
+                "FIT_RUNNING",
+                "Fitting selected min/max.",
+                self.fit_selected_extremum,
+            )
+        )
+        fit_lightcurve_controls.addWidget(self.fit_extremum_button)
 
         self.clear_extremum_button = QPushButton("Clear Fit")
         self.clear_extremum_button.setEnabled(False)
@@ -13175,11 +14457,8 @@ class LightCurveWindow(QWidget):
 
         fit_lightcurve_controls.addStretch(1)
         plot_lightcurve_layout.addLayout(fit_lightcurve_controls)
-        self.current_curve_path_label = QLabel("Current curve: none")
-        self.current_curve_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.current_curve_path_label.setWordWrap(True)
-        plot_lightcurve_layout.addWidget(self.current_curve_path_label)
         lightcurve_layout.addWidget(plot_lightcurve_group)
+        lightcurve_layout.addWidget(open_lightcurve_group)
         lightcurve_layout.addStretch(1)
 
         export_tab = QWidget()
@@ -13254,7 +14533,34 @@ class LightCurveWindow(QWidget):
         global_action_row = QHBoxLayout()
         global_action_row.setContentsMargins(14, 4, 14, 4)
         global_action_row.setSpacing(8)
+
+        footer_current_status = QWidget()
+        self.footer_current_status = footer_current_status
+        footer_current_status.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        footer_current_status_layout = QVBoxLayout(footer_current_status)
+        footer_current_status_layout.setContentsMargins(0, 0, 0, 0)
+        footer_current_status_layout.setSpacing(0)
+        self.footer_current_target_label = QLabel()
+        self.footer_current_curve_label = QLabel()
+        for label in (
+            self.footer_current_target_label,
+            self.footer_current_curve_label,
+        ):
+            label.setFixedWidth(340)
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            footer_current_status_layout.addWidget(label)
+        self.update_footer_current_status_labels()
+        global_action_row.addWidget(footer_current_status)
         global_action_row.addStretch(1)
+
+        overview_button = QPushButton("Overview")
+        overview_button.clicked.connect(self.show_overview)
+        global_action_row.addWidget(overview_button)
 
         help_button = QPushButton("Help")
         help_button.clicked.connect(self.show_help)
@@ -13277,12 +14583,95 @@ class LightCurveWindow(QWidget):
 
         tabs.addTab(input_tab, "Prepare")
         tabs.addTab(varstar_tab, "Variables")
-        self.add_optional_batch_tab()
+        self.add_required_batch_runner()
         tabs.addTab(lightcurve_tab, "Photometry")
         tabs.addTab(export_tab, "Export")
         self.add_optional_qc_tab()
         self.add_optional_bav_tab()
         self.add_optional_archive_tab()
+        self.add_optional_ext_scopes_tab()
+        self.add_required_analyze_tab()
+        self.footer_current_status_tabs = tuple(
+            tab
+            for tab in (lightcurve_tab, export_tab, self.bav_tab, self.archive_tab)
+            if tab is not None
+        )
+        tabs.currentChanged.connect(self.update_footer_current_status_visibility)
+        self.update_footer_current_status_visibility()
+
+    def update_footer_current_status_visibility(self, _index: int | None = None) -> None:
+        """Show current-result details only where they are actionable."""
+
+        footer_status = getattr(self, "footer_current_status", None)
+        tabs = getattr(self, "tabs", None)
+        visible_tabs = getattr(self, "footer_current_status_tabs", ())
+        if footer_status is not None and tabs is not None:
+            footer_status.setVisible(tabs.currentWidget() in visible_tabs)
+
+    def add_required_analyze_tab(self) -> None:
+        """Add the required standalone Tools tab."""
+
+        analyze_tab = analyze_tools.create_analyze_tab(self.analyze_plugin_context())
+        if not isinstance(analyze_tab, QWidget):
+            raise RuntimeError("Required Tools component did not return a QWidget")
+        label = str(analyze_tools.PLUGIN_TAB_LABEL).strip() or "Tools"
+        self.tabs.addTab(analyze_tab, label)
+        self.append_log("Required Tools component loaded.")
+
+    def analyze_plugin_context(self) -> dict[str, object]:
+        """Return the narrow API surface for independent Analyze tools."""
+
+        return {
+            "append_log": self.append_log,
+            "read_reference_frame": read_reference_frame,
+            "solve_image_for_analyze": solve_image_for_analyze,
+            "open_profiling_runner": self.open_profiling_runner,
+            "query_gaia_dr3_region": query_gaia_dr3_region,
+            "resolve_aperture_settings": resolve_aperture_settings,
+            "aperture_measurements_for_frame": aperture_measurements_for_frame,
+        }
+
+    def add_optional_ext_scopes_tab(self) -> None:
+        """Load an optional external telescope/FITS tools tab if present."""
+
+        plugin_path = Path(__file__).with_name("sp_mod_ext_scopes.py")
+        if not plugin_path.exists():
+            return
+
+        try:
+            spec = importlib.util.spec_from_file_location("sp_mod_ext_scopes", plugin_path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("could not create import spec")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(spec.name, None)
+                raise
+            create_ext_scopes_tab = getattr(module, "create_ext_scopes_tab", None)
+            if not callable(create_ext_scopes_tab):
+                raise RuntimeError("missing create_ext_scopes_tab(context)")
+
+            ext_scopes_tab = create_ext_scopes_tab(self.ext_scopes_plugin_context())
+            if not isinstance(ext_scopes_tab, QWidget):
+                raise RuntimeError("create_ext_scopes_tab(context) did not return a QWidget")
+
+            label = str(getattr(module, "PLUGIN_TAB_LABEL", "Ext_Tools")).strip() or "Ext_Tools"
+            self.ext_scopes_tab = ext_scopes_tab
+            self.tabs.addTab(ext_scopes_tab, label)
+            version = str(getattr(module, "EXT_SCOPES_VERSION", "")).strip()
+            version_text = f" (version {version})" if version else ""
+            self.append_log(
+                f"Optional Ext_Tools module loaded: {plugin_path.name}{version_text}."
+            )
+        except Exception as exc:
+            self.append_log(f"WARNING: Optional Ext_Tools tab could not be loaded: {exc}")
+
+    def ext_scopes_plugin_context(self) -> dict[str, object]:
+        """Return the narrow API surface for external telescope/FITS tools."""
+
+        return {"append_log": self.append_log}
 
     def add_optional_qc_tab(self) -> None:
         """Load an optional QC tab from sp_mod_qc.py if present."""
@@ -13378,6 +14767,7 @@ class LightCurveWindow(QWidget):
                 raise RuntimeError("create_archive_tab(context) did not return a QWidget")
 
             label = str(getattr(module, "PLUGIN_TAB_LABEL", "Archive")).strip() or "Archive"
+            self.archive_tab = archive_tab
             self.tabs.addTab(archive_tab, label)
             version = str(getattr(module, "ARCHIVE_PLUGIN_VERSION", "")).strip()
             version_text = f" (version {version})" if version else ""
@@ -13385,40 +14775,38 @@ class LightCurveWindow(QWidget):
         except Exception as exc:
             self.append_log(f"WARNING: Optional Archive tab could not be loaded: {exc}")
 
-    def add_optional_batch_tab(self) -> None:
-        """Load an optional multi-target Batch tab if present."""
+    def add_required_batch_runner(self) -> None:
+        """Add the required multi-target runner beside the single-target action."""
 
-        plugin_path = Path(__file__).with_name("sp_mod_batch.py")
-        if not plugin_path.exists():
+        batch_tab = batch_tools.create_batch_tab(self.qc_plugin_context())
+        if not isinstance(batch_tab, QWidget):
+            raise RuntimeError("Required Batch component did not return a QWidget")
+
+        self.batch_tab = batch_tab
+        batch_dialog = QDialog(self)
+        batch_dialog.setWindowTitle("Multiple targets")
+        batch_dialog_layout = QVBoxLayout(batch_dialog)
+        batch_dialog_layout.addWidget(batch_tab)
+        batch_dialog.resize(900, 620)
+        self.batch_dialog = batch_dialog
+
+        batch_group = QGroupBox("Multiple targets")
+        batch_layout = QHBoxLayout(batch_group)
+        self.batch_run_button = QPushButton("Select targets")
+        self.batch_run_button.clicked.connect(self.open_batch_runner)
+        batch_layout.addWidget(self.batch_run_button)
+        batch_layout.addStretch(1)
+        self.target_actions_layout.insertWidget(1, batch_group)
+        self.append_log("Required Batch component loaded.")
+
+    def open_batch_runner(self) -> None:
+        """Show the multi-target photometry runner."""
+
+        if self.batch_dialog is None:
             return
-
-        try:
-            spec = importlib.util.spec_from_file_location("sp_mod_batch", plugin_path)
-            if spec is None or spec.loader is None:
-                raise RuntimeError("could not create import spec")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            try:
-                spec.loader.exec_module(module)
-            except Exception:
-                sys.modules.pop(spec.name, None)
-                raise
-            create_batch_tab = getattr(module, "create_batch_tab", None)
-            if not callable(create_batch_tab):
-                raise RuntimeError("missing create_batch_tab(context)")
-
-            batch_tab = create_batch_tab(self.qc_plugin_context())
-            if not isinstance(batch_tab, QWidget):
-                raise RuntimeError("create_batch_tab(context) did not return a QWidget")
-
-            label = str(getattr(module, "PLUGIN_TAB_LABEL", "Batch")).strip() or "Batch"
-            self.batch_tab = batch_tab
-            self.tabs.addTab(batch_tab, label)
-            version = str(getattr(module, "BATCH_PLUGIN_VERSION", "")).strip()
-            version_text = f" (version {version})" if version else ""
-            self.append_log(f"Optional Batch module loaded: {plugin_path.name}{version_text}.")
-        except Exception as exc:
-            self.append_log(f"WARNING: Optional Batch tab could not be loaded: {exc}")
+        self.batch_dialog.show()
+        self.batch_dialog.raise_()
+        self.batch_dialog.activateWindow()
 
     def qc_plugin_context(self) -> dict[str, object]:
         """Return the small API surface exposed to the optional QC module."""
@@ -13487,11 +14875,13 @@ class LightCurveWindow(QWidget):
             "set_current_lightcurve": self.set_current_lightcurve_from_plugin,
             "set_aavso_observer_code_from_bav": self.set_aavso_observer_code_from_bav,
             "open_bav_results_folder": self.open_bav_result_browser,
+            "open_linearity_dialog": linearity_tools.open_linearity_dialog,
             "get_diagnostic_result_csv": self.diagnostic_result_csv,
             "instrumental_csv_for_result_csv": self.instrumental_csv_for_result_csv,
             "frame_search_directories_for_result_csv": self.frame_search_directories_for_result_csv,
             "current_display_aperture_settings": self.current_display_aperture_settings,
             "get_current_extremum_fit": self.current_extremum_fit,
+            "get_action_availability": self.action_availability,
             "is_busy": self.is_busy,
             "begin_busy_action": self.begin_busy_action,
             "finish_busy_action": self.finish_busy_action,
@@ -13538,6 +14928,116 @@ class LightCurveWindow(QWidget):
 
     def is_busy(self) -> bool:
         return self.busy_state != BUSY_IDLE
+
+    def action_availability(self) -> dict[str, bool]:
+        """Return availability derived from the current main-window state.
+
+        This is deliberately a small public UI contract for optional modules.
+        It does not replace validation in an action handler.
+        """
+
+        busy = self.is_busy()
+        prepared_field = self.prepare_completed and self.reference_frame is not None
+        selected_vsx = self.current_vsx_selection() is not None
+        selected_target = self.selected_target is not None
+        has_compstars = bool(self.comparison_stars)
+        has_result = self.current_export_lightcurve() is not None
+        result_metadata: dict[str, str] = {}
+        current_result = self.current_export_lightcurve()
+        if current_result is not None:
+            try:
+                result_metadata = read_result_metadata_header(current_result[0])
+            except OSError:
+                pass
+        can_create_binned_curve = (
+            has_result
+            and result_metadata.get("SOURCE_PROVENANCE") == "SINGLE_FRAME_LG_SERIES"
+            and result_metadata.get("BINNING_ALLOWED") == "1"
+        )
+        can_use_raw_curve = (
+            has_result
+            and result_metadata.get("SOURCE_PROVENANCE") == "BINNED_RESULT"
+            and bool(result_metadata.get("BIN_SOURCE_RESULT", "").strip())
+        )
+        aavso_folder = self.current_aavso_export_directory()
+        has_aavso_folder = aavso_folder is not None and aavso_folder.is_dir()
+        can_plot_lightcurve = has_result and self.current_result_origin != "single"
+        has_selected_plot_range = (
+            can_plot_lightcurve
+            and self.lightcurve_axis is not None
+            and self.lightcurve_selected_range is not None
+        )
+        lightcurve_mode = self.photometry_mode == MODE_LIGHTCURVE
+        can_run_photometry = (
+            not busy
+            and prepared_field
+            and selected_target
+            and (lightcurve_mode or self.single_target_precheck_ready)
+        )
+        return {
+            "prepare": not busy and self.current_scan is not None,
+            "select_target": not busy and prepared_field and selected_vsx,
+            "open_selected_vsx": not busy and prepared_field and selected_vsx,
+            "create_light_curve": can_run_photometry,
+            "show_comparison_stars": not busy and has_compstars,
+            "show_all_comparison_stars": not busy and has_compstars and selected_target,
+            "show_selected_comparison_star": (
+                not busy
+                and selected_target
+                and self.current_comp_selection() is not None
+            ),
+            "select_batch_targets": not busy and prepared_field,
+            "plot_light_curve": not busy and can_plot_lightcurve,
+            "fit_extremum": not busy and has_selected_plot_range,
+            "trim_lightcurve": not busy and has_selected_plot_range,
+            "clear_extremum_fit": not busy and (
+                bool(self.lightcurve_fit_artists) or has_selected_plot_range
+            ),
+            "export_aavso": not busy and has_result,
+            "open_aavso_folder": not busy and has_aavso_folder,
+            "create_binned_curve": not busy and can_create_binned_curve,
+            "use_raw_curve": not busy and can_use_raw_curve,
+            "bav_export_base": not busy and has_result,
+        }
+
+    def refresh_action_availability(self) -> None:
+        """Apply the central availability state to main and opted-in module actions."""
+
+        state = self.action_availability()
+        buttons = {
+            "prepare_button": "prepare",
+            "select_target_button": "select_target",
+            "vsx_selected_button": "open_selected_vsx",
+            "run_light_curve_button": "create_light_curve",
+            "show_compstars_button": "show_comparison_stars",
+            "show_all_comp_button": "show_all_comparison_stars",
+            "show_selected_comp_button": "show_selected_comparison_star",
+            "batch_run_button": "select_batch_targets",
+            "plot_light_curve_button": "plot_light_curve",
+            "fit_extremum_button": "fit_extremum",
+            "trim_lightcurve_button": "trim_lightcurve",
+            "clear_extremum_button": "clear_extremum_fit",
+            "export_aavso_button": "export_aavso",
+            "open_aavso_folder_button": "open_aavso_folder",
+            "create_binned_curve_button": "create_binned_curve",
+            "use_raw_curve_button": "use_raw_curve",
+        }
+        for name, action in buttons.items():
+            button = getattr(self, name, None)
+            if isinstance(button, QPushButton):
+                button.setEnabled(state[action])
+
+        for name in ("binning_mode_combo", "binning_value_spin"):
+            widget = getattr(self, name, None)
+            if isinstance(widget, QWidget):
+                widget.setEnabled(state["create_binned_curve"])
+
+        refresh_bav = getattr(self.bav_tab, "refresh_action_availability", None)
+        if callable(refresh_bav):
+            try:
+                refresh_bav()
+            except Exception as exc:
+                self.append_log(f"WARNING: BAV action availability refresh failed: {exc}")
 
     def busy_context_change_message(self, action: str) -> str | None:
         """Return and log why a result/source/mode change is currently blocked."""
@@ -13587,6 +15087,7 @@ class LightCurveWindow(QWidget):
 
         self.busy_state = state
         self.busy_message = message
+        self.vsx_preview_timer.stop()
         self._busy_locked_buttons = {}
         # Snapshot and lock child action buttons before disabling their parent
         # context groups. Otherwise QWidget.isEnabled() already reports False
@@ -13601,6 +15102,7 @@ class LightCurveWindow(QWidget):
             self._busy_locked_buttons[widget] = widget.isEnabled()
             widget.setEnabled(False)
         self.append_log(message)
+        self.refresh_action_availability()
         self.update_overall_status()
         QApplication.processEvents()
         return True
@@ -13618,6 +15120,7 @@ class LightCurveWindow(QWidget):
         self._busy_locked_buttons.clear()
         self.busy_state = BUSY_IDLE
         self.busy_message = ""
+        self.refresh_action_availability()
         self.update_overall_status()
         QApplication.processEvents()
 
@@ -13652,40 +15155,11 @@ class LightCurveWindow(QWidget):
         finally:
             self.finish_busy_action(state)
 
-    def load_cfa_stack_module(self) -> object:
-        """Load the optional SeePhot_CFA.py module once for manual and batch use."""
-
-        script_path = Path(__file__).with_name("SeePhot_CFA.py")
-        if not script_path.exists():
-            raise FileNotFoundError(f"Script not found: {script_path}")
-        if self.cfa_stack_module is not None:
-            return self.cfa_stack_module
-
-        spec = importlib.util.spec_from_file_location("SeePhot_CFA", script_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("could not create import spec")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(spec.name, None)
-            raise
-        self.cfa_stack_module = module
-        return module
-
-    def open_cfa_stack_window(self, initial_source_dir: str | Path | None = None) -> bool:
-        """Open SeePhot_CFA.py as a separate preprocessing window when available."""
-
-        script_path = Path(__file__).with_name("SeePhot_CFA.py")
-        if not script_path.exists():
-            QMessageBox.warning(self, "CFA Channels / Stack", f"Script not found:\n{script_path}")
-            return False
+    def open_cfa_stack_window(self, initial_source_dir: str | Path | None = None, grouping_behavior: str | None = None) -> bool:
+        """Open the required CFA/Stack preprocessing window."""
 
         try:
-            module = self.load_cfa_stack_module()
-
-            stack_window_class = getattr(module, "StackWindow", None)
+            stack_window_class = getattr(cfa_stack_app, "StackWindow", None)
             if not callable(stack_window_class):
                 raise RuntimeError("SeePhot_CFA.py has no importable StackWindow class")
 
@@ -13694,6 +15168,7 @@ class LightCurveWindow(QWidget):
                     allowed_channels=("L", "G"),
                     lightcurve_mode=True,
                     busy_context=self.qc_plugin_context(),
+                    default_grouping_behavior="gap_aware",
                 )
                 self.cfa_stack_signal_connected = False
 
@@ -13704,6 +15179,11 @@ class LightCurveWindow(QWidget):
                         f"Profiling source folder not found: {Path(initial_source_dir).expanduser()}"
                     )
 
+            if grouping_behavior is not None:
+                set_grouping_behavior = getattr(self.cfa_stack_window, "set_grouping_behavior", None)
+                if not callable(set_grouping_behavior) or not set_grouping_behavior(grouping_behavior):
+                    raise ValueError(f"Unsupported CFA/Stack grouping behavior: {grouping_behavior}")
+
             result_signal = getattr(self.cfa_stack_window, "stack_result_ready", None)
             if result_signal is not None and not self.cfa_stack_signal_connected:
                 result_signal.connect(self.on_cfa_stack_result_ready)
@@ -13712,7 +15192,7 @@ class LightCurveWindow(QWidget):
             self.cfa_stack_window.show()
             self.cfa_stack_window.raise_()
             self.cfa_stack_window.activateWindow()
-            self.append_log(f"Opened CFA Channels / Stack window from {script_path.name}.")
+            self.append_log("Opened CFA Channels / Stack window.")
             return True
         except Exception as exc:
             message = f"Could not open CFA Channels / Stack.\n\n{exc}"
@@ -13720,7 +15200,7 @@ class LightCurveWindow(QWidget):
             QMessageBox.warning(self, "CFA Channels / Stack", message)
             return False
 
-    def open_cfa_stack_for_profiling(self, source_dir: str) -> bool:
+    def open_cfa_stack_for_profiling(self, source_dir: str, grouping_behavior: str) -> bool:
         """Open CFA/Stack with a source explicitly confirmed by Stack Profiling."""
 
         if self.is_busy():
@@ -13731,66 +15211,34 @@ class LightCurveWindow(QWidget):
                 f"Another operation is still running:\n{active}",
             )
             return False
-        return self.open_cfa_stack_window(source_dir)
+        return self.open_cfa_stack_window(source_dir, grouping_behavior)
 
-    def open_profiling_runner(self) -> None:
-        """Open the optional read-only Stack Profiling dialog."""
-
-        script_path = Path(__file__).with_name("sp_mod_profiling.py")
-        if not script_path.exists():
-            QMessageBox.warning(self, "Stack Profiling", f"Script not found:\n{script_path}")
-            return
+    def open_profiling_runner(self, source_dir: str | None = None, grouping_behavior: str | None = None) -> None:
+        """Open the required read-only Stack Profiling dialog."""
 
         try:
-            if self.profiling_module is None:
-                spec = importlib.util.spec_from_file_location("sp_mod_profiling", script_path)
-                if spec is None or spec.loader is None:
-                    raise RuntimeError("could not create import spec")
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[spec.name] = module
-                try:
-                    spec.loader.exec_module(module)
-                except Exception:
-                    sys.modules.pop(spec.name, None)
-                    raise
-                self.profiling_module = module
-
-            open_dialog = getattr(self.profiling_module, "open_profiling_dialog", None)
+            dialog_name = "open_profiling_result_dialog" if source_dir is not None else "open_profiling_dialog"
+            open_dialog = getattr(profiling_tools, dialog_name, None)
             if not callable(open_dialog):
                 raise RuntimeError(
-                    "sp_mod_profiling.py has no open_profiling_dialog(context, parent)"
+                    "Required Stack Profiling component has no dialog entry point"
                 )
-            open_dialog(self.qc_plugin_context(), self)
+            if source_dir is None:
+                open_dialog(self.qc_plugin_context(), self)
+            else:
+                open_dialog(self.qc_plugin_context(), self, source_dir, grouping_behavior or "gap_aware")
         except Exception as exc:
             message = f"Could not open Stack Profiling.\n\n{exc}"
             self.append_log(f"WARNING: {message.replace(chr(10), ' ')}")
             QMessageBox.warning(self, "Stack Profiling", message)
 
     def open_automatic_runner(self) -> None:
-        """Open the optional CFA/Stack Batch dialog from sp_mod_auto.py."""
-
-        script_path = Path(__file__).with_name("sp_mod_auto.py")
-        if not script_path.exists():
-            QMessageBox.warning(self, "CFA/Stack Batch", f"Script not found:\n{script_path}")
-            return
+        """Open the required CFA/Stack Batch dialog."""
 
         try:
-            if self.automatic_module is None:
-                spec = importlib.util.spec_from_file_location("sp_mod_auto", script_path)
-                if spec is None or spec.loader is None:
-                    raise RuntimeError("could not create import spec")
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[spec.name] = module
-                try:
-                    spec.loader.exec_module(module)
-                except Exception:
-                    sys.modules.pop(spec.name, None)
-                    raise
-                self.automatic_module = module
-
-            open_dialog = getattr(self.automatic_module, "open_automatic_dialog", None)
+            open_dialog = getattr(automatic_tools, "open_automatic_dialog", None)
             if not callable(open_dialog):
-                raise RuntimeError("sp_mod_auto.py has no open_automatic_dialog(context, parent)")
+                raise RuntimeError("Required CFA/Stack Batch component has no dialog entry point")
 
             open_dialog(self.qc_plugin_context(), self)
         except Exception as exc:
@@ -13826,8 +15274,9 @@ class LightCurveWindow(QWidget):
         plan_values: Iterable[int],
         selected_plan_suffixes: Iterable[str],
         allow_overwrite: bool = False,
+        grouping_behavior: str = "continuous",
     ) -> bool:
-        """Start CFA/stack preprocessing for the optional multi-folder batch."""
+        """Start CFA/stack preprocessing for the required multi-folder batch."""
 
         if self.automatic_stack_worker is not None and self.automatic_stack_worker.isRunning():
             message = "CFA/Stack Batch is already running."
@@ -13836,14 +15285,13 @@ class LightCurveWindow(QWidget):
             return False
 
         try:
-            module = self.load_cfa_stack_module()
-            stack_worker_class = getattr(module, "StackWorker", None)
+            stack_worker_class = getattr(cfa_stack_app, "StackWorker", None)
             if not callable(stack_worker_class):
                 raise RuntimeError("SeePhot_CFA.py has no importable StackWorker class")
-            build_stack_plans = getattr(module, "build_stack_plans")
-            collect_valid_fits = getattr(module, "collect_valid_fits")
-            frames_need_cfa_split = getattr(module, "frames_need_cfa_split")
-            existing_result_dirs_for_run = getattr(module, "existing_result_dirs_for_run")
+            build_stack_plans = getattr(cfa_stack_app, "build_stack_plans")
+            collect_valid_fits = getattr(cfa_stack_app, "collect_valid_fits")
+            frames_need_cfa_split = getattr(cfa_stack_app, "frames_need_cfa_split")
+            existing_result_dirs_for_run = getattr(cfa_stack_app, "existing_result_dirs_for_run")
 
             source_path = Path(source_dir).expanduser()
             if not source_path.is_dir():
@@ -13885,6 +15333,7 @@ class LightCurveWindow(QWidget):
                 selected_plans,
                 channels,
                 needs_cfa_split,
+                grouping_behavior,
             )
             if existing_dirs and not allow_overwrite:
                 shown = ", ".join(path.name for path in existing_dirs[:6])
@@ -13909,6 +15358,7 @@ class LightCurveWindow(QWidget):
                 channels,
                 bool(allow_overwrite),
                 True,
+                grouping_behavior=grouping_behavior,
             )
             self.automatic_stack_worker = worker
             worker.log.connect(lambda message: self.append_log(f"CFA/Stack Batch: {message}"))
@@ -13916,7 +15366,8 @@ class LightCurveWindow(QWidget):
             self.append_log(
                 "CFA/Stack Batch selected: "
                 f"channels={', '.join(channels)}, "
-                f"groups={', '.join(plan.name for plan in selected_plans)}."
+                f"groups={', '.join(plan.name for plan in selected_plans)}, "
+                f"behavior={grouping_behavior}."
             )
             worker.start()
             return True
@@ -14091,17 +15542,12 @@ class LightCurveWindow(QWidget):
                 ]
             )
         )
-        self.update_current_curve_path_label()
+        self.update_current_result_displays()
 
-    def update_current_curve_path_label(self) -> None:
-        """Refresh the visible current-curve path in the Photometry tab."""
+    def update_current_result_displays(self) -> None:
+        """Refresh the current-result displays after its active path changes."""
 
-        label = getattr(self, "current_curve_path_label", None)
-        if label is not None:
-            if self.loaded_lightcurve_csv is None:
-                label.setText("Current curve: none")
-            else:
-                label.setText(f"Current curve: {self.loaded_lightcurve_csv}")
+        self.update_footer_current_status_labels()
 
         instrument_label = getattr(self, "aavso_instrument_label", None)
         if instrument_label is not None:
@@ -14284,6 +15730,11 @@ class LightCurveWindow(QWidget):
             trim_hint.setWordWrap(True)
             layout.addWidget(trim_hint)
             self.plot_extremum_fit_label = QLabel(self.extremum_fit_label.text())
+            self.plot_extremum_fit_label.setWordWrap(True)
+            self.plot_extremum_fit_label.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
             layout.addWidget(self.plot_extremum_fit_label)
             self.plot_dialog = dialog
 
@@ -14597,7 +16048,7 @@ class LightCurveWindow(QWidget):
             self.loaded_lightcurve_csv = rebased_lightcurve_csv
             self.export_status_label.setText(f"Current export source: {rebased_lightcurve_csv}")
             self.lightcurve_status_label.setText(f"Light curve loaded: {rebased_lightcurve_csv}")
-            self.update_current_curve_path_label()
+            self.update_current_result_displays()
 
         edit_path = self.source_path_from_edit()
         rebased_edit_path = rebase(edit_path)
@@ -14670,7 +16121,7 @@ class LightCurveWindow(QWidget):
             self.scan_label.setText("No input directory selected.")
             self.append_log("Mode changed: Light Curve.")
         self.update_mode_dependent_controls()
-        self.refresh_optional_tab_views()
+        self.refresh_plugin_tab_views()
         self.update_overall_status()
 
     def update_mode_dependent_controls(self) -> None:
@@ -14690,6 +16141,7 @@ class LightCurveWindow(QWidget):
         self.run_light_curve_button.setText(
             "Create Light Curve" if lightcurve_mode else "Run Measurement"
         )
+        self.refresh_action_availability()
 
     def set_result_display_kind(self, *, single: bool) -> None:
         """Show controls for the loaded/created result without changing acquisition mode."""
@@ -14719,6 +16171,7 @@ class LightCurveWindow(QWidget):
                 button.setEnabled(False)
         if self.compstars_status_label is not None:
             self.compstars_status_label.setText(self.compstars_summary_text())
+        self.refresh_action_availability()
 
     def reset_scan_state(self) -> None:
         self.current_scan = None
@@ -14727,6 +16180,7 @@ class LightCurveWindow(QWidget):
         self.catalog_objects = []
         self.filtered_catalog_objects = []
         self.selected_target = None
+        self.single_target_precheck_ready = False
         self.clear_comparison_star_state()
         self.set_selected_target_labels()
         self.vsx_tree.clear()
@@ -14735,17 +16189,12 @@ class LightCurveWindow(QWidget):
         self.prepare_description_label.setText(
             "Register frames · plate solve · load reference · query VSX"
         )
-        self.prepare_button.setEnabled(False)
-        self.select_target_button.setEnabled(False)
-        self.vsx_selected_button.setEnabled(False)
-        self.run_light_curve_button.setEnabled(False)
-        self.plot_light_curve_button.setEnabled(False)
         self.lightcurve_status_label.setText("No Light Curve generated yet.")
         self.export_status_label.setText("Exports the selected or opened Light Curve CSV as AAVSO Extended Format.")
         self.show_running_mean_checkbox.setChecked(False)
-        self.plot_binning_mode_combo.setCurrentIndex(0)
-        self.plot_binning_value_spin.setValue(5)
-        self.update_plot_binning_controls()
+        self.binning_mode_combo.setCurrentIndex(0)
+        self.binning_value_spin.setValue(10)
+        self.binning_eligibility_label.setText("Requires a newly created original-image result.")
         self.clear_single_result_summary()
         self.lightcurve_figure.clear()
         self.lightcurve_axis = None
@@ -14760,6 +16209,7 @@ class LightCurveWindow(QWidget):
         self.loaded_lightcurve_source_label = ""
         self.current_result_origin = "none"
         self.varstars_status = "none"
+        self.last_vsx_failure_message = ""
         self.result_status = "none"
         self.fit_status = "none"
         self.export_status = "none"
@@ -14767,10 +16217,8 @@ class LightCurveWindow(QWidget):
         self.lightcurve_selected_range = None
         self.lightcurve_span_selector = None
         self.lightcurve_fit_artists = []
-        self.fit_extremum_button.setEnabled(False)
-        self.trim_lightcurve_button.setEnabled(False)
-        self.clear_extremum_button.setEnabled(False)
         self.lightcurve_canvas.draw()
+        self.refresh_action_availability()
         self.update_overall_status()
 
     def close_siril_display_context(
@@ -14784,7 +16232,7 @@ class LightCurveWindow(QWidget):
         siril = s.SirilInterface()
         connected = False
         try:
-            siril.connect()
+            connect_siril_interface(siril, self.append_log)
             connected = True
             if safe_directory is not None and safe_directory.is_dir():
                 close_siril_image_and_change_cwd(siril, safe_directory)
@@ -14867,7 +16315,7 @@ class LightCurveWindow(QWidget):
         )
         self.clear_vsx_filter(update_tree=False)
         self.reset_scan_state()
-        self.reset_optional_tab_views()
+        self.reset_plugin_tab_views()
         self.update_mode_dependent_controls()
         self.tabs.setCurrentIndex(0)
         self.append_log(
@@ -14880,8 +16328,8 @@ class LightCurveWindow(QWidget):
             )
         )
 
-    def reset_optional_tab_views(self) -> None:
-        """Reset optional plugin-tab views that expose a reset hook."""
+    def reset_plugin_tab_views(self) -> None:
+        """Reset plugin-tab views that expose a reset hook."""
 
         for index in range(self.tabs.count()):
             widget = self.tabs.widget(index)
@@ -14892,10 +16340,10 @@ class LightCurveWindow(QWidget):
                 try:
                     reset_view()
                 except Exception as exc:
-                    self.append_log(f"WARNING: Optional tab reset failed: {exc}")
+                    self.append_log(f"WARNING: Plugin-tab reset failed: {exc}")
 
-    def refresh_optional_tab_views(self) -> None:
-        """Refresh optional plugin-tab views that expose a refresh hook."""
+    def refresh_plugin_tab_views(self) -> None:
+        """Refresh plugin-tab views that expose a refresh hook."""
 
         for index in range(self.tabs.count()):
             widget = self.tabs.widget(index)
@@ -14904,7 +16352,7 @@ class LightCurveWindow(QWidget):
                 try:
                     refresh_view()
                 except Exception as exc:
-                    self.append_log(f"WARNING: Optional tab refresh failed: {exc}")
+                    self.append_log(f"WARNING: Plugin-tab refresh failed: {exc}")
 
     def refresh_bav_tab_view(self) -> None:
         """Refresh the BAV view after the current result has changed."""
@@ -14917,21 +16365,72 @@ class LightCurveWindow(QWidget):
                 self.append_log(f"WARNING: BAV tab refresh failed: {exc}")
 
     def set_selected_target_labels(self, target_name: str | None = None) -> None:
-        """Keep the Variables and Photometry target labels in sync."""
+        """Refresh the selected-target and current-result displays."""
 
         clean_name = str(target_name or "").strip()
         display_name = clean_name or "none"
+        self.target_label.setText(f"Selected target: {display_name}")
         photometry_text = f"Target: {display_name}"
-        compact_photometry_text = self.photometry_target_label.fontMetrics().elidedText(
+        elided_text = self.photometry_target_label.fontMetrics().elidedText(
             photometry_text,
             Qt.TextElideMode.ElideMiddle,
             self.photometry_target_label.maximumWidth(),
         )
-        self.target_label.setText(f"Selected target: {display_name}")
-        self.photometry_target_label.setText(compact_photometry_text)
-        self.photometry_target_label.setToolTip(
-            photometry_text if compact_photometry_text != photometry_text else ""
-        )
+        self.photometry_target_label.setText(elided_text)
+        self.photometry_target_label.setToolTip(photometry_text)
+        self.update_footer_current_status_labels(display_name)
+
+    def update_footer_current_status_labels(
+        self, target_name: str | None = None
+    ) -> None:
+        """Refresh the compact two-line current-target/current-curve footer."""
+
+        target_label = getattr(self, "footer_current_target_label", None)
+        curve_label = getattr(self, "footer_current_curve_label", None)
+        if target_label is None or curve_label is None:
+            return
+
+        if target_name is None:
+            # A loaded or newly created result remains the current target even
+            # when no VSX target is selected in the present session.
+            if self.loaded_lightcurve_csv is not None:
+                target_name = self.loaded_lightcurve_target_name
+            elif self.selected_target is not None:
+                target_name = self.selected_target.catalog_object.name
+            else:
+                target_name = "none"
+        target_display_name = str(target_name or "none").strip() or "none"
+        target_prefix = "Current target: "
+        curve_path = self.loaded_lightcurve_csv
+        curve_prefix = "Current curve: "
+        curve_display_name = "none" if curve_path is None else Path(curve_path).name
+        for label, prefix, value, has_current_value in (
+            (
+                target_label,
+                target_prefix,
+                target_display_name,
+                target_display_name != "none",
+            ),
+            (curve_label, curve_prefix, curve_display_name, curve_path is not None),
+        ):
+            value_width = max(
+                0,
+                label.width() - label.fontMetrics().horizontalAdvance(prefix),
+            )
+            compact_value = label.fontMetrics().elidedText(
+                value, Qt.TextElideMode.ElideMiddle, value_width
+            )
+            if has_current_value:
+                label.setText(
+                    f"{html.escape(prefix)}<span style='color:#2f9e44'>"
+                    f"{html.escape(compact_value)}</span>"
+                )
+            else:
+                label.setText(f"{html.escape(prefix)}{html.escape(compact_value)}")
+            if label is curve_label and curve_path is not None:
+                label.setToolTip(str(curve_path))
+            else:
+                label.setToolTip(value if compact_value != value else "")
 
     def choose_source_input(self) -> None:
         busy_message = self.busy_context_change_message("load another source")
@@ -15047,12 +16546,6 @@ class LightCurveWindow(QWidget):
         self.prepare_description_label.setText(
             "Register frames · plate solve · load reference · query VSX"
         )
-        self.prepare_button.setEnabled(True)
-        self.select_target_button.setEnabled(False)
-        self.vsx_selected_button.setEnabled(False)
-        self.show_selected_comp_button.setEnabled(False)
-        self.show_all_comp_button.setEnabled(False)
-        self.plot_light_curve_button.setEnabled(False)
         self.lightcurve_status_label.setText(
             f"No target selected for {scan.directory.name}."
         )
@@ -15074,6 +16567,7 @@ class LightCurveWindow(QWidget):
             self.append_log(f"Found {scan.fits_count} FITS file(s) in {scan.directory}")
         self.append_log(f"Temporary work directory: {tmp_dir}")
         self.append_log(f"Results directory: {results_dir}")
+        self.refresh_action_availability()
 
     def scan_entered_directory(self) -> None:
         if self.source_path_from_edit() is None:
@@ -15130,13 +16624,13 @@ class LightCurveWindow(QWidget):
         ):
             return
 
-        self.prepare_button.setEnabled(False)
         self.prepare_completed = False
         self.loaded_lightcurve_csv = None
         self.loaded_lightcurve_target_name = "Target"
         self.loaded_lightcurve_source_label = ""
         self.current_result_origin = "none"
         self.varstars_status = "detecting"
+        self.last_vsx_failure_message = ""
         self.comp_status = "none"
         self.result_status = "none"
         self.fit_status = "none"
@@ -15153,10 +16647,6 @@ class LightCurveWindow(QWidget):
         self.vsx_tree.clear()
         self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
         self.comp_tree.clear()
-        self.select_target_button.setEnabled(False)
-        self.vsx_selected_button.setEnabled(False)
-        self.show_selected_comp_button.setEnabled(False)
-        self.show_all_comp_button.setEnabled(False)
         self.append_log("Detect Variables requested.")
         if not self.register_sequence(show_success=False):
             self.set_varstars_status("failed")
@@ -15175,6 +16665,7 @@ class LightCurveWindow(QWidget):
         ):
             return
         self.set_varstars_status("detecting")
+        self.last_vsx_failure_message = ""
         self.append_log(
             "Reusing registered and plate-solved work files; registration, alignment, "
             "and plate solving are not repeated."
@@ -15188,7 +16679,9 @@ class LightCurveWindow(QWidget):
                 message = "VSX objects loaded from the prepared reference frame."
             else:
                 self.set_varstars_status("failed")
-                message = "VSX query failed; prepared work files were retained."
+                message = self.last_vsx_failure_message or (
+                    "VSX query failed; prepared work files were retained."
+                )
                 self.append_log(message)
         finally:
             self.finish_busy_action("FIELD_SETUP_RUNNING")
@@ -15239,7 +16732,6 @@ class LightCurveWindow(QWidget):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        self.prepare_button.setEnabled(False)
         self.append_log("Starting per-frame plate solve.")
         self.append_log(
             "Using solver scale hints from "
@@ -15308,9 +16800,14 @@ class LightCurveWindow(QWidget):
             self.set_varstars_status("failed")
             QMessageBox.critical(self, "Detect Variables", f"Detect Variables failed.\n\n{message}")
         self.finish_busy_action("FIELD_SETUP_RUNNING")
+        completion_message = (
+            message
+            if self.varstars_status == "ready"
+            else self.last_vsx_failure_message or message
+        )
         self.automatic_prepare_finished.emit(
             bool(success and self.prepare_completed and self.varstars_status == "ready"),
-            message,
+            completion_message,
         )
 
     def register_sequence(self, show_success: bool = True) -> bool:
@@ -15323,7 +16820,7 @@ class LightCurveWindow(QWidget):
         siril = s.SirilInterface()
         connected = False
         try:
-            siril.connect()
+            connect_siril_interface(siril, self.append_log)
             connected = True
             close_siril_image_and_change_cwd(siril, self.current_scan.directory)
             if (
@@ -15435,7 +16932,7 @@ class LightCurveWindow(QWidget):
         siril = s.SirilInterface()
         connected = False
         try:
-            siril.connect()
+            connect_siril_interface(siril, self.append_log)
             connected = True
             self.append_log(f"Loading reference frame: {frame.path.name}")
             siril.cmd(f'load "{siril_path(frame.path)}"')
@@ -15460,19 +16957,28 @@ class LightCurveWindow(QWidget):
         return True
 
     def show_vsx_overlay(self) -> bool:
+        self.last_vsx_failure_message = ""
         if self.reference_frame is None:
             message = "No reference frame loaded. Run Detect Variables first."
+            self.last_vsx_failure_message = message
             self.append_log(f"WARNING: {message}")
             QMessageBox.warning(self, "Detect Variables", "Run Detect Variables first.")
             return False
 
         try:
-            self.append_log("Querying VizieR VSX for variable table.")
+            self.append_log("Querying live AAVSO VSX for variable table.")
             objects = vizier_vsx_objects_for_table(self.reference_frame, self.append_log)
         except Exception as exc:
-            message = f"Could not load VSX objects from VizieR: {exc}"
+            message = f"VSX catalog unavailable: {exc}"
+            self.last_vsx_failure_message = message
             self.append_log(f"ERROR: {message}")
-            QMessageBox.critical(self, "Detect Variables", f"Could not load variables from VizieR.\n\n{exc}")
+            QMessageBox.critical(
+                self,
+                "VSX Catalog Unavailable",
+                "The VSX variable-star catalog could not be reached after all retries.\n\n"
+                f"{exc}\n\n"
+                "The prepared frames were retained; click Query VSX again to retry.",
+            )
             return False
 
         raw_count = len(objects)
@@ -15480,6 +16986,7 @@ class LightCurveWindow(QWidget):
             aperture_settings = require_fixed_fwhm_aperture_settings(self.reference_frame)
         except RuntimeError as exc:
             message = str(exc)
+            self.last_vsx_failure_message = message
             self.append_log(f"ERROR: {message}")
             QMessageBox.warning(
                 self,
@@ -15503,23 +17010,27 @@ class LightCurveWindow(QWidget):
         if not objects:
             if raw_count == 0:
                 message = (
-                    "VizieR VSX returned no catalog rows after retrying; this may be a "
-                    "temporary catalog-service problem."
+                    "The VSX catalog query completed but returned no variable-star rows "
+                    "after all retries."
                 )
                 dialog_message = (
-                    "VizieR returned no VSX catalog rows.\n\n"
+                    "The VSX catalog returned no variable-star rows after all retries.\n\n"
+                    "This does not mean that the plate-solved image contains no stars.\n\n"
                     "The prepared frames were retained; click Query VSX again to retry."
                 )
+                dialog_title = "No VSX Variables Returned"
             else:
                 message = (
                     "No VSX objects fall inside the usable photometry area of the "
                     "reference image."
                 )
                 dialog_message = "No variables found in the usable image area."
+                dialog_title = "Detect Variables"
+            self.last_vsx_failure_message = message
             self.append_log(f"WARNING: {message}")
             QMessageBox.warning(
                 self,
-                "Detect Variables",
+                dialog_title,
                 dialog_message,
             )
             return False
@@ -15531,23 +17042,18 @@ class LightCurveWindow(QWidget):
         self.check_star = None
         self.series_optimized_aperture_settings = None
         self.set_selected_target_labels()
-        self.select_target_button.setEnabled(False)
-        self.vsx_selected_button.setEnabled(False)
         self.comp_tree.clear()
-        self.show_selected_comp_button.setEnabled(False)
-        self.show_all_comp_button.setEnabled(False)
-        self.run_light_curve_button.setEnabled(False)
         self.clear_vsx_filter(update_tree=False)
         self.apply_vsx_filter()
         self.restore_pending_vsx_selection()
         self.append_log(f"VSX table populated: {self.vsx_tree.topLevelItemCount()} row(s).")
         self.tabs.setCurrentWidget(self.varstar_tab)
         self.append_log(
-            f"VSX objects loaded: {len(objects)} from VizieR VSX "
+            f"VSX objects loaded: {len(objects)} from live AAVSO VSX "
             f"(limit magnitude {DEFAULT_VSX_LIMIT_MAG:g}; "
             f"{outside_count} outside the usable reference area filtered out)"
         )
-        self.refresh_optional_tab_views()
+        self.refresh_plugin_tab_views()
         return True
 
     def populate_vsx_tree(self, objects: list[CatalogObject]) -> None:
@@ -15633,7 +17139,13 @@ class LightCurveWindow(QWidget):
         except ValueError:
             return first_text == second_text
 
-    def filter_token_matches(self, value: str, pattern_text: str) -> bool:
+    def filter_token_matches(
+        self,
+        value: str,
+        pattern_text: str,
+        *,
+        allow_substring_match: bool = True,
+    ) -> bool:
         patterns = [
             pattern.strip().lower()
             for pattern in pattern_text.split(",")
@@ -15646,13 +17158,27 @@ class LightCurveWindow(QWidget):
             if pattern.endswith("*"):
                 if normalized.startswith(pattern[:-1]):
                     return True
-            elif normalized.startswith(pattern) or pattern in normalized:
+            elif normalized == pattern:
+                return True
+            elif allow_substring_match and pattern in normalized:
                 return True
         return False
+
+    @staticmethod
+    def vsx_type_is_certain(value: str) -> bool:
+        """Return whether VSX reports one definite variability classification."""
+
+        normalized = value.strip()
+        return bool(normalized) and ":" not in normalized and "|" not in normalized
 
     def apply_vsx_filter(self) -> None:
         name_filter = self.vsx_name_filter_edit.text().strip()
         type_filter = self.vsx_type_filter_edit.text().strip()
+        certain_types_only = (
+            str(self.vsx_type_preset_combo.currentData() or "")
+            == SINGLE_MODE_VSX_TYPE_SUGGESTION
+            and type_filter == SINGLE_MODE_VSX_TYPE_SUGGESTION
+        )
         mag_text = self.vsx_mag_filter_edit.text().strip().replace(",", ".")
         max_mag: float | None = None
         if mag_text:
@@ -15666,7 +17192,13 @@ class LightCurveWindow(QWidget):
         for obj in self.catalog_objects:
             if name_filter and not self.filter_token_matches(obj.name, name_filter):
                 continue
-            if type_filter and not self.filter_token_matches(obj.object_type, type_filter):
+            if type_filter and not self.filter_token_matches(
+                obj.object_type,
+                type_filter,
+                allow_substring_match=False,
+            ):
+                continue
+            if certain_types_only and not self.vsx_type_is_certain(obj.object_type):
                 continue
             if max_mag is not None:
                 mag = obj.magnitude_float()
@@ -15679,18 +17211,16 @@ class LightCurveWindow(QWidget):
         self.check_star = None
         self.series_optimized_aperture_settings = None
         self.set_selected_target_labels()
-        self.select_target_button.setEnabled(False)
-        self.vsx_selected_button.setEnabled(False)
         self.comp_tree.clear()
-        self.run_light_curve_button.setEnabled(False)
         self.populate_vsx_tree(filtered)
         self.refresh_batch_targets_from_vsx_filter()
         self.append_log(
             f"VSX filter applied: showing {len(filtered)}/{len(self.catalog_objects)} object(s)."
         )
+        self.refresh_action_availability()
 
     def refresh_batch_targets_from_vsx_filter(self) -> None:
-        """Let the optional Batch tab mirror the current visible VSX rows."""
+        """Let the required Batch component mirror the current visible VSX rows."""
 
         batch_tab = self.batch_tab
         if batch_tab is None:
@@ -15758,6 +17288,11 @@ class LightCurveWindow(QWidget):
         filename: str,
         log_success: bool = True,
     ) -> None:
+        busy_message = self.busy_context_change_message("show Siril annotations")
+        if busy_message is not None:
+            if title != "VSX Preview":
+                QMessageBox.information(self, "Operation Running", busy_message)
+            return
         if self.reference_frame is None:
             QMessageBox.warning(self, title, "Run Detect Variables first.")
             return
@@ -15793,7 +17328,7 @@ class LightCurveWindow(QWidget):
         siril = s.SirilInterface()
         connected = False
         try:
-            siril.connect()
+            connect_siril_interface(siril, self.append_log)
             connected = True
             siril.cmd(f'load "{siril_path(self.reference_frame.path)}"')
             siril.cmd("autostretch")
@@ -15886,16 +17421,14 @@ class LightCurveWindow(QWidget):
 
     def on_vsx_selection_changed(self) -> None:
         obj = self.current_vsx_selection()
-        self.select_target_button.setEnabled(obj is not None)
-        self.vsx_selected_button.setEnabled(obj is not None)
         self.selected_target = None
+        self.single_target_precheck_ready = False
         self.comparison_stars = []
         self.check_star = None
         self.series_optimized_aperture_settings = None
         self.set_selected_target_labels()
         self.clear_single_result_summary()
         self.comp_tree.clear()
-        self.run_light_curve_button.setEnabled(False)
         if self.photometry_mode == MODE_SINGLE_MEASUREMENT:
             self.loaded_lightcurve_csv = None
             self.loaded_lightcurve_target_name = "Target"
@@ -15905,10 +17438,6 @@ class LightCurveWindow(QWidget):
             self.fit_status = "none"
             self.export_status = "none"
             self.current_exports.clear()
-            self.plot_light_curve_button.setEnabled(False)
-            self.run_light_curve_button.setEnabled(
-                obj is not None and self.reference_frame is not None
-            )
             self.lightcurve_status_label.setText(
                 "Select a target or run a new single measurement."
                 if obj is not None
@@ -15916,15 +17445,12 @@ class LightCurveWindow(QWidget):
             )
             self.update_overall_status()
         elif self.loaded_lightcurve_csv is not None and self.loaded_lightcurve_csv.exists():
-            self.plot_light_curve_button.setEnabled(True)
             self.lightcurve_status_label.setText(
                 f"Loaded Light Curve available: {self.loaded_lightcurve_csv}"
             )
         else:
-            self.plot_light_curve_button.setEnabled(False)
             self.lightcurve_status_label.setText("Select a target to plot an existing Light Curve.")
-        self.show_selected_comp_button.setEnabled(False)
-        self.show_all_comp_button.setEnabled(False)
+        self.refresh_action_availability()
         if obj is None:
             self.vsx_preview_timer.stop()
             return
@@ -15967,7 +17493,7 @@ class LightCurveWindow(QWidget):
         return self.catalog_objects[row_index]
 
     def selected_vsx_targets_for_batch(self) -> list[CatalogObject]:
-        """Return unique VSX rows selected for the optional Batch tab."""
+        """Return unique VSX rows selected for the required Batch component."""
 
         return self.vsx_targets_from_items_for_batch(self.vsx_tree.selectedItems())
 
@@ -16037,6 +17563,59 @@ class LightCurveWindow(QWidget):
             aperture_settings.annulus_outer_px,
         )
         return measurements[0] if measurements else None
+
+    def single_annulus_mask_candidate_for_target(
+        self,
+        frame_path: Path,
+        measurement: ApertureMeasurement,
+        aperture_settings: ApertureSettings,
+    ) -> SingleAnnulusMaskCandidate | None:
+        """Find the one safely maskable bright island for a rejected target."""
+
+        try:
+            _header, data, _wcs, _saturation = read_loaded_photometry_frame(frame_path)
+            cutout, local_x, local_y, _x0, _y0 = image_cutout_for_radius(
+                data, measurement.x, measurement.y, aperture_settings.annulus_outer_px
+            )
+        except Exception as exc:
+            self.append_log(f"WARNING: Could not inspect target annulus for masking: {exc}")
+            return None
+        ring = annulus_mask(
+            cutout.shape,
+            local_x,
+            local_y,
+            aperture_settings.annulus_inner_px,
+            aperture_settings.annulus_outer_px,
+        )
+        return single_annulus_mask_candidate(cutout, ring, measurement.background_median)
+
+    def confirm_single_annulus_mask(self, candidate: SingleAnnulusMaskCandidate) -> bool:
+        """Offer the only user choice needed for a safely isolated ring source."""
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Bright Sources in Background Annulus")
+        if candidate.island_count == 1:
+            dialog.setText("One separate bright source lies in the background annulus.")
+        else:
+            dialog.setText(
+                f"{candidate.island_count} separate bright sources lie in the background annulus."
+            )
+        dialog.setInformativeText(
+            "SeePhot can automatically mask these regions. "
+            "The remaining background annulus is sufficient for the measurement."
+        )
+        dialog.setDetailedText(
+            f"Detected bright regions: {candidate.island_count}; "
+            "automatically masked annulus area: "
+            f"{candidate.masked_pixel_fraction:.1%}; remaining annulus: "
+            f"{candidate.remaining_pixel_fraction:.1%}."
+        )
+        use_mask = dialog.addButton("Use Cleaned Background", QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton("Discard Measurement", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(use_mask)
+        dialog.exec()
+        return dialog.clickedButton() is use_mask
 
     def single_measurement_work_frame(self) -> tuple[Path, int]:
         """Return the solved work frame used by single-image photometry."""
@@ -16258,6 +17837,7 @@ class LightCurveWindow(QWidget):
             return False
 
         self.selected_target = SelectedTarget(obj, self.reference_frame)
+        self.single_target_precheck_ready = False
         self.loaded_lightcurve_csv = None
         self.loaded_lightcurve_target_name = "Target"
         self.loaded_lightcurve_source_label = ""
@@ -16271,9 +17851,9 @@ class LightCurveWindow(QWidget):
         self.current_extremum_fit_csv = None
         self.set_extremum_fit_text("Min/Max fit: none")
         self.clear_comparison_star_state()
-        self.run_light_curve_button.setEnabled(self.photometry_mode == MODE_LIGHTCURVE)
         self.set_selected_target_labels(obj.name or "(unnamed)")
         self.update_selected_target_lightcurve_status()
+        self.refresh_action_availability()
         self.append_log(
             "Selected target: "
             f"{obj.name or '(unnamed)'} "
@@ -16305,8 +17885,24 @@ class LightCurveWindow(QWidget):
                 f"inst_err={error_text}, "
                 f"x={measurement.x:.1f}, y={measurement.y:.1f}."
             )
-            if not measurement.valid:
-                self.run_light_curve_button.setEnabled(False)
+            precheck_mask_candidate = None
+            if (
+                not measurement.valid
+                and measurement.quality_flag == "ANNULUS_CONTAMINATION"
+            ):
+                aperture_settings = resolve_aperture_settings(self.reference_frame)
+                precheck_mask_candidate = self.single_annulus_mask_candidate_for_target(
+                    self.reference_frame.path,
+                    measurement,
+                    aperture_settings,
+                )
+                if precheck_mask_candidate is not None:
+                    self.append_log(
+                        "Single target precheck found safely maskable annulus source(s): "
+                        f"islands={precheck_mask_candidate.island_count}; "
+                        "measurement remains available pending user confirmation."
+                    )
+            if not measurement.valid and precheck_mask_candidate is None:
                 self.lightcurve_status_label.setText(
                     "Single target is not measurable: "
                     f"{measurement.quality_flag} ({measurement.note})."
@@ -16330,14 +17926,21 @@ class LightCurveWindow(QWidget):
                     "WARNING: Single target SNR is low for a useful single measurement: "
                     f"SNR={measurement.snr:.1f}, inst_err={error_text}."
                 )
-            self.run_light_curve_button.setEnabled(True)
-            self.lightcurve_status_label.setText(
-                "Single target selected. Run Measurement will use Field Zero Point calibration."
-            )
+            self.single_target_precheck_ready = True
+            self.refresh_action_availability()
+            if precheck_mask_candidate is not None:
+                self.lightcurve_status_label.setText(
+                    "Single target selected with maskable annulus contamination. "
+                    "Run Measurement will ask before cleaning the background."
+                )
+            else:
+                self.lightcurve_status_label.setText(
+                    "Single target selected. Run Measurement will use Field Zero Point calibration."
+                )
         return True
 
     def select_target_by_name_for_automation(self, target_name: str) -> bool:
-        """Select exactly one VSX target by name for the optional Automatic assistant."""
+        """Select exactly one VSX target by name for the required Automatic assistant."""
 
         query = target_name.strip().lower()
         if not query:
@@ -16661,8 +18264,7 @@ class LightCurveWindow(QWidget):
         return self.comparison_stars[row_index]
 
     def on_comp_selection_changed(self) -> None:
-        enabled = self.current_comp_selection() is not None and self.selected_target is not None
-        self.show_selected_comp_button.setEnabled(enabled)
+        self.refresh_action_availability()
 
     def compstars_summary_text(self) -> str:
         target = (
@@ -16690,12 +18292,7 @@ class LightCurveWindow(QWidget):
     def update_compstars_dialog_status(self) -> None:
         if self.compstars_status_label is not None:
             self.compstars_status_label.setText(self.compstars_summary_text())
-        has_compstars = bool(self.comparison_stars)
-        self.show_compstars_button.setEnabled(has_compstars)
-        self.show_all_comp_button.setEnabled(has_compstars and self.selected_target is not None)
-        self.show_selected_comp_button.setEnabled(
-            self.current_comp_selection() is not None and self.selected_target is not None
-        )
+        self.refresh_action_availability()
 
     def show_compstars_dialog(self) -> None:
         if not self.comparison_stars and self.check_star is None:
@@ -16781,7 +18378,9 @@ class LightCurveWindow(QWidget):
         stem = self.selected_target_output_stem()
         if output_dir is None or stem is None:
             return None
-        return output_dir / f"{stem}_result_curve.csv"
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        return Path(self.lightcurve_results_module.raw_lightcurve_result_path(output_dir, stem))
 
     def selected_target_diagnostic_curve_csv(self) -> Path | None:
         """Return the separate non-exportable target-contamination curve path."""
@@ -16824,7 +18423,9 @@ class LightCurveWindow(QWidget):
         stem = self.selected_target_output_stem()
         if output_dir is None or stem is None:
             return None
-        return output_dir / f"{stem}_single_field_zp_measurement.csv"
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        return Path(self.lightcurve_results_module.single_measurement_result_path(output_dir, stem))
 
     def show_single_measurement_warning(
         self,
@@ -16887,22 +18488,256 @@ class LightCurveWindow(QWidget):
     def instrumental_csv_for_result_csv(self, result_csv: Path) -> Path:
         """Return the expected instrumental CSV path for one result CSV."""
 
-        suffix = "_result_curve.csv"
-        if result_csv.name.endswith(suffix):
-            stem = result_csv.name[: -len(suffix)]
-            new_path = diagnostics_directory_for_result_csv(result_csv) / f"{stem}_instrumental_photometry.csv"
-            old_path = result_csv.with_name(f"{stem}_instrumental_photometry.csv")
-            return new_path if new_path.exists() or not old_path.exists() else old_path
-        single_suffix = "_single_field_zp_measurement.csv"
-        if result_csv.name.endswith(single_suffix):
-            stem = result_csv.name[: -len(single_suffix)]
-            new_path = diagnostics_directory_for_result_csv(result_csv) / f"{stem}_single_instrumental_photometry.csv"
-            old_path = result_csv.with_name(f"{stem}_single_instrumental_photometry.csv")
-            return new_path if new_path.exists() or not old_path.exists() else old_path
-        filename = result_csv.stem.replace("result_curve", "instrumental_photometry") + ".csv"
-        new_path = diagnostics_directory_for_result_csv(result_csv) / filename
-        old_path = result_csv.with_name(filename)
-        return new_path if new_path.exists() or not old_path.exists() else old_path
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        resolver = getattr(
+            self.lightcurve_results_module,
+            "instrumental_csv_for_result_csv",
+            None,
+        )
+        if not callable(resolver):
+            raise RuntimeError("Central result-file contract is unavailable.")
+        return Path(resolver(result_csv))
+
+    def create_binned_curve(self) -> None:
+        """Create and select a separately stored scientific flux-binned curve."""
+
+        source_csv = self.loaded_lightcurve_csv
+        if source_csv is None or not source_csv.exists():
+            QMessageBox.warning(self, "Create Binned Curve", "Create or load a raw Light Curve first.")
+            return
+        source_metadata = read_result_metadata_header(source_csv)
+        if source_metadata.get("SOURCE_PROVENANCE") != "SINGLE_FRAME_LG_SERIES" or source_metadata.get("BINNING_ALLOWED") != "1":
+            provenance = source_metadata.get("SOURCE_PROVENANCE", "missing").strip() or "missing"
+            allowed = source_metadata.get("BINNING_ALLOWED", "missing").strip() or "missing"
+            message = (
+                "Binning requires a current L/G single-frame result "
+                "(FILTER=L or G, NCOMBINE=1).\n\n"
+                f"This result has SOURCE_PROVENANCE={provenance}, "
+                f"BINNING_ALLOWED={allowed}.\n\n"
+                "Stacks, already binned results, and results created before the current "
+                "provenance check are rejected."
+            )
+            self.binning_eligibility_label.setText(
+                f"Not eligible: {provenance}; BINNING_ALLOWED={allowed}."
+            )
+            self.append_log(
+                f"Binning rejected for {source_csv}: SOURCE_PROVENANCE={provenance}, "
+                f"BINNING_ALLOWED={allowed}."
+            )
+            QMessageBox.warning(self, "Create Binned Curve", message)
+            return
+        instrumental_csv = self.instrumental_csv_for_result_csv(source_csv)
+        if not instrumental_csv.exists():
+            QMessageBox.warning(self, "Create Binned Curve", "Instrumental photometry CSV not found.")
+            return
+        try:
+            source_dir = self.source_directory_for_result_csv(source_csv)
+            source_input_files = (
+                sorted(
+                    path
+                    for path in source_dir.iterdir()
+                    if is_fits_file(path) and not is_plate_solve_artifact(path)
+                )
+                if source_dir is not None and source_dir.is_dir()
+                else []
+            )
+            expected_input_fingerprint = source_metadata.get(
+                "SOURCE_INPUT_FINGERPRINT_SHA256", ""
+            ).strip()
+            if not expected_input_fingerprint:
+                raise ValueError(
+                    "Source input fingerprint is missing; run single-frame L/G photometry again."
+                )
+            if frame_series_provenance(source_input_files) != "SINGLE_FRAME_LG_SERIES":
+                raise ValueError("Selected source directory is no longer a L/G single-frame series.")
+            if input_series_fingerprint(source_input_files) != expected_input_fingerprint:
+                raise ValueError(
+                    "Input FITS files changed since photometry; run single-frame photometry again."
+                )
+            module = load_measurement_binning_module()
+            with instrumental_csv.open(newline="") as handle:
+                instrumental_rows = list(csv_data_dict_reader(handle))
+            fingerprint = module.source_fingerprint(instrumental_rows)
+            frames, excluded = module.calibrated_frames_from_instrumental_rows(instrumental_rows)
+            mode = str(self.binning_mode_combo.currentData())
+            value = int(self.binning_value_spin.value())
+            groups, skipped = module.plan_bins(frames, mode, value)
+            bins = [module.combine_flux_bin(group) for group in groups]
+            if not bins:
+                raise ValueError("No bin with at least two eligible original-image measurements was created.")
+            with source_csv.open(newline="") as handle:
+                source_reader = csv_data_dict_reader(handle)
+                fieldnames = list(source_reader.fieldnames or [])
+            for extra in (
+                "bin_input_count",
+                "bin_check_input_count",
+                "bin_start_jd",
+                "bin_end_jd",
+                "bin_exposure_seconds",
+                "bin_source_frames",
+            ):
+                if extra not in fieldnames:
+                    fieldnames.append(extra)
+            if self.lightcurve_results_module is None:
+                self.lightcurve_results_module = load_lightcurve_results_module()
+            output_path_builder = getattr(
+                self.lightcurve_results_module,
+                "binned_result_path",
+                None,
+            )
+            if not callable(output_path_builder):
+                raise RuntimeError("Central result-file contract is unavailable.")
+            output_csv = Path(output_path_builder(source_csv, mode, value))
+            metadata = dict(source_metadata)
+            metadata.update({
+                "SOURCE_PROVENANCE": "BINNED_RESULT",
+                "BINNING_ALLOWED": "0",
+                "BIN_SOURCE_RESULT": source_csv.name,
+                "BIN_SOURCE_FINGERPRINT_SHA256": fingerprint,
+                "BINNING_MODE": mode,
+                "BINNING_VALUE": value,
+                "BINNING_GAP_RULE": "3x median eligible-input cadence; no cross-gap bin",
+                "BINNING_FLUX_RULE": module.FLUX_RULE_ID,
+                "BINNING_MIN_INPUTS": module.MIN_INPUTS_PER_BIN,
+                "BINNING_EXCLUDED_INPUTS": excluded,
+                "BINNING_SKIPPED_REST_BINS": skipped,
+                "PHOTOMETRY_SOFTWARE": SOFTWARE_NAME,
+            })
+            rows: list[dict[str, object]] = []
+            for index, item in enumerate(bins, start=1):
+                row: dict[str, object] = {name: "" for name in fieldnames}
+                bin_snr = item.flux / item.flux_error
+                check_snr = (
+                    item.check_flux / item.check_flux_error
+                    if item.check_flux is not None and item.check_flux_error is not None
+                    else None
+                )
+                check_delta_mag = (
+                    item.check_magnitude - item.check_catalog_mag
+                    if item.check_magnitude is not None and item.check_catalog_mag is not None
+                    else None
+                )
+                check_valid = item.check_magnitude is not None
+                bin_valid = (
+                    np.isfinite(bin_snr)
+                    and bin_snr >= MIN_PHOTOMETRY_SNR
+                    and item.magnitude_error <= MAX_INSTRUMENTAL_MAG_ERROR
+                )
+                bin_flag = "OK"
+                if not bin_valid:
+                    bin_flag = "LOW_SNR" if bin_snr < MIN_PHOTOMETRY_SNR else "HIGH_MAG_ERROR"
+                row.update({
+                    "frame_index": index,
+                    "filename": ";".join(frame.filename for frame in item.frames),
+                    "image_source": item.frames[0].image_source,
+                    "aavso_filter": item.frames[0].aavso_filter,
+                    "jd": f"{item.jd:.8f}",
+                    "target_calibrated_mag": f"{item.magnitude:.6f}",
+                    "target_calibrated_mag_error": f"{item.magnitude_error:.6f}",
+                    "target_inst_mag": "",
+                    "target_inst_mag_error": "",
+                    "target_snr": f"{bin_snr:.6f}",
+                    "check_object_id": item.check_object_id,
+                    "check_catalog_source": item.check_catalog_source,
+                    "check_catalog_id": item.check_catalog_id,
+                    "check_snr": "" if check_snr is None else f"{check_snr:.6f}",
+                    "check_inst_mag_error": (
+                        ""
+                        if item.check_magnitude_error is None
+                        else f"{item.check_magnitude_error:.6f}"
+                    ),
+                    "check_catalog_mag": (
+                        "" if item.check_catalog_mag is None else f"{item.check_catalog_mag:.6f}"
+                    ),
+                    "check_catalog_mag_error": (
+                        ""
+                        if item.check_catalog_mag_error is None
+                        else f"{item.check_catalog_mag_error:.6f}"
+                    ),
+                    "check_catalog_nobs": item.check_catalog_nobs,
+                    "check_catalog_b_minus_v": (
+                        ""
+                        if item.check_catalog_b_minus_v is None
+                        else f"{item.check_catalog_b_minus_v:.6f}"
+                    ),
+                    "check_catalog_g_minus_r": (
+                        ""
+                        if item.check_catalog_g_minus_r is None
+                        else f"{item.check_catalog_g_minus_r:.6f}"
+                    ),
+                    "check_calibrated_mag": (
+                        "" if item.check_magnitude is None else f"{item.check_magnitude:.6f}"
+                    ),
+                    "check_delta_mag": (
+                        "" if check_delta_mag is None else f"{check_delta_mag:.6f}"
+                    ),
+                    "check_quality_status": "OK" if check_valid else "INVALID",
+                    "check_quality_flag": "OK" if check_valid else "INSUFFICIENT_BIN_INPUTS",
+                    "valid": "1" if bin_valid else "0",
+                    "quality_status": "OK" if bin_valid else "INVALID",
+                    "quality_flag": bin_flag,
+                    "quality_note": (
+                        "flux-binned derived result"
+                        if bin_valid else "flux-binned result does not meet target quality threshold"
+                    ),
+                    "bin_input_count": len(item.frames),
+                    "bin_check_input_count": item.check_input_count,
+                    "bin_start_jd": f"{item.start_jd:.8f}",
+                    "bin_end_jd": f"{item.end_jd:.8f}",
+                    "bin_exposure_seconds": f"{item.exposure_seconds:.6f}",
+                    "bin_source_frames": ";".join(str(frame.frame_index) for frame in item.frames),
+                })
+                rows.append(row)
+            if not any(str(row.get("valid", "")) == "1" for row in rows):
+                raise ValueError("No binned point meets the existing target quality threshold.")
+            metadata = augment_result_metadata_from_rows(metadata, rows)
+            with output_csv.open("w", newline="") as handle:
+                write_result_metadata_header(handle, metadata)
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as exc:
+            self.binning_eligibility_label.setText(f"Binning failed: {exc}")
+            self.append_log(f"Binning failed: {exc}")
+            QMessageBox.warning(self, "Create Binned Curve", str(exc))
+            return
+        self.set_current_lightcurve_from_plugin(
+            output_csv,
+            source_metadata.get("OBJECT_NAME", "Target") or "Target",
+            plot_lightcurve=True,
+        )
+        self.binning_eligibility_label.setText(f"Created {len(bins)} binned points; raw curve remains unchanged.")
+        self.lightcurve_status_label.setText(f"Binned curve created: {output_csv}")
+        self.export_status_label.setText(f"Current export source: {output_csv}")
+        self.append_log(
+            f"Binned curve written: {output_csv} ({len(bins)} bins, {len(frames)} eligible inputs, "
+            f"{excluded} excluded, {skipped} short rest bins skipped)."
+        )
+
+    def activate_raw_curve(self) -> None:
+        """Switch an active binned result back to its unmodified source curve."""
+
+        current = self.loaded_lightcurve_csv
+        if current is None or not current.exists():
+            QMessageBox.warning(self, "Use Raw Curve", "No active Light Curve is available.")
+            return
+        metadata = read_result_metadata_header(current)
+        source_name = metadata.get("BIN_SOURCE_RESULT", "").strip()
+        if metadata.get("SOURCE_PROVENANCE") != "BINNED_RESULT" or not source_name:
+            QMessageBox.information(self, "Use Raw Curve", "The active curve is already the raw result.")
+            return
+        source_csv = current.with_name(source_name)
+        if not source_csv.exists():
+            QMessageBox.warning(self, "Use Raw Curve", "The raw source result CSV was not found.")
+            return
+        try:
+            self.set_current_lightcurve_from_plugin(source_csv, "", plot_lightcurve=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Use Raw Curve", f"Could not activate raw curve:\n{exc}")
+            return
+        self.binning_eligibility_label.setText("Raw curve active; it may be binned again with another size.")
+        self.append_log(f"Raw curve activated: {source_csv}")
 
     def source_directory_for_result_csv(self, result_csv: Path) -> Path | None:
         """Infer the original source directory from the current result location."""
@@ -17025,12 +18860,10 @@ class LightCurveWindow(QWidget):
 
     def update_selected_target_lightcurve_status(self) -> None:
         if self.selected_target is None:
-            self.plot_light_curve_button.setEnabled(False)
             self.lightcurve_status_label.setText("No target selected.")
             return
 
         target_name = self.selected_target.catalog_object.name.strip() or "target"
-        self.plot_light_curve_button.setEnabled(False)
         self.lightcurve_status_label.setText(
             f"No Light Curve generated or loaded for {target_name}. "
             "Create Light Curve will select Comp Stars and Check Star automatically."
@@ -17041,23 +18874,15 @@ class LightCurveWindow(QWidget):
             return self.reference_frame.path.parent
         return self.current_work_directory()
 
-    def update_plot_binning_controls(self) -> None:
-        """Update the plot-binning value field for the selected mode."""
+    def update_binning_controls(self) -> None:
+        """Update the scientific-binning size field for the selected mode."""
 
-        mode = self.plot_binning_mode_combo.currentData()
-        if mode == "count":
-            self.plot_binning_value_spin.setEnabled(True)
-            self.plot_binning_value_spin.setRange(1, 9999)
-            self.plot_binning_value_spin.setSuffix(" points")
-            self.plot_binning_value_spin.setValue(5)
-        elif mode == "seconds":
-            self.plot_binning_value_spin.setEnabled(True)
-            self.plot_binning_value_spin.setRange(1, 999999)
-            self.plot_binning_value_spin.setSuffix(" s")
-            self.plot_binning_value_spin.setValue(600)
+        if self.binning_mode_combo.currentData() == "seconds":
+            self.binning_value_spin.setSuffix(" s")
+            self.binning_value_spin.setValue(600)
         else:
-            self.plot_binning_value_spin.setEnabled(False)
-            self.plot_binning_value_spin.setSuffix("")
+            self.binning_value_spin.setSuffix(" images")
+            self.binning_value_spin.setValue(10)
 
     def single_field_zp_catalog_cache_path(self) -> Path | None:
         """Return the per-field auto-catalog cache file for Field-ZP single measurements."""
@@ -17143,8 +18968,6 @@ class LightCurveWindow(QWidget):
                 if not self.set_selected_target_object(current_selection):
                     self.set_result_status("failed")
                     return
-                if self.is_busy():
-                    self.run_light_curve_button.setEnabled(False)
 
         self.loaded_lightcurve_csv = None
         self.loaded_lightcurve_target_name = "Target"
@@ -17189,7 +19012,8 @@ class LightCurveWindow(QWidget):
         if filter_metadata is None:
             message = (
                 "No unambiguous supported FITS FILTER/CHANMODE metadata found. "
-                "Run CFA Channels / Stack first or use a FITS file with FILTER=L or FILTER=G."
+                "Run CFA Channels / Stack first or use a FITS file with "
+                "FILTER=L, FILTER=G or FILTER=V."
             )
             self.set_result_status("failed")
             self.append_log(f"ERROR: {message}")
@@ -17203,7 +19027,7 @@ class LightCurveWindow(QWidget):
             f"AAVSO filter={aavso_filter}."
         )
         if origin_marker:
-            self.append_log(f"FITS origin marker: SSAP={origin_marker}")
+            self.append_log(f"FITS provenance marker: {origin_marker}")
 
         try:
             specs = self.single_measurement_specs(image_source, aavso_filter)
@@ -17238,6 +19062,42 @@ class LightCurveWindow(QWidget):
         )
         target_measurements = [item for item in measurements if item.role == "target"]
         target_measurement = target_measurements[0] if target_measurements else None
+        if (
+            target_measurement is not None
+            and not target_measurement.valid
+            and target_measurement.quality_flag == "ANNULUS_CONTAMINATION"
+        ):
+            mask_candidate = self.single_annulus_mask_candidate_for_target(
+                frame_path,
+                target_measurement,
+                aperture_settings,
+            )
+            if mask_candidate is not None:
+                self.append_log(
+                    "Single target annulus mask candidate: "
+                    f"islands={mask_candidate.island_count}; "
+                    f"masked={mask_candidate.masked_pixel_fraction:.1%}, "
+                    f"remaining={mask_candidate.remaining_pixel_fraction:.1%}."
+                )
+                if self.confirm_single_annulus_mask(mask_candidate):
+                    measurements = aperture_measurements_for_frame(
+                        frame_path,
+                        frame_index,
+                        specs,
+                        aperture_settings.aperture_radius_px,
+                        aperture_settings.annulus_inner_px,
+                        aperture_settings.annulus_outer_px,
+                        {target_measurement.object_id: mask_candidate.exclusion_mask},
+                    )
+                    target_measurement = next(
+                        (item for item in measurements if item.role == "target"), None
+                    )
+                    self.append_log(
+                        "Single target background masked after user confirmation: "
+                        f"{mask_candidate.masked_pixel_count} pixel(s) excluded."
+                    )
+                else:
+                    self.append_log("Single target annulus-mask proposal declined by user.")
         if target_measurement is None or not target_measurement.valid or target_measurement.inst_mag is None:
             message = (
                 "Target measurement is not valid"
@@ -17261,7 +19121,14 @@ class LightCurveWindow(QWidget):
         check_calibrated_mag: float | None = None
         check_delta_mag: float | None = None
         diagnostics_dir = diagnostics_directory_for_results_dir(output_dir)
-        result_csv = output_dir / f"{stem}_single_field_zp_measurement.csv"
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        result_csv = Path(
+            self.lightcurve_results_module.single_measurement_result_path(
+                output_dir,
+                stem,
+            )
+        )
         instrumental_csv = diagnostics_dir / f"{stem}_single_instrumental_photometry.csv"
         optional_settings = load_optional_observer_result_settings()
         try:
@@ -17331,7 +19198,7 @@ class LightCurveWindow(QWidget):
             f"Single field-ZP catalog candidates: {len(field_zp_objects)} "
             f"(sources={field_zp_catalog_sources})."
         )
-        field_zp_candidates = select_single_field_zp_candidates(
+        field_zp_candidates = select_single_field_zp_candidates_with_ucac4_fallback(
             field_zp_objects,
             self.reference_frame,
             aperture_settings,
@@ -17452,6 +19319,12 @@ class LightCurveWindow(QWidget):
         ]
         field_zp_metadata = {
             **metadata,
+            "SINGLE_TARGET_BACKGROUND_MASKED": int(target_measurement.annulus_masked),
+            "SINGLE_TARGET_BACKGROUND_MASKED_PIXELS": target_measurement.annulus_masked_pixel_count,
+            "SINGLE_TARGET_BACKGROUND_MASKED_FRACTION": format_csv_float(
+                target_measurement.annulus_masked_pixel_fraction,
+                10,
+            ),
             "FIELD_ZP_STATUS": field_zp_fit.status,
             "FIELD_ZP_REFERENCE_MEASURED": field_zp_fit.measured_count,
             "FIELD_ZP_REFERENCE_USABLE": field_zp_fit.usable_count,
@@ -17547,7 +19420,7 @@ class LightCurveWindow(QWidget):
         self.current_exports.clear()
         self.set_result_status("created")
         self.refresh_bav_tab_view()
-        self.plot_light_curve_button.setEnabled(False)
+        self.refresh_action_availability()
         check_text = (
             "n/a"
             if check_delta_mag is None
@@ -17724,7 +19597,6 @@ class LightCurveWindow(QWidget):
         self.current_result_origin = "diagnostic"
         self.current_exports.clear()
         self.set_result_status("warning")
-        self.plot_light_curve_button.setEnabled(True)
         self.export_status_label.setText(
             "Diagnostic curve: scientific export and archive are disabled."
         )
@@ -17784,6 +19656,8 @@ class LightCurveWindow(QWidget):
             self.reference_frame,
             target_blend_aperture_settings,
             self.append_log,
+            warning_limit_mag=SERIES_TARGET_BLEND_WARNING_LIMIT_MAG,
+            invalid_limit_mag=SERIES_TARGET_BLEND_ERROR_LIMIT_MAG,
         )
         self.clear_comparison_star_state()
         diagnostic_curve_requested = False
@@ -17891,7 +19765,8 @@ class LightCurveWindow(QWidget):
         if filter_metadata is None:
             message = (
                 "No unambiguous supported FITS FILTER/CHANMODE metadata found. "
-                "Run CFA Channels / Stack first or use FITS files with FILTER=L or FILTER=G."
+                "Run CFA Channels / Stack first or use FITS files with "
+                "FILTER=L, FILTER=G or FILTER=V."
             )
             self.fail_lightcurve_run(message)
             self.append_log(f"ERROR: {message}")
@@ -17900,12 +19775,36 @@ class LightCurveWindow(QWidget):
             )
             return
         image_source, aavso_filter, origin_marker = filter_metadata
+        # Registration and plate solving may drop NCOMBINE from their work
+        # copies. Provenance must therefore be checked on the selected input
+        # source files, never on the temporary sequence files.
+        source_input_files = (
+            sorted(
+                path
+                for path in source_dir.iterdir()
+                if is_fits_file(path) and not is_plate_solve_artifact(path)
+            )
+            if source_dir is not None and source_dir.is_dir()
+            else []
+        )
+        source_provenance = frame_series_provenance(source_input_files)
+        source_input_fingerprint = input_series_fingerprint(source_input_files)
+        binning_allowed = source_provenance == "SINGLE_FRAME_LG_SERIES"
+        stack_image_count = (
+            uniform_stack_image_count(source_input_files)
+            if source_provenance == "DERIVED_FITS"
+            else None
+        )
         self.append_log(
             f"Photometry source/filter: image_source={image_source}, "
             f"AAVSO filter={aavso_filter}."
         )
         if origin_marker:
-            self.append_log(f"FITS origin marker: SSAP={origin_marker}")
+            self.append_log(f"FITS provenance marker: {origin_marker}")
+        self.append_log(
+            f"Binning source provenance: {source_provenance} "
+            f"({len(source_input_files)} selected input FITS files)."
+        )
 
         instrumental_csv = self.selected_target_instrumental_csv()
         result_csv = self.selected_target_result_csv()
@@ -18078,6 +19977,26 @@ class LightCurveWindow(QWidget):
             self.show_lightcurve_failure_dialog("No measurements were created.")
             return
 
+        measurements, local_background_assessment = apply_series_local_background_quality(
+            measurements
+        )
+        if local_background_assessment.baseline_ratio is None:
+            self.append_log(
+                "Series local-background guard unavailable: "
+                f"eligible frames={local_background_assessment.eligible_count}, "
+                f"need={SERIES_LOCAL_BACKGROUND_MIN_FRAMES}."
+            )
+        else:
+            self.append_log(
+                "Series local-background guard: "
+                f"method={local_background_assessment.method}, "
+                f"eligible={local_background_assessment.eligible_count}, "
+                f"baseline ratio={local_background_assessment.baseline_ratio:.4f}, "
+                f"robust sigma={local_background_assessment.robust_sigma:.4f}; "
+                f"warning={local_background_assessment.warning_count}, "
+                f"rejected={local_background_assessment.invalid_count}."
+            )
+
         measurements_before_target_blend = measurements
         measurements = apply_target_blend_assessment_to_measurements(
             measurements_before_target_blend,
@@ -18093,11 +20012,55 @@ class LightCurveWindow(QWidget):
                 f"target rows={affected_targets}."
             )
 
+        measurements, temporal_spike_assessment = apply_series_temporal_spike_quality(
+            measurements
+        )
+        self.append_log(
+            "Series temporal target-spike guard: "
+            f"method={temporal_spike_assessment.method}, "
+            f"eligible={temporal_spike_assessment.eligible_count}, "
+            f"median cadence="
+            f"{format_optional_float(temporal_spike_assessment.median_cadence_seconds, 2)} s, "
+            f"rejected={temporal_spike_assessment.rejected_count}."
+        )
+
         try:
             result_metadata = self.result_metadata(
                 measurements,
                 aperture_settings,
                 sequence_files[0],
+            )
+            result_metadata.update(
+                {
+                    "SOURCE_PROVENANCE": source_provenance,
+                    "BINNING_ALLOWED": "1" if binning_allowed else "0",
+                    "STACK_IMAGES_PER_RESULT": (
+                        "" if stack_image_count is None else stack_image_count
+                    ),
+                    "SOURCE_INPUT_FINGERPRINT_SHA256": source_input_fingerprint,
+                    "LOCAL_BACKGROUND_QC_METHOD": local_background_assessment.method,
+                    "LOCAL_BACKGROUND_QC_ELIGIBLE": local_background_assessment.eligible_count,
+                    "LOCAL_BACKGROUND_QC_WARNINGS": local_background_assessment.warning_count,
+                    "LOCAL_BACKGROUND_QC_REJECTED": local_background_assessment.invalid_count,
+                    "LOCAL_BACKGROUND_QC_BASELINE_RATIO": (
+                        ""
+                        if local_background_assessment.baseline_ratio is None
+                        else f"{local_background_assessment.baseline_ratio:.8f}"
+                    ),
+                    "LOCAL_BACKGROUND_QC_ROBUST_SIGMA": (
+                        ""
+                        if local_background_assessment.robust_sigma is None
+                        else f"{local_background_assessment.robust_sigma:.8f}"
+                    ),
+                    "TEMPORAL_SPIKE_QC_METHOD": temporal_spike_assessment.method,
+                    "TEMPORAL_SPIKE_QC_ELIGIBLE": temporal_spike_assessment.eligible_count,
+                    "TEMPORAL_SPIKE_QC_REJECTED": temporal_spike_assessment.rejected_count,
+                    "TEMPORAL_SPIKE_QC_MEDIAN_CADENCE_SECONDS": (
+                        ""
+                        if temporal_spike_assessment.median_cadence_seconds is None
+                        else f"{temporal_spike_assessment.median_cadence_seconds:.6f}"
+                    ),
+                }
             )
         except Exception as exc:
             message = f"Result metadata could not be created: {exc}"
@@ -18109,7 +20072,7 @@ class LightCurveWindow(QWidget):
             )
             return
 
-        write_instrumental_photometry(instrumental_csv, measurements)
+        write_instrumental_photometry(instrumental_csv, measurements, result_metadata)
         calibration_stats = write_calibrated_light_curve(
             result_csv,
             measurements,
@@ -18158,6 +20121,16 @@ class LightCurveWindow(QWidget):
                 self.append_log(line)
             for line in comparison_star_stability_lines(len(sequence_files), measurements):
                 self.append_log(line)
+            try:
+                result_csv.unlink(missing_ok=True)
+            except OSError as exc:
+                self.append_log(
+                    f"WARNING: Could not remove empty Light Curve result {result_csv}: {exc}"
+                )
+            else:
+                self.append_log(
+                    f"Empty Light Curve result removed after failed photometry: {result_csv}"
+                )
             run_log = self.write_run_log(output_dir)
             self.append_log(f"Run log written: {run_log.name}")
             self.write_run_log(output_dir)
@@ -18181,7 +20154,6 @@ class LightCurveWindow(QWidget):
                 )
             return
 
-        self.plot_light_curve_button.setEnabled(True)
         self.loaded_lightcurve_csv = result_csv
         self.loaded_lightcurve_target_name = target_name
         self.loaded_lightcurve_source_label = source_dir.name if source_dir is not None else ""
@@ -18285,14 +20257,18 @@ class LightCurveWindow(QWidget):
         )
 
     def plot_light_curve_from_csv_for_batch(self, result_csv: Path | str) -> None:
-        """Plot one result CSV from the optional Batch tab without enabling fit tools."""
+        """Plot one result CSV from the required Batch component without enabling fit tools."""
 
         busy_message = self.busy_context_change_message("load another result")
         if busy_message is not None:
             raise RuntimeError(busy_message)
         path = Path(result_csv)
         result_metadata = read_result_metadata_header(path)
-        target_name = result_metadata.get("OBJECT_NAME", "").strip() or path.stem.replace("_result_curve", "")
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        parsed_filename = self.lightcurve_results_module.parse_result_filename(path)
+        fallback_name = parsed_filename.target_stem if parsed_filename is not None else path.stem
+        target_name = result_metadata.get("OBJECT_NAME", "").strip() or fallback_name
         target_name = target_name.replace("_", " ") or "Target"
         self.loaded_lightcurve_csv = path
         self.loaded_lightcurve_target_name = target_name
@@ -18309,7 +20285,7 @@ class LightCurveWindow(QWidget):
             path.parent.name,
             allow_extremum=False,
         )
-        self.refresh_optional_tab_views()
+        self.refresh_plugin_tab_views()
 
     def describe_batch_result(self, result_csv: Path | str) -> tuple[str, str]:
         """Return the compact OK/WARN/ERROR status shown in the Batch table."""
@@ -18369,7 +20345,7 @@ class LightCurveWindow(QWidget):
             )
         else:
             title = "Open Light Curve CSV"
-            file_filter = "Light Curve CSV (*_result_curve.csv result_curve.csv *.csv)"
+            file_filter = "Light Curve CSV (*_result_curve*.csv result_curve.csv *.csv)"
         selected, _ = QFileDialog.getOpenFileName(
             self,
             title,
@@ -18528,12 +20504,15 @@ class LightCurveWindow(QWidget):
                 f"{getattr(report, 'result_csv_found', 0)} result CSV(s) found",
             ]
             issue_count = len(getattr(report, "issues", ()))
+            invalid_count = len(getattr(report, "invalid_results", ()))
             symlink_count = int(getattr(report, "symlink_directories_skipped", 0))
             archive_count = int(getattr(report, "archive_directories_skipped", 0))
             if bool(getattr(report, "cancelled", False)):
                 details.append("CANCELLED: partial list")
             if issue_count:
                 details.append(f"WARNING: {issue_count} path(s) unreadable")
+            if invalid_count:
+                details.append(f"WARNING: {invalid_count} invalid result(s) skipped")
             if symlink_count:
                 details.append(f"{symlink_count} linked folder(s) skipped")
             if archive_count:
@@ -18546,6 +20525,7 @@ class LightCurveWindow(QWidget):
             return bool(
                 getattr(report, "cancelled", False)
                 or getattr(report, "issues", ())
+                or getattr(report, "invalid_results", ())
                 or getattr(report, "symlink_directories_skipped", 0)
             )
 
@@ -18554,6 +20534,7 @@ class LightCurveWindow(QWidget):
                 return
             self.append_log(f"{window_title} scan: {scan_report_text(report)}")
             issues = tuple(getattr(report, "issues", ()))
+            invalid_results = tuple(getattr(report, "invalid_results", ()))
             for issue in issues[:20]:
                 self.append_log(
                     f"WARNING: Result scan could not read {issue.path}: {issue.message}"
@@ -18561,6 +20542,15 @@ class LightCurveWindow(QWidget):
             if len(issues) > 20:
                 self.append_log(
                     f"WARNING: {len(issues) - 20} additional result scan issue(s) omitted."
+                )
+            for invalid_result in invalid_results[:20]:
+                self.append_log(
+                    f"WARNING: Invalid result skipped: {invalid_result.path}: "
+                    f"{invalid_result.message}"
+                )
+            if len(invalid_results) > 20:
+                self.append_log(
+                    f"WARNING: {len(invalid_results) - 20} additional invalid result(s) omitted."
                 )
 
         try:
@@ -18616,7 +20606,7 @@ class LightCurveWindow(QWidget):
 
         update_browser_status()
 
-        table = QTableWidget(len(candidates), 10 if browser_single else 8)
+        table = QTableWidget(len(candidates), 10)
         table.setHorizontalHeaderLabels(
             (
                 [
@@ -18624,7 +20614,10 @@ class LightCurveWindow(QWidget):
                     "Status", "Refs", "Check Δ", "AAVSO", "BAV",
                 ]
                 if browser_single
-                else ["Star", "Type", "Date", "Image folder", "Rows", "PNG", "AAVSO", "BAV"]
+                else [
+                    "Star", "Type", "Date", "Image folder", "Variant", "Rows",
+                    "Check", "PNG", "AAVSO", "BAV",
+                ]
             )
         )
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -18636,13 +20629,15 @@ class LightCurveWindow(QWidget):
         table.setColumnWidth(1, 95 if browser_single else 90)
         table.setColumnWidth(2, 270 if browser_single else 95)
         table.setColumnWidth(3, 90 if browser_single else 270)
-        table.setColumnWidth(4, 70 if browser_single else 60)
-        table.setColumnWidth(5, 150 if browser_single else 55)
-        table.setColumnWidth(6, 55 if browser_single else 65)
-        table.setColumnWidth(7, 75 if browser_single else 55)
+        table.setColumnWidth(4, 70 if browser_single else 95)
+        table.setColumnWidth(5, 150 if browser_single else 60)
+        table.setColumnWidth(6, 55 if browser_single else 55)
+        table.setColumnWidth(7, 75 if browser_single else 65)
         if browser_single:
             table.setColumnWidth(8, 65)
             table.setColumnWidth(9, 55)
+        else:
+            table.setColumnWidth(8, 55)
 
         def candidate_values(candidate: object) -> list[str]:
             if browser_single:
@@ -18670,7 +20665,9 @@ class LightCurveWindow(QWidget):
                 candidate.variable_type,
                 candidate.report_date,
                 candidate.source_directory_name,
+                str(getattr(candidate, "result_variant_label", "Raw")),
                 str(candidate.row_count),
+                "yes" if candidate.has_calibrated_check else "no",
                 "yes" if candidate.png_exists else "no",
                 "yes" if candidate.aavso_exists else "no",
                 str(candidate.bav_file_count),
@@ -18717,8 +20714,6 @@ class LightCurveWindow(QWidget):
                     candidate.target_name,
                     candidate.source_directory_name,
                     show_running_mean=False,
-                    bin_mode="off",
-                    bin_value=1,
                     include_check=False,
                 )
             except Exception as exc:
@@ -18758,11 +20753,14 @@ class LightCurveWindow(QWidget):
                 self.append_log(f"WARNING: Result CSV could not be loaded: {exc}")
                 return
             source_label = "BAV result" if bav_only else "Result"
+            check_text = "available" if candidate.has_calibrated_check else "not stored"
             self.append_log(
-                f"{source_label} selected from folder scan: {candidate.result_csv}"
+                f"{source_label} selected from folder scan: {candidate.result_csv}; "
+                f"Check Star: {check_text}."
             )
             update_browser_status(
                 f"Loaded: {candidate.target_name} ({candidate.report_date}) | "
+                f"Check Star: {check_text} | "
                 f"{len(candidates)} {item_label}: {results_dir}"
             )
 
@@ -18820,19 +20818,36 @@ class LightCurveWindow(QWidget):
             raise RuntimeError(f"Result CSV not found: {path}")
         name = str(target_name or "").strip()
         result_metadata = read_result_metadata_header(path)
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        parsed_filename = self.lightcurve_results_module.parse_result_filename(path)
         is_single_result = result_csv_contains_single_field_zp_rows(path)
         is_diagnostic_result = result_metadata_is_diagnostic(result_metadata)
+        can_plot_lightcurve = (
+            (
+                parsed_filename is not None
+                and parsed_filename.result_kind
+                == self.lightcurve_results_module.RESULT_KIND_LIGHTCURVE
+            )
+            or is_diagnostic_result
+        )
+        if not is_single_result:
+            if not can_plot_lightcurve:
+                raise RuntimeError(
+                    "CSV is neither a Light Curve nor a Single Measurement result"
+                )
+            load_light_curve_plot_data(
+                path,
+                include_invalid=is_diagnostic_result,
+            )
         if not name:
-            name = result_metadata.get("OBJECT_NAME", "").strip() or path.name
-            for suffix in (
-                "_result_curve.csv",
-                "_single_field_zp_measurement.csv",
-                "_diagnostic_curve.csv",
-                ".csv",
-            ):
-                if name.endswith(suffix):
-                    name = name[: -len(suffix)]
-                    break
+            name = result_metadata.get("OBJECT_NAME", "").strip()
+            if not name:
+                name = (
+                    parsed_filename.target_stem
+                    if parsed_filename is not None
+                    else path.stem.removesuffix("_diagnostic_curve")
+                )
             name = name.replace("_", " ")
         self.loaded_lightcurve_csv = path
         self.loaded_lightcurve_target_name = name or "Target"
@@ -18850,7 +20865,6 @@ class LightCurveWindow(QWidget):
                 rows.extend(csv_data_dict_reader(handle))
             if not rows:
                 raise RuntimeError("Single Measurement result has no data row")
-            self.plot_light_curve_button.setEnabled(False)
             self.set_loaded_single_result_summary(path, rows)
             if not any(result_row_is_valid(row) for row in rows):
                 self.set_result_status("failed")
@@ -18869,16 +20883,11 @@ class LightCurveWindow(QWidget):
                 self.lightcurve_status_label.setText(f"Single Measurement loaded: {path}")
                 self.export_status_label.setText(f"Current export source: {path}")
                 self.append_log(f"Single Measurement CSV loaded: {path}")
-            self.update_current_curve_path_label()
+            self.update_current_result_displays()
             self.clear_extremum_fit(redraw=False, reset_status=False)
-            self.refresh_optional_tab_views()
+            self.refresh_action_availability()
+            self.refresh_plugin_tab_views()
             return
-        can_plot_lightcurve = (
-            path.name.endswith("_result_curve.csv") or is_diagnostic_result
-        )
-        if not can_plot_lightcurve:
-            raise RuntimeError("CSV is neither a Light Curve nor a Single Measurement result")
-        self.plot_light_curve_button.setEnabled(can_plot_lightcurve)
         if is_diagnostic_result:
             self.export_status_label.setText(
                 "Diagnostic curve: scientific export and archive are disabled."
@@ -18887,7 +20896,7 @@ class LightCurveWindow(QWidget):
         else:
             self.export_status_label.setText(f"Current export source: {path}")
             self.lightcurve_status_label.setText(f"Light curve loaded: {path}")
-        self.update_current_curve_path_label()
+        self.update_current_result_displays()
         self.append_log(f"Light Curve CSV loaded: {path}")
         self.clear_extremum_fit(redraw=False, reset_status=False)
         if plot_lightcurve and can_plot_lightcurve:
@@ -18902,7 +20911,8 @@ class LightCurveWindow(QWidget):
                 allow_extremum=allow_extremum and not is_diagnostic_result,
                 include_invalid=is_diagnostic_result,
             )
-        self.refresh_optional_tab_views()
+        self.refresh_action_availability()
+        self.refresh_plugin_tab_views()
 
     def current_export_lightcurve(self) -> tuple[Path, str] | None:
         """Return the current valid photometry result and target name for export."""
@@ -18942,9 +20952,9 @@ class LightCurveWindow(QWidget):
     def current_aavso_export_path(self, result_csv: Path) -> Path:
         """Return the AAVSO report path for one result CSV."""
 
-        output_dir = result_csv.parent / "AAVSO"
-        output_name = result_csv.stem.replace("_result_curve", "") + "_aavso_extended.txt"
-        return output_dir / output_name
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        return Path(self.lightcurve_results_module.aavso_report_path(result_csv))
 
     def open_aavso_export_folder(self) -> None:
         """Open the folder containing the current AAVSO export."""
@@ -19112,8 +21122,6 @@ class LightCurveWindow(QWidget):
         allow_extremum: bool = True,
         include_invalid: bool = False,
     ) -> None:
-        bin_mode = str(self.plot_binning_mode_combo.currentData() or "off")
-        bin_value = int(self.plot_binning_value_spin.value())
         try:
             plot_data = load_light_curve_plot_data(
                 result_csv,
@@ -19125,8 +21133,6 @@ class LightCurveWindow(QWidget):
                 target_name,
                 source_label,
                 show_running_mean=self.show_running_mean_checkbox.isChecked(),
-                bin_mode=bin_mode,
-                bin_value=bin_value,
                 include_check=True,
             )
         except (OSError, ValueError) as exc:
@@ -19153,14 +21159,10 @@ class LightCurveWindow(QWidget):
                 props={"facecolor": "#4c78a8", "alpha": 0.18},
                 interactive=True,
             )
-            self.fit_extremum_button.setEnabled(True)
-            self.trim_lightcurve_button.setEnabled(True)
         else:
             self.lightcurve_span_selector = None
-            self.fit_extremum_button.setEnabled(False)
-            self.trim_lightcurve_button.setEnabled(False)
-        self.clear_extremum_button.setEnabled(False)
         self.lightcurve_canvas.draw()
+        self.refresh_action_availability()
 
         if output_png is not None:
             self.lightcurve_figure.savefig(output_png, dpi=150)
@@ -19183,6 +21185,7 @@ class LightCurveWindow(QWidget):
         if xmin == xmax:
             return
         self.lightcurve_selected_range = (min(xmin, xmax), max(xmin, xmax))
+        self.refresh_action_availability()
         self.lightcurve_status_label.setText(
             f"Selected JD range: {self.lightcurve_selected_range[0]:.8f} - "
             f"{self.lightcurve_selected_range[1]:.8f}. "
@@ -19283,7 +21286,7 @@ class LightCurveWindow(QWidget):
         )
         self.lightcurve_status_label.setText(message)
         self.append_log(message)
-        self.refresh_optional_tab_views()
+        self.refresh_plugin_tab_views()
         try:
             self.write_run_log(result_csv.parent)
         except Exception as exc:
@@ -19317,7 +21320,7 @@ class LightCurveWindow(QWidget):
                     self.lightcurve_span_selector.clear()
                 except AttributeError:
                     pass
-        self.clear_extremum_button.setEnabled(False)
+        self.refresh_action_availability()
         if reset_status:
             self.set_fit_status("none")
         else:
@@ -19354,50 +21357,14 @@ class LightCurveWindow(QWidget):
                 parts.append(f"{key}={format_quality_value(value)}")
             self.append_log(f"Min/Max fit #{attempt_number} model check: " + ", ".join(parts))
 
-        def show_rejected_fit_attempt(calculation: ExtremumFitCalculation) -> None:
-            axis = self.lightcurve_axis
-            if axis is None or calculation.coefficients is None or calculation.selected_x is None:
-                return
-            if not np.isfinite(calculation.vertex_jd) or not np.isfinite(calculation.vertex_mag):
-                return
-            a, b, c = calculation.coefficients
-            x = calculation.selected_x
-            xlim = axis.get_xlim()
-            ylim = axis.get_ylim()
-            self.clear_extremum_fit(redraw=False, reset_status=False, clear_selection=False)
-            fit_x_plot = np.linspace(float(np.min(x)), float(np.max(x)), 160)
-            fit_centered = fit_x_plot - calculation.x0
-            fit_y_plot = a * fit_centered * fit_centered + b * fit_centered + c
-            fit_line = axis.plot(
-                fit_x_plot,
-                fit_y_plot,
-                color="#cc3311",
-                linewidth=1.4,
-                linestyle="--",
-            )[0]
-            marker = axis.plot(
-                calculation.vertex_jd,
-                calculation.vertex_mag,
-                "x",
-                color="#cc3311",
-                markersize=6,
-                markeredgewidth=1.4,
-            )[0]
-            vline = axis.axvline(
-                calculation.vertex_jd,
-                color="#cc3311",
-                linewidth=0.9,
-                linestyle=":",
-            )
-            self.lightcurve_fit_artists = [fit_line, marker, vline]
-            self.current_extremum_fit_result = None
-            self.current_extremum_fit_csv = None
-            self.set_extremum_fit_text("Min/Max fit: rejected")
-            self.clear_extremum_button.setEnabled(True)
-            axis.set_xlim(xlim)
-            axis.set_ylim(ylim)
-            self.lightcurve_canvas.draw()
+        def persist_fit_log() -> None:
+            output_dir = self.lightcurve_output_directory()
+            if output_dir is not None:
+                self.write_run_log(output_dir)
 
+        # Even an invalid new attempt must invalidate an older export result.
+        self.clear_extremum_fit(
+            redraw=self.lightcurve_canvas is not None, reset_status=False, clear_selection=False)
         if (
             self.lightcurve_axis is None
             or self.lightcurve_jd_values is None
@@ -19419,20 +21386,43 @@ class LightCurveWindow(QWidget):
         self.extremum_fit_attempt_counter = attempt_number
         self.set_fit_status("fitting")
         xmin, xmax = self.lightcurve_selected_range
+        selected_model_setting = str(self.extremum_model_combo.currentData())
+        required_model_name = (
+            None
+            if selected_model_setting == EXTREMUM_MODEL_AUTOMATIC
+            else selected_model_setting
+        )
+        model_label = next(
+            (
+                label
+                for label, model_name in EXTREMUM_MODEL_OPTIONS
+                if model_name == selected_model_setting
+            ),
+            selected_model_setting,
+        )
         calculation = calculate_extremum_fit(
             self.lightcurve_jd_values,
             self.lightcurve_mag_values,
             self.lightcurve_mag_errors,
             xmin,
             xmax,
+            required_model_name=required_model_name,
         )
+        fit_mode_label = f"curve model={model_label}, exact user range"
+        for model_check in calculation.model_checks:
+            log_model_check(model_check)
 
         if not calculation.accepted:
-            if calculation.show_attempt:
-                show_rejected_fit_attempt(calculation)
             self.set_fit_status("failed")
             log_fit_quality("rejected", calculation.reason, **calculation.metrics)
-            self.append_log(f"Min/Max fit #{attempt_number} rejected: {calculation.reason}")
+            self.set_extremum_fit_text(
+                f"Min/Max fit: rejected ({model_label})"
+            )
+            self.append_log(
+                f"Min/Max fit #{attempt_number} rejected: {calculation.reason}, "
+                f"mode={fit_mode_label}, range={xmin:.8f}-{xmax:.8f}"
+            )
+            persist_fit_log()
             QMessageBox.warning(self, "Fit Min/Max", calculation.message)
             return
 
@@ -19454,7 +21444,6 @@ class LightCurveWindow(QWidget):
         self.lightcurve_fit_artists = [fit_line, marker, vline]
         axis.set_xlim(xlim)
         axis.set_ylim(ylim)
-        self.clear_extremum_button.setEnabled(True)
         warning_suffix = f" ({'; '.join(calculation.warnings)})" if calculation.warnings else ""
         inlier_count = int(result["point_count"])
         selected_count = int(result["selected_point_count"])
@@ -19462,10 +21451,12 @@ class LightCurveWindow(QWidget):
         current = self.current_export_lightcurve()
         self.current_extremum_fit_csv = current[0] if current is not None else None
         self.set_fit_status("selected")
-        for model_check in calculation.model_checks:
-            log_model_check(model_check)
+        self.refresh_action_availability()
         log_fit_quality("accepted", "ok", **calculation.metrics)
-        model_suffix = f", model={calculation.model_name or result.get('fit_model', 'unknown')}"
+        model_suffix = (
+            f", model={calculation.model_name or result.get('fit_model', 'unknown')}"
+            f", selected={model_label}"
+        )
         fit_summary = (
             f"{calculation.extremum_type}: JD {calculation.vertex_jd:.8f}"
             + (f" +/- {calculation.vertex_jd_error:.8f}" if np.isfinite(calculation.vertex_jd_error) else "")
@@ -19485,12 +21476,11 @@ class LightCurveWindow(QWidget):
             f"n={inlier_count}/{selected_count}, rms={float(result['rms']):.4f}, "
             f"weighted_rms={float(result['weighted_rms']):.4f}, "
             f"model={calculation.model_name or result.get('fit_model', 'unknown')}, "
+            f"mode={fit_mode_label}, "
             f"range={xmin:.8f}-{xmax:.8f}"
             + (f", warnings={'; '.join(calculation.warnings)}" if calculation.warnings else "")
         )
-        output_dir = self.lightcurve_output_directory()
-        if output_dir is not None:
-            self.write_run_log(output_dir)
+        persist_fit_log()
         self.lightcurve_canvas.draw()
 
     def closeEvent(self, event) -> None:  # noqa: N802
@@ -19537,14 +21527,12 @@ class LightCurveWindow(QWidget):
         if self.cfa_stack_window is not None:
             self.cfa_stack_window.close()
             self.cfa_stack_window = None
-        self.automatic_module = None
-        self.cfa_stack_module = None
         local_loop = self.local_event_loop
         if isinstance(local_loop, QEventLoop) and local_loop.isRunning():
             local_loop.quit()
         event.accept()
 
-    def build_help_html(self) -> str:
+    def build_overview_html(self) -> str:
         colors = THEME_COLORS
         return f"""
         <html>
@@ -19626,12 +21614,15 @@ class LightCurveWindow(QWidget):
                 <li>SNR below {MIN_PHOTOMETRY_SNR:g} or magnitude error above
                 {MAX_INSTRUMENTAL_MAG_ERROR:g} mag;</li>
                 <li>a large centroid offset;</li>
-                <li>a completely modeled Gaia neighbor blend with at least
-                {TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag expected target impact;</li>
+                <li>a completely modeled Gaia neighbor blend in a single measurement with at least
+                {TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag, or in a series with at least
+                {SERIES_TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag, expected target impact;</li>
                 <li>background contamination of a comparison or check star with at least
                 {REFERENCE_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact;</li>
                 <li>target background/annulus contamination with at least
                 {TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact;</li>
+                <li>a large per-series mismatch between the already measured target
+                background and the simultaneous comparison-star backgrounds;</li>
                 <li>inconsistent comparison-star zero points.</li>
             </ul>
             <p>Warnings remain usable and stay visible in the CSV and log. In particular,
@@ -19639,7 +21630,9 @@ class LightCurveWindow(QWidget):
             {TARGET_ANNULUS_IMPACT_WARNING_MAG:.2f} mag and invalid from
             {TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag.
             Missing or ambiguous Gaia evidence is also a warning; the aperture measurement
-            still runs.</p>
+            still runs. In a series, a completely modeled Gaia target blend is also a
+            warning from {SERIES_TARGET_BLEND_WARNING_LIMIT_MAG:.2f} mag and invalid from
+            {SERIES_TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag; its flux is not corrected.</p>
             <div class="note">
                 The result contains only valid calibrated target points.<br>
                 Results: <code>../{RESULTS_DIRECTORY_NAME}/&lt;FITS-folder-name&gt;</code><br>
@@ -19670,13 +21663,17 @@ class LightCurveWindow(QWidget):
             <ol>
                 <li>Drag a JD range around one visible extremum.</li>
                 <li>Include both flanks and at least {EXTREMUM_MINIMUM_FIT_POINTS} points.</li>
+                <li>Keep the recommended robust cubic spline, or deliberately choose another curve model.</li>
                 <li>Click <b>Fit Min/Max</b>.</li>
             </ol>
+            <p>The robust cubic spline chooses its smoothing automatically. A manually
+            selected model is never silently replaced by another one.</p>
             <p>A fit is rejected if:</p>
             <ul>
                 <li>the range is too small or unbalanced;</li>
                 <li>the curve is nearly linear;</li>
                 <li>the extremum lies outside the selection or measured magnitude range;</li>
+                <li>the selected range contains no extremum or multiple extrema;</li>
                 <li>the prominence is too weak compared with the scatter.</li>
             </ul>
             <p>An accepted fit is marked in the plot and recorded in the run log.
@@ -19706,10 +21703,98 @@ class LightCurveWindow(QWidget):
         </html>
         """
 
-    def show_help(self) -> None:
+    def build_help_html(self) -> str:
+        """Return concise help for the tab that is currently visible."""
+
+        tab_index = self.tabs.currentIndex()
+        tab_name = self.tabs.tabText(tab_index) if tab_index >= 0 else "SeePhot"
+        help_by_tab = {
+            "Prepare": (
+                "Select the folder with the prepared FITS sequence and click <b>Run</b>. "
+                "Use <b>CFA Channels / Stack</b> first when original Seestar CFA frames "
+                "still need to be prepared. Progress and skipped-frame details appear in the log."
+            ),
+            "Variables": (
+                "Filter the VSX list if needed, then double-click a row or use "
+                "<b>Select Target</b>. <b>Open VSX</b> opens the catalog entry for the "
+                "selected variable."
+            ),
+            "Photometry": (
+                "Click <b>Create Light Curve</b> to measure the selected target. Use "
+                "<b>Show Comparison Stars</b> to inspect the ensemble. Existing result CSVs "
+                "can be opened, plotted, trimmed, and fitted here. Quality limits distinguish "
+                f"target blends ({TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag), reference-annulus "
+                f"contamination ({REFERENCE_ANNULUS_IMPACT_INVALID_MAG:.2f} mag), and target-annulus "
+                f"warnings/invalid measurements ({TARGET_ANNULUS_IMPACT_WARNING_MAG:.2f}/"
+                f"{TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag)."
+            ),
+            "Export": (
+                "Enter your AAVSO observer code, check the displayed telescope, and click "
+                "<b>Export AAVSO Report</b>. The export uses the currently selected or opened "
+                "Light Curve result."
+            ),
+            "QC": (
+                "Use this developer-oriented tab to run or compare focused quality checks for "
+                "the current result. Read the log before saving a new reference result."
+            ),
+            "BAV": (
+                "Complete the BAV configuration, then create the BAV files from the current "
+                "Light Curve result. Use <b>Ordner öffnen</b> to inspect the generated files."
+            ),
+            "Archive": (
+                "Choose a results folder, review its worklist and status, then archive only the "
+                "intended results or images. Add or inspect comments before archiving if needed."
+            ),
+            "Ext_Tools": (
+                "Open a FITS file to inspect the external-telescope header tools available on "
+                "this tab. Any findings and errors are reported in the log."
+            ),
+            "Tools": (
+                "Choose a FITS image for the photometric-linearity check, or select a source "
+                "folder and run <b>Analyze Timing</b> for stack profiling."
+            ),
+        }
+        body = help_by_tab.get(
+            tab_name,
+            "Use the controls on this tab from top to bottom. Progress, warnings, and errors "
+            "appear in the log below.",
+        )
+        colors = THEME_COLORS
+        return f"""
+        <html><head><style>
+            body {{ color: {colors['text']}; }}
+            h2 {{ color: {colors['title_text']}; margin-bottom: 8px; }}
+            .note {{ background-color: {colors['status']}; border-left: 3px solid
+                {colors['status_accent']}; padding: 9px; }}
+        </style></head><body>
+            <h2>{tab_name}</h2>
+            <div class="note">{body}</div>
+            <p>For the complete workflow, click <b>Overview</b>.</p>
+        </body></html>
+        """
+
+    def show_overview(self) -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"{APP_DISPLAY_NAME} Help")
+        dialog.setWindowTitle(f"{APP_DISPLAY_NAME} Overview")
         dialog.resize(780, 620)
+
+        layout = QVBoxLayout(dialog)
+        text_view = QTextEdit()
+        text_view.setReadOnly(True)
+        text_view.setHtml(self.build_overview_html())
+        layout.addWidget(text_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def show_help(self) -> None:
+        tab_index = self.tabs.currentIndex()
+        tab_name = self.tabs.tabText(tab_index) if tab_index >= 0 else APP_DISPLAY_NAME
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{tab_name} Help")
+        dialog.resize(620, 300)
 
         layout = QVBoxLayout(dialog)
         text_view = QTextEdit()
@@ -19818,15 +21903,14 @@ def acquire_single_instance_lock() -> SingleInstanceLock | None:
 
     def lock_is_stale() -> bool:
         try:
-            stat = SINGLE_INSTANCE_LOCK_PATH.stat()
+            pid_text = SINGLE_INSTANCE_LOCK_PATH.read_text(encoding="ascii").strip()
         except FileNotFoundError:
             return False
-        if time.time() - stat.st_mtime > SINGLE_INSTANCE_LOCK_MAX_AGE_SECONDS:
+        except OSError:
             return True
         try:
-            pid_text = SINGLE_INSTANCE_LOCK_PATH.read_text(encoding="ascii").strip()
             pid = int(pid_text.splitlines()[0])
-        except (OSError, ValueError, IndexError):
+        except (ValueError, IndexError):
             return True
         if pid <= 0:
             return True

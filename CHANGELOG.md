@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.8.20 - 2026-09-20
+
+- Expanded the Main release bundle to ten scripts, adding analysis tools,
+  automated CFA/stack processing, target batch processing, scientific
+  light-curve binning, linearity diagnostics, and stack profiling.
+- Added pause-aware and dynamic stacking workflows with improved CFA stack
+  planning, recommendations, and logging.
+- Added Seestar S50 Pro support and improved FITS metadata handling for newer
+  Seestar firmware.
+- Reworked result discovery, generated result variants, binning provenance,
+  and Single Measurement workflows.
+- Improved target and annulus contamination handling, measurement validation,
+  and robust extremum fitting.
+- Expanded the BAV workflow with optional periods, multiple extrema, comments,
+  improved filenames, and more reliable result handling.
+- Refined application state, contextual help, batch workflows, and
+  user-facing error reporting.
+
 ## 0.4.5-pre - 2026-08-05
 
 - Added post-measurement Gaia DR3 target-blend assessment for light curves

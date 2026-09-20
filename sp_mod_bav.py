@@ -24,6 +24,12 @@ from html import escape
 from io import BytesIO
 from pathlib import Path
 
+_SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(_SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIRECTORY))
+
+import sp_mod_results as _RESULT_CONTRACT
+
 warnings.filterwarnings(
     "ignore",
     message=r"XDG_CACHE_HOME is set to .*but the default location.*already exists.*",
@@ -31,8 +37,8 @@ warnings.filterwarnings(
 
 
 PLUGIN_TAB_LABEL = "BAV"
-BAV_PLUGIN_VERSION = "0.3"
-APP_NAME = "SeestarLightcurve"
+BAV_PLUGIN_VERSION = "0.4"
+APP_NAME = "SeePhot"
 CONFIG_NAME = "bav_report.json"
 REPORT_TABLE_HEADER_BACKGROUND = "#4472C4"
 REPORT_TABLE_HEADER_TEXT = "#FFFFFF"
@@ -49,21 +55,10 @@ SINGLE_FIELD_ZP_CALIBRATION_METHODS = {
     "field_zero_point_auto_catalog_v1",
     "field-zero-point-auto-catalog-v1",
 }
-TELESCOPE_CHOICES = ("Seestar S30", "Seestar S30pro", "Seestar S50")
-TELESCOPE_SPECS = {
-    "Seestar S30": {
-        "sensor": "Sony IMX662",
-        "pixel_scale_arcsec_px": 3.99,
-    },
-    "Seestar S30pro": {
-        "sensor": "Sony IMX585",
-        "pixel_scale_arcsec_px": 3.76,
-    },
-    "Seestar S50": {
-        "sensor": "Sony IMX462",
-        "pixel_scale_arcsec_px": 2.39,
-    },
-}
+TELESCOPE_CHOICES = _RESULT_CONTRACT.RESULT_TELESCOPE_CHOICES
+TELESCOPE_SPECS = _RESULT_CONTRACT.RESULT_TELESCOPE_SPECS
+
+
 DEFAULT_CONFIG = {
     "bav_code": "",
     "observer_name": "",
@@ -89,7 +84,6 @@ LIGHTCURVE_SHEET_REQUIRED_METADATA = (
     "OBJECT_DEC",
     "OBJECT_VAR_TYPE",
     "OBJECT_MAG_RANGE",
-    "OBJECT_PERIOD",
     "OBSERVER_BAV",
     "OBSERVER_NAME",
     "OBSERVER_AAVSO",
@@ -506,6 +500,72 @@ def _exposure_text(value: str) -> str:
     return value.strip()
 
 
+def _positive_int(value: str) -> int | None:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def observation_method_and_image_count(
+    metadata: dict[str, str],
+    rows: list[dict[str, str]],
+) -> tuple[str, str, str]:
+    """Return method, used original-image count, and exposure unit for BAV."""
+
+    provenance = _metadata_value(metadata, "SOURCE_PROVENANCE")
+    binning_mode = _metadata_value(metadata, "BINNING_MODE")
+    binning_value = _positive_int(_metadata_value(metadata, "BINNING_VALUE"))
+    if provenance == "BINNED_RESULT" and binning_value is not None:
+        if binning_mode == "count":
+            method = f"Binning {binning_value} img"
+        elif binning_mode == "seconds":
+            method = f"Binning {binning_value} s"
+        else:
+            method = "Binning"
+        used_images = sum(
+            count
+            for row in rows
+            if (count := _positive_int(row.get("bin_input_count", ""))) is not None
+        )
+        return method, str(used_images) if used_images else "n/a", "image"
+    if provenance == "SINGLE_FRAME_LG_SERIES":
+        return "Single images", str(len(rows)), "image"
+    if provenance == "DERIVED_FITS":
+        stack_images = _positive_int(_metadata_value(metadata, "STACK_IMAGES_PER_RESULT"))
+        if stack_images is not None:
+            return f"Stack {stack_images} img", str(len(rows) * stack_images), "stack"
+        return "Stacked images", "n/a", "stack"
+    return "", "n/a", ""
+
+
+def observation_details_rows(
+    metadata: dict[str, str],
+    rows: list[dict[str, str]],
+) -> list[tuple[str, str]]:
+    """Return the compact acquisition and observer rows for a BAV sheet."""
+
+    method, image_count, exposure_unit = observation_method_and_image_count(metadata, rows)
+    exposure = _exposure_text(_metadata_value(metadata, "EXPOSURE_SECONDS"))
+    if exposure and exposure_unit:
+        exposure = f"{exposure} / {exposure_unit}"
+    return [
+        ("UTC Range", _utc_text(_metadata_value(metadata, "UTC_START"))),
+        ("", _utc_text(_metadata_value(metadata, "UTC_END"))),
+        ("HJD Range", _hjd_range_text(metadata, rows)),
+        ("Exposure", exposure),
+        ("Method", method),
+        ("Images used", image_count),
+        ("N° Obs", _metadata_value(metadata, "OBS_COUNT")),
+        ("Location", _metadata_value(metadata, "OBSERVER_SITE")),
+        ("Lat / Long", _lat_long_text(metadata)),
+        ("Observer", _metadata_value(metadata, "OBSERVER_NAME")),
+        ("BAV", _metadata_value(metadata, "OBSERVER_BAV")),
+        ("AAVSO", _metadata_value(metadata, "OBSERVER_AAVSO")),
+    ]
+
+
 def _format_dms(value: float, positive_suffix: str, negative_suffix: str) -> str:
     suffix = positive_suffix if value >= 0 else negative_suffix
     absolute = abs(value)
@@ -543,6 +603,8 @@ def _report_table(
     rows: list[tuple[str, str]],
     styles: object,
     widths: tuple[float, float],
+    *,
+    section_break_after: frozenset[str] = frozenset(),
 ) -> object:
     from reportlab.lib import colors
     from reportlab.lib.styles import ParagraphStyle
@@ -576,9 +638,7 @@ def _report_table(
             ]
         )
     table = Table(data, colWidths=list(widths), hAlign="LEFT")
-    table.setStyle(
-        TableStyle(
-            [
+    style_commands = [
                 ("SPAN", (0, 0), (1, 0)),
                 (
                     "BACKGROUND",
@@ -600,9 +660,13 @@ def _report_table(
                 ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                 ("TOPPADDING", (0, 0), (-1, -1), 2),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ]
-        )
-    )
+    ]
+    for row_index, (label, _value) in enumerate(rows, start=1):
+        if label in section_break_after:
+            style_commands.append(
+                ("LINEBELOW", (0, row_index), (1, row_index), 0.9, colors.HexColor("#6d8eaa"))
+            )
+    table.setStyle(TableStyle(style_commands))
     return table
 
 
@@ -702,56 +766,105 @@ def _short_catalog_source(value: str) -> str:
     return text
 
 
+def _catalog_designation(source: str, catalog_id: str) -> str:
+    return " ".join(
+        part for part in (_short_catalog_source(source), catalog_id.strip()) if part
+    )
+
+
+def _metadata_catalog_designation(entry: str) -> str:
+    parts = entry.strip().split()
+    if len(parts) < 2:
+        return entry.strip()
+    return _catalog_designation(parts[0], parts[1])
+
+
+def _catalog_display_name(value: str) -> str:
+    source = value.strip()
+    return "APASS DR10" if source == "APASS_DR10" else source
+
+
+def _catalog_sources_for_photometry(
+    metadata: dict[str, str],
+    rows: list[dict[str, str]],
+) -> list[str]:
+    sources: list[str] = []
+    if rows:
+        row = rows[0]
+        sources.extend(_split_semicolon_field(row, "comparison_catalog_sources"))
+        sources.append(row.get("check_catalog_source", "").strip())
+    if not any(sources):
+        for key in ("COMP_STARS", "CHECK_STAR"):
+            for entry in _metadata_value(metadata, key).split(";"):
+                parts = entry.strip().split()
+                if parts:
+                    sources.append(parts[0])
+    return list(dict.fromkeys(_catalog_display_name(source) for source in sources if source))
+
+
 def _comparison_star_rows(
     metadata: dict[str, str],
     rows: list[dict[str, str]],
-    limit: int = 6,
 ) -> list[tuple[str, str]]:
     if rows:
         row = rows[0]
-        sources = _split_semicolon_field(row, "comparison_catalog_sources")
-        ids = _split_semicolon_field(row, "comparison_catalog_ids")
-        mags = _split_semicolon_field(row, "comparison_catalog_mags")
-        b_minus_v = _split_semicolon_field(row, "comparison_catalog_b_minus_v")
-        g_minus_r = _split_semicolon_field(row, "comparison_catalog_g_minus_r")
-        table_rows: list[tuple[str, str]] = []
-        for index, comp_id in enumerate(ids[:limit]):
-            source = _short_catalog_source(sources[index]) if index < len(sources) else ""
-            mag = mags[index] if index < len(mags) else ""
-            bv = b_minus_v[index] if index < len(b_minus_v) else ""
-            gr = g_minus_r[index] if index < len(g_minus_r) else ""
-            parts = [" ".join(part for part in (source, comp_id) if part)]
-            try:
-                mag_text = f"V={float(mag):.1f}mag"
-            except ValueError:
-                mag_text = ""
-            if mag_text:
-                photometry_parts = [mag_text]
-            else:
-                photometry_parts = []
-            try:
-                photometry_parts.append(f"B-V={float(bv):.2f}")
-            except ValueError:
-                if gr:
-                    try:
-                        photometry_parts.append(f"G-R={float(gr):.2f}")
-                    except ValueError:
-                        pass
-            text = escape(parts[0] if parts else "")
-            if photometry_parts:
-                text += "<br/>" + escape(", ".join(photometry_parts))
-            table_rows.append(("Comp Star", text))
-        if len(ids) > limit:
-            table_rows.append(("Comp Star", escape(f"... {len(ids) - limit} more")))
-        if table_rows:
-            return table_rows
+        ids = [
+            catalog_id
+            for catalog_id in _split_semicolon_field(row, "comparison_catalog_ids")
+            if catalog_id
+        ]
+        designations: list[str] = []
+        for index, comp_id in enumerate(ids):
+            designation = comp_id.strip()
+            if designation:
+                designations.append(designation)
+        if designations:
+            return [("Comp Stars", "<br/>".join(escape(item) for item in designations))]
 
     raw = _metadata_value(metadata, "COMP_STARS")
     entries = [item.strip() for item in raw.split(";") if item.strip()]
-    table_rows = [("Comp Star", escape(entry)) for entry in entries[:limit]]
-    if len(entries) > limit:
-        table_rows.append(("Comp Star", escape(f"... {len(entries) - limit} more")))
-    return table_rows
+    designations = [
+        " ".join(entry.split()[1:2]) or _metadata_catalog_designation(entry)
+        for entry in entries
+    ]
+    return [("Comp Stars", "<br/>".join(escape(item) for item in designations))] if designations else []
+
+
+def _check_star_row(
+    metadata: dict[str, str],
+    rows: list[dict[str, str]],
+) -> tuple[str, str] | None:
+    if rows:
+        row = rows[0]
+        designation = _catalog_designation(
+            row.get("check_catalog_source", ""),
+            row.get("check_catalog_id", "") or row.get("check_object_id", ""),
+        )
+        if designation:
+            details = [
+                row.get("check_catalog_id", "").strip()
+                or row.get("check_object_id", "").strip()
+            ]
+            magnitude = _optional_float(row.get("check_catalog_mag"))
+            if math.isfinite(magnitude):
+                details.append(f"Mag={magnitude:.2f}")
+            b_minus_v = _optional_float(row.get("check_catalog_b_minus_v"))
+            g_minus_r = _optional_float(row.get("check_catalog_g_minus_r"))
+            if math.isfinite(b_minus_v):
+                details.append(f"B-V={b_minus_v:.2f}")
+            elif math.isfinite(g_minus_r):
+                details.append(f"G-R={g_minus_r:.2f}")
+            return "Check Star", escape(", ".join(details))
+
+    raw = _metadata_value(metadata, "CHECK_STAR")
+    designation = _metadata_catalog_designation(raw)
+    if not designation:
+        return None
+    details = [" ".join(raw.split()[1:2]) or designation]
+    magnitude_match = re.search(r"\\bmag=([0-9.]+)", raw)
+    if magnitude_match is not None:
+        details.append(f"Mag={float(magnitude_match.group(1)):.2f}")
+    return "Check Star", escape(", ".join(details))
 
 
 def _outer_two_column_table(left: object, right: object) -> object:
@@ -778,30 +891,37 @@ def report_observation_photometry_tables(
     rows: list[dict[str, str]],
     styles: object,
 ) -> object:
-    """Return side-by-side Observation Details and Photometry tables."""
+    """Return side-by-side Details and Photometry tables."""
 
     from reportlab.lib.units import mm
 
     observation_rows = [
-        ("UTC Range", escape(_utc_text(_metadata_value(metadata, "UTC_START")))),
-        ("", escape(_utc_text(_metadata_value(metadata, "UTC_END")))),
-        ("HJD Range", escape(_hjd_range_text(metadata, rows))),
-        ("Exposure", escape(_exposure_text(_metadata_value(metadata, "EXPOSURE_SECONDS")))),
-        ("Location", escape(_metadata_value(metadata, "OBSERVER_SITE"))),
-        ("Lat / Long", escape(_lat_long_text(metadata))),
-        ("Observer", escape(_metadata_value(metadata, "OBSERVER_NAME"))),
-        ("BAV", escape(_metadata_value(metadata, "OBSERVER_BAV"))),
-        ("AAVSO", escape(_metadata_value(metadata, "OBSERVER_AAVSO"))),
-        ("N° Obs", escape(_metadata_value(metadata, "OBS_COUNT"))),
+        (label, escape(value))
+        for label, value in observation_details_rows(metadata, rows)
     ]
     photometry_rows = _comparison_star_rows(metadata, rows)
+    catalog_sources = _catalog_sources_for_photometry(metadata, rows)
+    if catalog_sources:
+        photometry_rows.insert(
+            0,
+            ("Catalog" if len(catalog_sources) == 1 else "Catalogs", escape(", ".join(catalog_sources))),
+        )
+    check_star = _check_star_row(metadata, rows)
+    if check_star is not None:
+        photometry_rows.append(check_star)
     photometry_rows.append(
         (
             "Method",
             escape(_compact_photometry_method(_metadata_value(metadata, "PHOTOMETRY_METHOD"))),
         )
     )
-    observation_table = _report_table("Observation Details", observation_rows, styles, (25 * mm, 57 * mm))
+    observation_table = _report_table(
+        "Details",
+        observation_rows,
+        styles,
+        (25 * mm, 57 * mm),
+        section_break_after=frozenset({"HJD Range", "N° Obs"}),
+    )
     photometry_table = _report_table("Photometry", photometry_rows, styles, (25 * mm, 57 * mm))
     return _outer_two_column_table(observation_table, photometry_table)
 
@@ -1022,6 +1142,20 @@ def _optional_float(value: str | None) -> float:
     return numeric if math.isfinite(numeric) else float("nan")
 
 
+def result_row_is_valid(row: dict[str, str]) -> bool:
+    """Return whether a result row may enter a scientific BAV output."""
+
+    if str(row.get("valid", "1")).strip().casefold() in {"0", "false", "no"}:
+        return False
+    return str(row.get("quality_status", "")).strip().upper() != "INVALID"
+
+
+def valid_result_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return only scientifically valid result rows."""
+
+    return [row for row in rows if result_row_is_valid(row)]
+
+
 def render_lightcurve_plot_png(
     result_csv: Path,
     extremum_fit: dict[str, object] | None = None,
@@ -1038,7 +1172,7 @@ def render_lightcurve_plot_png(
     check_delta_values: list[float] = []
     check_calibrated_values: list[float] = []
 
-    for row in rows:
+    for row in valid_result_rows(rows):
         jd = _optional_float(row.get("jd"))
         mag = _optional_float(row.get("target_calibrated_mag"))
         if not math.isfinite(jd) or not math.isfinite(mag):
@@ -1390,7 +1524,7 @@ def _current_output_directory(context: dict[str, object]) -> Path | None:
     current = _current_lightcurve(context)
     if current is not None:
         result_csv, _target_name = current
-        return result_csv.parent / "BAV"
+        return Path(_RESULT_CONTRACT.bav_output_directory(result_csv))
     results_dir = _context_path(context, "get_results_directory")
     return results_dir / "BAV" if results_dir is not None else None
 
@@ -1499,13 +1633,14 @@ def existing_bav_files_prompt(
 
 def bav_output_paths(result_csv: Path, metadata: dict[str, str], fit: dict[str, object]) -> tuple[Path, Path]:
     prefix = bav_output_prefix(metadata, fit)
-    output_dir = result_csv.parent / "BAV"
+    output_dir = Path(_RESULT_CONTRACT.bav_output_directory(result_csv))
     return output_dir / f"{prefix}.pdf", output_dir / f"{prefix}_MiniMax.txt"
 
 
 def bav_single_magnitudes_path(result_csv: Path, metadata: dict[str, str], fit: dict[str, object]) -> Path:
     prefix = bav_output_prefix(metadata, fit)
-    return result_csv.parent / "BAV" / f"{prefix}_Report.txt"
+    output_dir = Path(_RESULT_CONTRACT.bav_output_directory(result_csv))
+    return output_dir / f"{prefix}_Report.txt"
 
 
 def existing_bav_output_files(
@@ -1528,7 +1663,8 @@ def bav_single_measurement_path(result_csv: Path, metadata: dict[str, str]) -> P
     """Return the BAV output path for one Single Measurement result."""
 
     object_name = bav_filename_object_name(_metadata_value(metadata, "OBJECT_NAME"), result_csv.stem)
-    return result_csv.parent / "BAV" / f"{object_name}_Einzelhelligkeit.txt"
+    output_dir = Path(_RESULT_CONTRACT.bav_output_directory(result_csv))
+    return output_dir / f"{object_name}_Einzelhelligkeit.txt"
 
 
 def ensure_valid_cwd(preferred_directory: Path) -> None:
@@ -1567,7 +1703,9 @@ def create_lightcurve_sheet_pdf(
     from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
 
     metadata, rows = read_result_curve_with_metadata(result_csv)
+    rows = valid_result_rows(rows)
     metadata = bav_export_metadata(metadata, settings)
+    metadata["OBS_COUNT"] = str(len(rows))
     require_lightcurve_sheet_metadata(metadata)
     target_name = bav_filename_object_name(metadata["OBJECT_NAME"].strip())
     report_metadata = dict(metadata)
@@ -1615,8 +1753,10 @@ def create_minimax_file(
 
     result_csv, _target_name = _current_result_csv(context)
     ensure_astropy_available(context)
-    metadata, _rows = read_result_curve_with_metadata(result_csv)
+    metadata, rows = read_result_curve_with_metadata(result_csv)
+    rows = valid_result_rows(rows)
     metadata = bav_export_metadata(metadata, settings)
+    metadata["OBS_COUNT"] = str(len(rows))
     require_lightcurve_sheet_metadata(metadata)
     extremum_fit = _current_extremum_fit(context)
     _output_pdf, minimax_path = bav_output_paths(result_csv, metadata, extremum_fit)
@@ -1677,7 +1817,7 @@ def create_single_magnitudes_file(
 
     jd_values: list[float] = []
     mag_values: list[float] = []
-    for row in rows:
+    for row in valid_result_rows(rows):
         jd = _optional_float(row.get("jd"))
         mag = _optional_float(row.get("target_calibrated_mag"))
         if math.isfinite(jd) and math.isfinite(mag):
@@ -1716,7 +1856,7 @@ def create_single_measurement_bav_file(
     data_rows = [
         row
         for row in rows
-        if is_single_field_zp_row(row)
+        if is_single_field_zp_row(row) and result_row_is_valid(row)
     ]
     if len(data_rows) != 1:
         raise RuntimeError(
@@ -2061,6 +2201,13 @@ def create_bav_tab(context: dict[str, object]) -> object:
             "telescope": config["telescope"],
         }
 
+    try:
+        initial_saved_settings: dict[str, str] | None = validate_config(config)
+    except BavConfigValidationError:
+        initial_saved_settings = None
+    saved_settings: dict[str, dict[str, str] | None] = {
+        "value": initial_saved_settings,
+    }
     config_warning_state: dict[str, str | None] = {"message": None}
 
     def checked_config(
@@ -2100,6 +2247,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
             return
 
         config_file = save_config(settings)
+        saved_settings["value"] = settings
         bav_code_edit.setText(settings["bav_code"])
         aavso_code_edit.setText(settings["aavso_code"])
         update_main_observer_code = context.get(
@@ -2150,6 +2298,42 @@ def create_bav_tab(context: dict[str, object]) -> object:
         else:
             config_warning_state["message"] = None
             status_label.setText(f"BAV-Konfiguration vollständig: {config_path().name}")
+        refresh_action_availability()
+
+    def bav_export_available() -> bool:
+        """Return whether the BAV export can start without a conflicting state."""
+
+        get_action_availability = context.get("get_action_availability")
+        if callable(get_action_availability):
+            try:
+                if not bool(get_action_availability().get("bav_export_base")):
+                    return False
+            except Exception as exc:
+                append_log(f"WARNING: Could not read BAV export availability: {exc}")
+                return False
+        else:
+            is_busy = context.get("is_busy")
+            if callable(is_busy) and bool(is_busy()):
+                return False
+
+        settings, problem = checked_config(require_saved_file=True)
+        if problem is not None or settings != saved_settings["value"]:
+            return False
+        try:
+            kind = current_result_kind(context)
+            if kind != RESULT_KIND_SINGLE_FIELD_ZP:
+                _current_extremum_fit(context)
+        except Exception:
+            return False
+        return True
+
+    def refresh_action_availability() -> None:
+        """Apply the shared app state plus BAV-specific export prerequisites."""
+
+        bav_files_button.setEnabled(bav_export_available())
+        output_path = last_output["path"]
+        folder = output_path.parent if output_path is not None else _current_output_directory(context)
+        open_folder_button.setEnabled(folder is not None and folder.is_dir())
 
     def prepare_bav_output_directory(settings: dict[str, str]) -> bool:
         folder = _current_output_directory(context)
@@ -2206,7 +2390,11 @@ def create_bav_tab(context: dict[str, object]) -> object:
         except Exception as exc:
             status_label.setText(f"{action_title} fehlgeschlagen.")
             append_log(f"WARNING: BAV {action_title} not created: {exc}")
-            QMessageBox.critical(tab, action_title, f"{action_title} fehlgeschlagen.")
+            QMessageBox.critical(
+                tab,
+                action_title,
+                f"{action_title} fehlgeschlagen.\n\n{type(exc).__name__}: {exc}",
+            )
             return None
         return kind
 
@@ -2302,9 +2490,16 @@ def create_bav_tab(context: dict[str, object]) -> object:
             append_log(f"WARNING: BAV file creation failed: {type(exc).__name__}: {exc}")
             for line in traceback.format_exc().rstrip().splitlines():
                 append_log(f"BAV traceback: {line}")
-            QMessageBox.critical(tab, "BAV-Dateien", "BAV-Dateien fehlgeschlagen.")
+            QMessageBox.critical(
+                tab,
+                "BAV-Dateien",
+                "BAV-Dateien fehlgeschlagen.\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                "Weitere Details stehen im SeePhot-Log.",
+            )
             return
         last_output["path"] = created_paths[-1] if created_paths else None
+        refresh_action_availability()
         status_label.setText("BAV-Datei erzeugt." if result_kind == RESULT_KIND_SINGLE_FIELD_ZP else "BAV-Dateien erzeugt.")
         mark_export_status = context.get("mark_export_status")
         if callable(mark_export_status):
@@ -2378,6 +2573,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
         last_output["path"] = None
         telescope_label.setText("none")
         status_label.setText("")
+        refresh_action_availability()
         return True
 
     save_button.clicked.connect(save_settings)
@@ -2385,7 +2581,21 @@ def create_bav_tab(context: dict[str, object]) -> object:
     bav_files_button.clicked.connect(run_bav_files_action)
     open_folder_button.clicked.connect(open_output_folder)
     bav_web_button.clicked.connect(open_bav_website)
+    for edit in (bav_code_edit, observer_name_edit, aavso_code_edit, site_name_edit):
+        edit.textChanged.connect(refresh_action_availability)
+    for combo in (latitude_hemisphere_combo, longitude_hemisphere_combo):
+        combo.currentTextChanged.connect(refresh_action_availability)
+    for spin in (
+        latitude_degrees_spin,
+        latitude_minutes_spin,
+        latitude_seconds_spin,
+        longitude_degrees_spin,
+        longitude_minutes_spin,
+        longitude_seconds_spin,
+    ):
+        spin.valueChanged.connect(refresh_action_availability)
     setattr(tab, "reset_plugin_view", reset_plugin_view)
     setattr(tab, "refresh_plugin_view", refresh)
+    setattr(tab, "refresh_action_availability", refresh_action_availability)
     refresh()
     return tab
