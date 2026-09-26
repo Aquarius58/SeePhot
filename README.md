@@ -27,8 +27,6 @@ Keep all ten Python files in the same Siril script directory:
 - `sp_mod_profiling.py` — stack timing analysis and recommendations.
 - `sp_mod_results.py` — result discovery, metadata, and output-path helpers.
 
-The development-only modules `sp_mod_qc.py`, `sp_mod_archive.py`, and
-`sp_mod_ext_scopes.py` are not part of the Main release.
 
 ## Main Features
 
