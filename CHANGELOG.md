@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.40 - 2026-09-26
+
+- Improved result browsing with VSX type display, numeric sorting, and clearer
+  mode-specific result navigation.
+- Made light-curve trimming safer and report when stale export files could not
+  be removed.
+- Added provenance for scatter-rejected frames and refined Gaia isolation and
+  photometric analysis workflows.
+- Improved CFA and BAV workflow handling.
+
 ## 0.8.20 - 2026-09-20
 
 - Expanded the Main release bundle to ten scripts, adding analysis tools,

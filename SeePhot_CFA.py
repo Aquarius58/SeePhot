@@ -2015,71 +2015,132 @@ class StackWindow(QWidget):
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
 
-    def build_overview_text(self) -> str:
+    def build_overview_html(self) -> str:
         lightcurve_note = ""
         if self.lightcurve_mode:
-            lightcurve_note = (
-                "SeePhot:\n"
-                "- This window was opened from SeePhot.\n"
-                "- Only L or G outputs are used for V-calibrated Light Curves.\n\n"
-            )
-        return (
-            "This tool prepares and stacks original Seestar FITS frames for photometry.\n\n"
-            f"{lightcurve_note}"
-            "Workflow:\n"
-            "1. Select the folder containing the original Seestar .fit frames.\n"
-            "2. Select stack groups by seconds, by frame count, or ALL.\n"
-            "3. Select CFA output channels if the input frames are raw Bayer/CFA data.\n"
-            "4. Click 'Start'. Results are written next to the selected source folder.\n\n"
-            "CFA / channel output:\n"
-            "- CFA/Bayer input is split into measured CFA samples without interpolation.\n"
-            "- Output channels keep the original Seestar image size for downstream compatibility.\n"
-            "- Each measured CFA value is replicated over its original 2x2 Bayer block.\n"
-            "- L is the mean of one Bayer cell: (R + G1 + G2 + B) / 4.\n"
-            "- G is the mean of the two green samples: (G1 + G2) / 2.\n"
-            "- R and B use the measured red and blue CFA samples.\n"
-            "- FILTER and CHANMODE are written into the FITS header to document the derived channel.\n"
-            "- Non-CFA input is stacked directly.\n\n"
-            "Results and temporary files:\n"
-            "- Original input frames are never modified.\n"
-            "- Results are written next to the source folder, e.g. '<source>_l' or '<source>_g-stack100sec'.\n"
-            "- Non-CFA stack results use no channel suffix, e.g. '<source>-stack100sec'.\n"
-            "- Temporary folders use '<source>-tmp...' names and are removed when the run ends.\n\n"
-            "Overwrite safety:\n"
-            "- Existing result folders are listed before the run starts.\n"
-            "- They are cleared only after explicit confirmation.\n\n"
-            "Stack acceptance:\n"
-            f"- A stack block must have at least {MIN_FRAMES_PER_STACK} registered frames.\n"
-            f"- Time-based blocks also need at least {MIN_STACK_COMPLETION_FRACTION * 100:g}% "
-            "of the requested duration.\n"
-            "- End-of-sequence blocks are accepted when these criteria are met.\n\n"
-            "Stack mode:\n"
-            "- Continuous keeps grouping across observation pauses.\n"
-            "- Pause-aware ends a stack at a pause longer than 3 × median input cadence.\n\n"
-            "FITS headers:\n"
-            "- DATE-OBS is required; files without DATE-OBS are skipped.\n"
-            "- With DATE-EXP, DATE-OBS is the exposure start and DATE-EXP the end.\n"
-            "- Without DATE-EXP, DATE-OBS is treated as the exposure end.\n"
-            "- Generated files use DATE-OBS = UTC exposure start and DATE-END = UTC exposure end.\n"
-            "- DATE-AVG and MJD-AVG store the exposure-weighted midpoint for photometry.\n"
-            "- Stack EXPTIME is the summed exposure time of the used frames, excluding gaps.\n"
-            "- NCOMBINE is the number of frames actually included in the stack.\n"
-            f"- Missing EXPTIME falls back to {DEFAULT_SUBFRAME_EXPOSURE:g}s.\n\n"
-            "The log ends with a [SUMMARY] section listing input frames, skipped files, "
-            "channel frames, stack results, skipped blocks and warnings."
-        )
+            lightcurve_note = """
+            <div class="note">
+                This window was opened from SeePhot. Only <b>L</b> or <b>G</b>
+                outputs are used for V-calibrated Light Curves.
+            </div>
+            """
+        return f"""
+        <html><head><style>
+            body {{ color: #eceff4; }}
+            h2, h3 {{ color: #d8dee9; }}
+            h2 {{ margin-bottom: 4px; }}
+            h3 {{ margin-top: 18px; margin-bottom: 4px; }}
+            p {{ margin-top: 4px; margin-bottom: 7px; }}
+            ul, ol {{ margin-top: 4px; margin-bottom: 8px; }}
+            li {{ margin-bottom: 3px; }}
+            .note {{ background-color: #111827; border-left: 3px solid #4f8cff;
+                padding: 8px; margin-top: 7px; margin-bottom: 9px; }}
+            code {{ color: #d8dee9; }}
+        </style></head><body>
+            <h2>SeePhot Stack Overview</h2>
+            <p>This tool prepares and stacks original Seestar FITS frames for photometry.</p>
+            {lightcurve_note}
 
-    def build_help_text(self) -> str:
-        return (
-            "Select the folder containing the original Seestar FITS frames.\n"
-            "Choose grouping by seconds or frames, enable the required groups and CFA "
-            "channels, then click 'Start'.\n\n"
-            "Continuous grouping spans observation pauses; Gap-aware grouping starts a new "
-            "block after a long pause. Existing result folders are changed only after you "
-            "confirm the overwrite prompt.\n\n"
-            "Progress, skipped inputs, warnings, and the final summary appear in the log. "
-            "For details about outputs, timing, and CFA processing, click 'Overview'."
-        )
+            <h3>Workflow</h3>
+            <ol>
+                <li>Select the folder containing the original Seestar <code>.fit</code> frames.</li>
+                <li>Select stack groups by seconds, by frame count, or <b>ALL</b>.</li>
+                <li>Select CFA output channels if the input frames are raw Bayer/CFA data.</li>
+                <li>Click <b>Start</b>. Results are written next to the selected source folder.</li>
+            </ol>
+
+            <h3>CFA / channel output</h3>
+            <ul>
+                <li>CFA/Bayer input is split into measured CFA samples without interpolation.</li>
+                <li>Output channels keep the original Seestar image size for downstream compatibility.</li>
+                <li>Each measured CFA value is replicated over its original 2x2 Bayer block.</li>
+                <li>L is the mean of one Bayer cell: (R + G1 + G2 + B) / 4.</li>
+                <li>G is the mean of the two green samples: (G1 + G2) / 2.</li>
+                <li>R and B use the measured red and blue CFA samples.</li>
+                <li><code>FILTER</code> and <code>CHANMODE</code> document the derived channel
+                in the FITS header.</li>
+                <li>Non-CFA input is stacked directly.</li>
+            </ul>
+
+            <h3>Results and temporary files</h3>
+            <ul>
+                <li>Original input frames are never modified.</li>
+                <li>Results are written next to the source folder, e.g.
+                <code>&lt;source&gt;_l</code> or <code>&lt;source&gt;_g-stack100sec</code>.</li>
+                <li>Non-CFA stack results use no channel suffix, e.g.
+                <code>&lt;source&gt;-stack100sec</code>.</li>
+                <li>Gap-aware stack result folders end in <code>_ga</code>, e.g.
+                <code>&lt;source&gt;_g-stack100sec_ga</code> or
+                <code>&lt;source&gt;-stack100sec_ga</code>.</li>
+                <li>Temporary folders use <code>&lt;source&gt;-tmp...</code> names and are
+                removed when the run ends.</li>
+            </ul>
+
+            <div class="note"><b>Overwrite safety:</b> Existing result folders are listed
+            before the run starts. They are cleared only after explicit confirmation.</div>
+
+            <h3>Stack acceptance</h3>
+            <ul>
+                <li>A stack block must have at least {MIN_FRAMES_PER_STACK} registered frames.</li>
+                <li>Time-based blocks also need at least
+                {MIN_STACK_COMPLETION_FRACTION * 100:g}% of the requested duration.</li>
+                <li>End-of-sequence blocks are accepted when these criteria are met.</li>
+            </ul>
+
+            <h3>Stack mode</h3>
+            <ul>
+                <li><b>Continuous</b> keeps grouping across observation pauses.</li>
+                <li><b>Gap-aware</b> ends a stack at a pause longer than
+                3 × median input cadence.</li>
+            </ul>
+
+            <h3>FITS headers</h3>
+            <ul>
+                <li><code>DATE-OBS</code> is required; files without it are skipped.</li>
+                <li>With <code>DATE-EXP</code>, <code>DATE-OBS</code> is the exposure start
+                and <code>DATE-EXP</code> the end.</li>
+                <li>Without <code>DATE-EXP</code>, <code>DATE-OBS</code> is treated as the
+                exposure end.</li>
+                <li>This distinction reflects a change by ZWO in the meaning of
+                <code>DATE-OBS</code> in Seestar firmware.</li>
+                <li>Generated files use <code>DATE-OBS</code> = UTC exposure start and
+                <code>DATE-END</code> = UTC exposure end.</li>
+                <li><code>DATE-AVG</code> and <code>MJD-AVG</code> store the exposure-weighted
+                midpoint for photometry.</li>
+                <li>Stack <code>EXPTIME</code> is the summed exposure time of the used frames,
+                excluding gaps.</li>
+                <li><code>NCOMBINE</code> is the number of frames actually included in the stack.</li>
+                <li>Missing <code>EXPTIME</code> falls back to
+                {DEFAULT_SUBFRAME_EXPOSURE:g}s.</li>
+            </ul>
+
+            <div class="note">The log ends with a <b>[SUMMARY]</b> section listing input
+            frames, skipped files, channel frames, stack results, skipped blocks and warnings.</div>
+        </body></html>
+        """
+
+    def build_help_html(self) -> str:
+        return """
+        <html><head><style>
+            body { color: #eceff4; }
+            h2 { color: #d8dee9; margin-bottom: 8px; }
+            p { margin-top: 4px; margin-bottom: 8px; }
+            .note { background-color: #111827; border-left: 3px solid #4f8cff;
+                padding: 9px; }
+        </style></head><body>
+            <h2>SeePhot Stack Help</h2>
+            <div class="note">
+                <p>Select the folder containing the original Seestar FITS frames. Choose
+                grouping by seconds or frames, enable the required groups and CFA channels,
+                then click <b>Start</b>.</p>
+                <p><b>Continuous</b> grouping spans observation pauses; <b>Gap-aware</b>
+                grouping starts a new block after a long pause. Existing result folders
+                are changed only after you confirm the overwrite prompt.</p>
+            </div>
+            <p>Progress, skipped inputs, warnings, and the final summary appear in the log.
+            For details about outputs, timing, and CFA processing, click <b>Overview</b>.</p>
+        </body></html>
+        """
 
     def show_overview(self) -> None:
         dialog = QDialog(self)
@@ -2089,7 +2150,7 @@ class StackWindow(QWidget):
         layout = QVBoxLayout(dialog)
         text_view = QTextEdit()
         text_view.setReadOnly(True)
-        text_view.setPlainText(self.build_overview_text())
+        text_view.setHtml(self.build_overview_html())
         layout.addWidget(text_view)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -2105,7 +2166,7 @@ class StackWindow(QWidget):
         layout = QVBoxLayout(dialog)
         text_view = QTextEdit()
         text_view.setReadOnly(True)
-        text_view.setPlainText(self.build_help_text())
+        text_view.setHtml(self.build_help_html())
         layout.addWidget(text_view)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import math
-from typing import Iterable
+from statistics import median
+from typing import Iterable, Mapping
 
 
 MIN_INPUTS_PER_BIN = 2
@@ -83,20 +85,36 @@ def _finite(value: object) -> float | None:
 
 
 def source_fingerprint(rows: Iterable[dict[str, str]]) -> str:
-    """Fingerprint all instrumental rows, in their recorded frame order."""
+    """Fingerprint every field of the instrumental rows in stable frame order."""
 
     digest = hashlib.sha256()
     for row in sorted(rows, key=lambda item: (item.get("frame_index", ""), item.get("role", ""))):
-        digest.update("\x1f".join(str(row.get(key, "")) for key in (
-            "frame_index", "filename", "role", "object_id", "jd", "exptime",
-            "net_flux", "flux_error", "catalog_mag", "inst_mag", "valid", "quality_status",
-        )).encode("utf-8"))
+        digest.update(json.dumps(row, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
 
 
+def scatter_rejected_frame_indices(metadata: Mapping[str, str]) -> frozenset[str]:
+    """Read the raw curve's per-frame scatter exclusions for binning."""
+
+    key = "ZERO_POINT_SCATTER_REJECTED_FRAME_INDICES"
+    encoded = metadata.get(key)
+    if encoded is None:
+        raise ValueError("Raw result has no scatter exclusion record; run photometry again.")
+    if not encoded.strip():
+        return frozenset()
+    parts = [part.strip() for part in encoded.split(",")]
+    if any(not part.isdecimal() for part in parts):
+        raise ValueError("Raw result has an invalid scatter exclusion record; run photometry again.")
+    indices = frozenset(str(int(part)) for part in parts)
+    if len(indices) != len(parts):
+        raise ValueError("Raw result has a duplicate scatter exclusion index; run photometry again.")
+    return indices
+
+
 def calibrated_frames_from_instrumental_rows(
     rows: Iterable[dict[str, str]], *, min_valid_comps: int = 3,
+    excluded_frame_indices: frozenset[str] = frozenset(),
 ) -> tuple[list[CalibratedFrame], int]:
     """Recalibrate eligible target fluxes from the complete instrumental CSV.
 
@@ -112,7 +130,10 @@ def calibrated_frames_from_instrumental_rows(
         by_frame.setdefault(str(row.get("frame_index", "")), []).append(row)
     output: list[CalibratedFrame] = []
     excluded = 0
-    for frame_rows in by_frame.values():
+    for frame_index, frame_rows in by_frame.items():
+        if frame_index in excluded_frame_indices:
+            excluded += 1
+            continue
         targets = [row for row in frame_rows if row.get("role", "").strip() == "target"]
         comps = [row for row in frame_rows if row.get("role", "").strip() == "comparison"]
         checks = [row for row in frame_rows if row.get("role", "").strip() == "check"]
@@ -153,7 +174,7 @@ def calibrated_frames_from_instrumental_rows(
         if jd is None or exptime is None:
             excluded += 1
             continue
-        zero_point = sorted(zero_points)[len(zero_points) // 2]
+        zero_point = median(zero_points)
         scale = 10.0 ** (-0.4 * zero_point)
         mean_zero_point = sum(zero_points) / len(zero_points)
         zp_variance = sum((value - mean_zero_point) ** 2 for value in zero_points) / (len(zero_points) - 1)

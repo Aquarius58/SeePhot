@@ -7,6 +7,7 @@ QC module. It gathers independent image and data analysis tools.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from pathlib import Path
 
 
@@ -16,7 +17,13 @@ PLUGIN_TAB_LABEL = "Tools"
 GAIA_V_COLOR_MIN = -0.5
 GAIA_V_COLOR_MAX = 2.75
 LINEARITY_DISPLAY_MIN_EXPECTED_SNR = 10.0
+LINEARITY_NEIGHBOR_RADIUS_APERTURE_FACTOR = 1.6
+LINEARITY_NEIGHBOR_MAX_G_MAG_DELTA = 3.0
 LINEARITY_LIMIT_MIN_REFERENCE_COUNT = 8
+LINEARITY_COLOR_CONTROL_MIN = -0.5
+LINEARITY_COLOR_CONTROL_MAX = 4.0
+LINEARITY_COLOR_DEFAULT_MIN = 0.3
+LINEARITY_COLOR_DEFAULT_MAX = 1.5
 
 
 def gaia_v_from_g_bp_rp(gaia_g: float, bp_rp: float) -> float | None:
@@ -150,9 +157,86 @@ def linearity_plot_rows(
         for row in rows
         if bool(row.get("valid"))
         and row.get("inst_mag") is not None
+        and row.get("snr") is not None
+        and math.isfinite(float(row["snr"]))
+        and float(row["snr"]) >= LINEARITY_DISPLAY_MIN_EXPECTED_SNR
         and (faint_limit is None or float(row["v_mag"]) <= faint_limit)
     ]
     return plotted, faint_limit
+
+
+def validated_linearity_color_range(lower: float, upper: float) -> tuple[float, float]:
+    """Return a valid user-selected BP-RP interval."""
+
+    lower = float(lower)
+    upper = float(upper)
+    if not (math.isfinite(lower) and math.isfinite(upper)):
+        raise ValueError("The BP-RP limits must be finite numbers.")
+    if not (
+        LINEARITY_COLOR_CONTROL_MIN <= lower <= LINEARITY_COLOR_CONTROL_MAX
+        and LINEARITY_COLOR_CONTROL_MIN <= upper <= LINEARITY_COLOR_CONTROL_MAX
+    ):
+        raise ValueError(
+            "The BP-RP limits must be between "
+            f"{LINEARITY_COLOR_CONTROL_MIN:.1f} and {LINEARITY_COLOR_CONTROL_MAX:.1f}."
+        )
+    if upper <= lower:
+        raise ValueError("The maximum BP-RP value must be greater than the minimum.")
+    return lower, upper
+
+
+def filter_linearity_rows_by_color(
+    rows: list[dict[str, float | str | bool | None]],
+    lower: float,
+    upper: float,
+) -> list[dict[str, float | str | bool | None]]:
+    """Return rows strictly inside the selected BP-RP interval."""
+
+    lower, upper = validated_linearity_color_range(lower, upper)
+    return [row for row in rows if lower < float(row["bp_rp"]) < upper]
+
+
+def linearity_selection_counts(
+    rows: list[dict[str, float | str | bool | None]],
+    filtered_rows: list[dict[str, float | str | bool | None]],
+    faint_limit: float | None,
+) -> dict[str, int]:
+    """Count mutually exclusive reasons a measured reference is not plotted."""
+
+    counts = {
+        "outside_color": len(rows) - len(filtered_rows),
+        "invalid_measurement": 0,
+        "low_or_missing_snr": 0,
+        "beyond_faint_limit": 0,
+        "plotted": 0,
+    }
+    for row in filtered_rows:
+        if not bool(row.get("valid")) or row.get("inst_mag") is None:
+            counts["invalid_measurement"] += 1
+        elif (
+            row.get("snr") is None
+            or not math.isfinite(float(row["snr"]))
+            or float(row["snr"]) < LINEARITY_DISPLAY_MIN_EXPECTED_SNR
+        ):
+            counts["low_or_missing_snr"] += 1
+        elif faint_limit is not None and float(row["v_mag"]) > faint_limit:
+            counts["beyond_faint_limit"] += 1
+        else:
+            counts["plotted"] += 1
+    return counts
+
+
+def linearity_invalid_reasons(
+    filtered_rows: list[dict[str, float | str | bool | None]],
+) -> dict[str, int]:
+    """Count quality flags of color-matched, invalid aperture measurements."""
+
+    reasons = Counter(
+        str(row.get("quality_flag") or "UNSPECIFIED")
+        for row in filtered_rows
+        if not bool(row.get("valid")) or row.get("inst_mag") is None
+    )
+    return dict(sorted(reasons.items()))
 
 
 def linearity_rows_for_image(
@@ -172,7 +256,16 @@ def linearity_rows_for_image(
         raise RuntimeError("Automatic plate solve did not produce a usable WCS image.")
     try:
         progress(f"Analyzed image: {path}")
-        gaia_objects = _call(context, "query_gaia_dr3_region")(frame, progress)
+        settings = _call(context, "resolve_aperture_settings")(frame)
+        gaia_objects = _call(context, "query_gaia_dr3_region")(
+            frame,
+            progress,
+            isolation_radius_px=(
+                getattr(settings, "aperture_radius_px")
+                * LINEARITY_NEIGHBOR_RADIUS_APERTURE_FACTOR
+            ),
+            isolation_max_g_mag_delta=LINEARITY_NEIGHBOR_MAX_G_MAG_DELTA,
+        )
         specs = _linearity_specs(gaia_objects)
         if not specs:
             raise RuntimeError(
@@ -183,7 +276,6 @@ def linearity_rows_for_image(
             str(spec["catalog_id"]): float(spec["analyze_bp_rp"])
             for spec in specs
         }
-        settings = _call(context, "resolve_aperture_settings")(frame)
         measurements = _call(context, "aperture_measurements_for_frame")(
             analysis_path,
             0,
@@ -207,7 +299,9 @@ def linearity_rows_for_image(
                     "bp_rp": float(bp_rp),
                     "catalog_id": catalog_id,
                     "valid": bool(getattr(measurement, "valid", False)),
+                    "quality_flag": str(getattr(measurement, "quality_flag", "") or ""),
                     "flux_error": getattr(measurement, "flux_error", None),
+                    "snr": getattr(measurement, "snr", None),
                     "exptime": getattr(measurement, "exptime", None),
                 }
             )
@@ -223,7 +317,7 @@ def create_analyze_tab(context: dict[str, object]) -> object:
     """Create standalone analysis tools, initially Gaia linearity diagnostics."""
 
     from PyQt6.QtCore import QThread, pyqtSignal
-    from PyQt6.QtWidgets import QComboBox, QDialog, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+    from PyQt6.QtWidgets import QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
 
@@ -238,16 +332,22 @@ def create_analyze_tab(context: dict[str, object]) -> object:
     refresh_button.setEnabled(False)
     refresh_button.setToolTip("Run the analysis again for the selected image.")
     controls.addWidget(refresh_button)
-    color_filter = QComboBox()
-    color_filter.addItem("All BP-RP", (None, None))
-    color_filter.addItem("BP-RP ≤ 0.5", (None, 0.5))
-    color_filter.addItem("BP-RP ≤ 1.0", (None, 1.0))
-    color_filter.addItem("BP-RP ≤ 1.5", (None, 1.5))
-    color_filter.addItem("BP-RP ≥ 0.5", (0.5, None))
-    color_filter.addItem("BP-RP ≥ 1.0", (1.0, None))
-    color_filter.addItem("BP-RP ≥ 1.5", (1.5, None))
-    color_filter.setToolTip("Plot only Gaia references on the selected side of the BP-RP limit.")
-    controls.addWidget(color_filter)
+    controls.addWidget(QLabel("BP-RP min"))
+    color_minimum = QDoubleSpinBox()
+    color_minimum.setRange(LINEARITY_COLOR_CONTROL_MIN, LINEARITY_COLOR_CONTROL_MAX)
+    color_minimum.setDecimals(1)
+    color_minimum.setSingleStep(0.1)
+    color_minimum.setValue(LINEARITY_COLOR_DEFAULT_MIN)
+    color_minimum.setToolTip("Lower BP-RP limit (excluded).")
+    controls.addWidget(color_minimum)
+    controls.addWidget(QLabel("max"))
+    color_maximum = QDoubleSpinBox()
+    color_maximum.setRange(LINEARITY_COLOR_CONTROL_MIN, LINEARITY_COLOR_CONTROL_MAX)
+    color_maximum.setDecimals(1)
+    color_maximum.setSingleStep(0.1)
+    color_maximum.setValue(LINEARITY_COLOR_DEFAULT_MAX)
+    color_maximum.setToolTip("Upper BP-RP limit (excluded and greater than the minimum).")
+    controls.addWidget(color_maximum)
     controls.addStretch(1)
     linearity_layout.addLayout(controls)
     image_label = QLabel("No image selected")
@@ -283,19 +383,19 @@ def create_analyze_tab(context: dict[str, object]) -> object:
 
     class LinearityWorker(QThread):
         log_message = pyqtSignal(str)
-        completed = pyqtSignal(object)
 
         def __init__(self, image_path: Path) -> None:
             super().__init__()
             self.image_path = image_path
+            self.result: tuple[str, object] | None = None
 
         def run(self) -> None:
             try:
-                self.completed.emit(
-                    ("ok", linearity_rows_for_image(context, self.image_path, self.log_message.emit))
+                self.result = (
+                    "ok", linearity_rows_for_image(context, self.image_path, self.log_message.emit)
                 )
             except Exception as exc:
-                self.completed.emit(("error", str(exc)))
+                self.result = ("error", str(exc))
 
     def log(message: str) -> None:
         append_log = context.get("append_log")
@@ -321,15 +421,41 @@ def create_analyze_tab(context: dict[str, object]) -> object:
         rows: list[dict[str, float | str | bool | None]],
         reference_count: int,
     ) -> None:
-        lower, upper = color_filter.currentData()
-        filtered_rows = [
-            row for row in rows
-            if (lower is None or float(row["bp_rp"]) >= float(lower))
-            and (upper is None or float(row["bp_rp"]) <= float(upper))
-        ]
+        try:
+            lower, upper = validated_linearity_color_range(
+                color_minimum.value(), color_maximum.value()
+            )
+        except ValueError as exc:
+            log(f"ERROR: {exc}")
+            return
+        filtered_rows = filter_linearity_rows_by_color(rows, lower, upper)
         plotted_rows, faint_limit = linearity_plot_rows(filtered_rows)
+        counts = linearity_selection_counts(rows, filtered_rows, faint_limit)
+        v_range = (
+            f"{min(float(row['v_mag']) for row in plotted_rows):.2f}.."
+            f"{max(float(row['v_mag']) for row in plotted_rows):.2f}"
+            if plotted_rows else "none"
+        )
+        log(
+            f"Linearity selection: {len(rows)} measured; "
+            f"outside BP-RP range {counts['outside_color']}; "
+            f"invalid measurement {counts['invalid_measurement']}; "
+            f"S/N < {LINEARITY_DISPLAY_MIN_EXPECTED_SNR:.0f} or unavailable "
+            f"{counts['low_or_missing_snr']}; "
+            f"beyond dynamic faint limit {counts['beyond_faint_limit']}; "
+            f"plotted {counts['plotted']} (V={v_range})."
+        )
+        invalid_reasons = linearity_invalid_reasons(filtered_rows)
+        if invalid_reasons:
+            log(
+                "Invalid aperture reasons (within BP-RP range): "
+                + ", ".join(
+                    f"{reason}={count}" for reason, count in invalid_reasons.items()
+                )
+                + "."
+            )
         if not plotted_rows:
-            log("ERROR: No valid reference stars remain after the BP-RP filter.")
+            log("ERROR: No reference stars satisfy the linearity plot criteria.")
             return
         plot_dialog = QDialog(tab)
         plot_dialog.setWindowTitle(f"Photometric linearity – {path.name}")
@@ -358,7 +484,7 @@ def create_analyze_tab(context: dict[str, object]) -> object:
                 label=f"slope 1; median offset {median_offset:.2f}",
             )
             top.set_ylabel("Instrumental magnitude")
-            filter_label = color_filter.currentText()
+            filter_label = f"{lower:.1f} < BP-RP < {upper:.1f}"
             limit_label = "" if faint_limit is None else f" · V ≤ {faint_limit:.2f}"
             top.set_title(
                 f"{path.name} · {filter_label} · {len(plotted_rows)} stars{limit_label}"
@@ -392,6 +518,11 @@ def create_analyze_tab(context: dict[str, object]) -> object:
         nonlocal active_worker
         if active_worker is not None:
             return
+        try:
+            validated_linearity_color_range(color_minimum.value(), color_maximum.value())
+        except ValueError as exc:
+            log(f"ERROR: {exc}")
+            return
         choose_button.setEnabled(False)
         refresh_button.setEnabled(False)
         log("Starting image analysis.")
@@ -399,20 +530,25 @@ def create_analyze_tab(context: dict[str, object]) -> object:
         active_worker = worker
         worker.log_message.connect(log)
 
-        def handle_result(result: object) -> None:
+        def handle_finished() -> None:
             nonlocal active_worker
+            worker.wait()
+            result = worker.result
+            worker.deleteLater()
+            active_worker = None
+            choose_button.setEnabled(True)
+            refresh_button.setEnabled(selected_path is not None)
+            if result is None:
+                log("ERROR: Image analysis ended without a result.")
+                return
             status_kind, payload = result
             if status_kind == "ok":
                 _frame, rows, reference_count = payload
                 show_plot(path, rows, reference_count)
             else:
                 log(f"ERROR: {payload}")
-            worker.deleteLater()
-            active_worker = None
-            choose_button.setEnabled(True)
-            refresh_button.setEnabled(selected_path is not None)
 
-        worker.completed.connect(handle_result)
+        worker.finished.connect(handle_finished)
         worker.start()
 
     def choose_image() -> None:

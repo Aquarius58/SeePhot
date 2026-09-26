@@ -415,12 +415,6 @@ def single_references_csv_for_result_csv(result_csv: Path) -> Path:
     return new_path if new_path.exists() or not old_path.exists() else old_path
 
 
-def normalized_target_match_text(text: str) -> str:
-    """Return a loose filename-match text for target-specific sidecar files."""
-
-    return re.sub(r"\s+", " ", text.replace("_", " ").strip()).casefold()
-
-
 def bav_filename_object_text(text: str, fallback: str = "target") -> str:
     """Return the BAV object-name component without importing the BAV plugin."""
 
@@ -435,59 +429,45 @@ def bav_filename_object_text(text: str, fallback: str = "target") -> str:
     return (component or fallback)[:120]
 
 
-def bav_constellation_first_texts(text: str) -> set[str]:
-    """Return BAV filename variants like ``Dra BK`` for ``BK Dra``."""
-
-    raw = re.sub(r"\s+", " ", (text or "").replace("_", " ").strip())
-    parts = raw.split()
-    if len(parts) < 2 or len(parts[-1]) != 3:
-        return set()
-    constellation = parts[-1]
-    if not constellation.isalpha():
-        return set()
-    object_name = " ".join(parts[:-1])
-    return {
-        f"{constellation} {object_name}",
-        f"{constellation}_{object_name}",
-        f"{constellation} {raw}",
-        f"{constellation}_{raw}",
-    }
-
-
-def target_name_match_values(
-    result_csv: Path,
-    metadata: dict[str, str] | None = None,
-    target_name: str | None = None,
-) -> set[str]:
-    """Return normalized target names that may appear in target-specific files."""
-
-    values = {
-        result_target_stem(result_csv),
-        result_target_stem(result_csv).replace("_", " "),
-    }
-    if metadata is not None:
-        object_name = metadata.get("OBJECT_NAME", "").strip()
-        if object_name:
-            values.add(object_name)
-            values.add(bav_filename_object_text(object_name, result_target_stem(result_csv)))
-            values.update(bav_constellation_first_texts(object_name))
-    if target_name:
-        values.add(target_name)
-        values.add(bav_filename_object_text(target_name, result_target_stem(result_csv)))
-        values.update(bav_constellation_first_texts(target_name))
-    return {normalized_target_match_text(value) for value in values if value.strip()}
-
-
 def target_name_matches_path(
     path: Path,
     result_csv: Path,
     metadata: dict[str, str] | None = None,
     target_name: str | None = None,
 ) -> bool:
-    """Return whether a sidecar filename belongs to the current result target."""
+    """Match the complete object field of a current BAV output filename."""
 
-    filename_text = normalized_target_match_text(path.stem)
-    return any(value and value in filename_text for value in target_name_match_values(result_csv, metadata, target_name))
+    parsed = parse_result_filename(result_csv)
+    if parsed is None:
+        return False
+    object_name = (
+        (metadata or {}).get("OBJECT_NAME", "").strip()
+        or str(target_name or "").strip()
+        or parsed.target_stem
+    )
+    expected_object = bav_filename_object_text(object_name)
+    if parsed.result_kind == RESULT_KIND_SINGLE:
+        return path.name.casefold() == f"{expected_object}_Einzelhelligkeit.txt".casefold()
+
+    match = re.fullmatch(
+        r"(?P<constellation>[A-Za-z]{3})_(?P<object>.+)_"
+        r"[0-9]+(?:\.[0-9]+)?_[A-Za-z]+(?:\.pdf|_(?:MiniMax|Report)\.txt)",
+        path.name,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return False
+    # The writer removes a trailing constellation token from the technical
+    # object field, e.g. R Dra -> Dra_R_<HJD>_<observer>.pdf.
+    constellation = match.group("constellation")
+    shortened = re.sub(
+        rf"(?:^|\s+){re.escape(constellation)}$",
+        "",
+        expected_object,
+        flags=re.IGNORECASE,
+    ).strip()
+    expected_object = shortened or expected_object
+    return match.group("object").casefold() == expected_object.casefold()
 
 
 def bav_report_files(

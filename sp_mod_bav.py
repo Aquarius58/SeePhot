@@ -37,6 +37,20 @@ warnings.filterwarnings(
 
 
 PLUGIN_TAB_LABEL = "BAV"
+PLUGIN_HELP_BODY = (
+    "<h3>Konfiguration</h3>"
+    "<ul><li>BAV-Kürzel, Beobachter und Standort mit Koordinaten eintragen; dann "
+    "<b>Speichern</b>.</li>"
+    "<li>Den angezeigten Teleskopwert und Konfigurationsstatus prüfen.</li></ul>"
+    "<h3>Export</h3>"
+    "<ul><li>Für das aktuelle Ergebnis <b>BAV-Dateien erzeugen</b>.</li>"
+    "<li>Die Ausgabeart sehen und die Dateien mit <b>Ordner öffnen</b> "
+    "aufrufen.</li>"
+    "<li><b>BAV Web</b> öffnet die Webseite und kopiert den Pfad zum "
+    "BAV-Dateienordner in die Zwischenablage. Den Pfad im Dateiauswahldialog "
+    "einfügen und dort die gewünschte BAV-Datei auswählen.</li></ul>"
+)
+PLUGIN_HELP_FOOTER = "Den vollständigen Ablauf finden Sie unter <b>Overview</b>."
 BAV_PLUGIN_VERSION = "0.4"
 APP_NAME = "SeePhot"
 CONFIG_NAME = "bav_report.json"

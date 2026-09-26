@@ -47,7 +47,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.8.20"
+SCRIPT_VERSION = "0.8.40"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
@@ -462,6 +462,7 @@ def ensure_importable_module(import_name: str, package_name: str | None = None) 
 ensure_importable_module("PyQt6")
 ensure_importable_module("astropy")
 ensure_importable_module("numpy")
+ensure_importable_module("scipy")
 ensure_importable_module("matplotlib")
 ensure_importable_module("pyvo")
 
@@ -872,6 +873,27 @@ class VsxTreeWidgetItem(QTreeWidgetItem):
             other_value = float(other_mag) if isinstance(other_mag, (int, float)) else math.inf
             if self_value != other_value:
                 return self_value < other_value
+        return super().__lt__(other)
+
+
+class ResultBrowserTableItem(QTableWidgetItem):
+    """Keep formatted result values while sorting numeric columns numerically."""
+
+    def __init__(self, text: str, *, numeric: bool = False) -> None:
+        super().__init__(text)
+        if numeric:
+            try:
+                self.sort_value = float(text)
+            except (TypeError, ValueError):
+                self.sort_value = math.inf
+            if not math.isfinite(self.sort_value):
+                self.sort_value = math.inf
+        else:
+            self.sort_value = text.casefold()
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if isinstance(other, ResultBrowserTableItem):
+            return self.sort_value < other.sort_value
         return super().__lt__(other)
 
 
@@ -5878,6 +5900,26 @@ def write_lightcurve_trim_plan(plan: LightCurveTrimPlan) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def apply_lightcurve_trim_plan(
+    plan: LightCurveTrimPlan,
+    export_files: tuple[Path, ...],
+) -> tuple[tuple[Path, ...], tuple[tuple[Path, OSError], ...]]:
+    """Commit the trimmed CSV before removing local exports derived from it."""
+
+    write_lightcurve_trim_plan(plan)
+    deleted: list[Path] = []
+    failed: list[tuple[Path, OSError]] = []
+    for path in export_files:
+        try:
+            path.unlink()
+            deleted.append(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            failed.append((path, exc))
+    return tuple(deleted), tuple(failed)
+
+
 def local_derived_export_files(
     result_csv: Path,
     target_name: str,
@@ -7055,8 +7097,10 @@ def filter_and_sample_gaia_ari_table(
     frame: ReferenceFrame,
     table: object,
     max_sources: int = GAIA_LINEARITY_SAMPLE_SIZE,
+    isolation_radius_px: float | None = None,
+    isolation_max_g_mag_delta: float = 3.0,
 ) -> tuple[object, int]:
-    """Vector-filter the WCS footprint and take a bounded balanced sample."""
+    """Fill a balanced sample with isolated sources from the WCS footprint."""
 
     if max_sources < 1:
         raise ValueError("Gaia linearity sample size must be positive.")
@@ -7089,35 +7133,67 @@ def filter_and_sample_gaia_ari_table(
     inside_indices = np.flatnonzero(valid)
     inside_count = int(inside_indices.size)
     if inside_count <= max_sources:
-        return table[inside_indices], inside_count
+        candidate_indices = inside_indices
+    else:
+        x_bin = np.minimum(3, np.asarray(x[inside_indices] * 4.0 / frame.width, dtype=int))
+        y_bin = np.minimum(3, np.asarray(y[inside_indices] * 4.0 / frame.height, dtype=int))
+        magnitude_bin = np.clip(
+            np.digitize(g_mag[inside_indices], GAIA_FIELD_MAG_BIN_EDGES) - 1,
+            0,
+            len(GAIA_FIELD_MAG_BIN_EDGES) - 2,
+        )
+        color_bin = np.clip(
+            np.digitize(bp_rp[inside_indices], GAIA_FIELD_COLOR_BIN_EDGES) - 1,
+            0,
+            len(GAIA_FIELD_COLOR_BIN_EDGES) - 2,
+        )
+        stratum = (
+            ((y_bin * 4 + x_bin) * (len(GAIA_FIELD_MAG_BIN_EDGES) - 1) + magnitude_bin)
+            * (len(GAIA_FIELD_COLOR_BIN_EDGES) - 1)
+            + color_bin
+        )
+        source_ids = np.asarray(table["source_id"])[inside_indices]
+        by_stratum = np.lexsort((source_ids, stratum))
+        sorted_strata = stratum[by_stratum]
+        group_starts = np.r_[True, sorted_strata[1:] != sorted_strata[:-1]]
+        start_positions = np.maximum.accumulate(
+            np.where(group_starts, np.arange(inside_count), 0)
+        )
+        levels = np.arange(inside_count) - start_positions
+        balanced_order = np.lexsort((sorted_strata, levels))
+        candidate_indices = inside_indices[by_stratum[balanced_order]]
 
-    x_bin = np.minimum(3, np.asarray(x[inside_indices] * 4.0 / frame.width, dtype=int))
-    y_bin = np.minimum(3, np.asarray(y[inside_indices] * 4.0 / frame.height, dtype=int))
-    magnitude_bin = np.clip(
-        np.digitize(g_mag[inside_indices], GAIA_FIELD_MAG_BIN_EDGES) - 1,
-        0,
-        len(GAIA_FIELD_MAG_BIN_EDGES) - 2,
-    )
-    color_bin = np.clip(
-        np.digitize(bp_rp[inside_indices], GAIA_FIELD_COLOR_BIN_EDGES) - 1,
-        0,
-        len(GAIA_FIELD_COLOR_BIN_EDGES) - 2,
-    )
-    stratum = (
-        ((y_bin * 4 + x_bin) * (len(GAIA_FIELD_MAG_BIN_EDGES) - 1) + magnitude_bin)
-        * (len(GAIA_FIELD_COLOR_BIN_EDGES) - 1)
-        + color_bin
-    )
-    source_ids = np.asarray(table["source_id"])[inside_indices]
-    by_stratum = np.lexsort((source_ids, stratum))
-    sorted_strata = stratum[by_stratum]
-    group_starts = np.r_[True, sorted_strata[1:] != sorted_strata[:-1]]
-    start_positions = np.maximum.accumulate(
-        np.where(group_starts, np.arange(inside_count), 0)
-    )
-    levels = np.arange(inside_count) - start_positions
-    balanced_order = np.lexsort((sorted_strata, levels))
-    selected_indices = inside_indices[by_stratum[balanced_order[:max_sources]]]
+    if isolation_radius_px is None:
+        selected_indices = candidate_indices[:max_sources]
+    else:
+        if not np.isfinite(isolation_radius_px) or isolation_radius_px <= 0:
+            raise ValueError("Gaia isolation radius must be finite and positive.")
+        from scipy.spatial import cKDTree
+
+        neighbor_indices = np.flatnonzero(
+            np.isfinite(x) & np.isfinite(y) & np.isfinite(g_mag)
+        )
+        tree = cKDTree(np.column_stack((x[neighbor_indices], y[neighbor_indices])))
+        all_ids = np.asarray(table["source_id"])
+        selected: list[int] = []
+        for start in range(0, len(candidate_indices), 512):
+            chunk = candidate_indices[start : start + 512]
+            nearby = tree.query_ball_point(
+                np.column_stack((x[chunk], y[chunk])), isolation_radius_px
+            )
+            for index, neighbors in zip(chunk, nearby):
+                if not any(
+                    all_ids[neighbor_indices[j]] != all_ids[index]
+                    and g_mag[neighbor_indices[j]] - g_mag[index]
+                    <= isolation_max_g_mag_delta
+                    for j in neighbors
+                ):
+                    selected.append(int(index))
+                    if len(selected) >= max_sources:
+                        break
+            if len(selected) >= max_sources:
+                break
+        selected_indices = np.asarray(selected, dtype=int)
     return table[selected_indices], inside_count
 
 
@@ -7127,6 +7203,8 @@ def query_gaia_dr3_region(
     min_g_mag: float = 5.0,
     max_g_mag: float = 18.5,
     maxrec: int = GAIA_FIELD_MAXREC,
+    isolation_radius_px: float | None = None,
+    isolation_max_g_mag_delta: float = 3.0,
 ) -> list[CatalogObject]:
     """Query Gaia DR3 synchronously through ARI TAP for one solved image."""
 
@@ -7148,12 +7226,17 @@ def query_gaia_dr3_region(
         raise RuntimeError(f"ARI Gaia DR3 TAP sync query failed: {exc}") from exc
     if progress is not None:
         progress(f"ARI Gaia DR3 query complete: {len(table)} source(s); filtering locally.")
-    selected_table, inside_count = filter_and_sample_gaia_ari_table(frame, table)
+    selected_table, inside_count = filter_and_sample_gaia_ari_table(
+        frame,
+        table,
+        isolation_radius_px=isolation_radius_px,
+        isolation_max_g_mag_delta=isolation_max_g_mag_delta,
+    )
     objects = gaia_objects_from_ari_table(selected_table)
     if progress is not None:
         progress(
             f"Gaia footprint contains {inside_count} usable source(s); "
-            f"selected {len(objects)} balanced reference(s) for aperture measurement."
+            f"selected {len(objects)} balanced, isolated reference(s) for aperture measurement."
         )
     return objects
 
@@ -10743,7 +10826,9 @@ def evaluate_photometry_quality(
             False,
             f"annulus contains {annulus_satpix} saturated pixel(s)",
         )
-    reference_role = role in {"comparison", "check", "field_zp_reference"}
+    reference_role = role in {
+        "comparison", "check", "field_zp_reference", "analyze_linearity_reference"
+    }
     if reference_role and aperture_highpix > 0:
         return PhotometryQualityDecision(
             QUALITY_STATUS_INVALID,
@@ -12568,14 +12653,19 @@ def write_calibrated_light_curve(
     robust_scatter_sigma = scatter_limit_info[2] if scatter_limit_info is not None else None
 
     rejected_high_scatter = 0
+    rejected_frame_indices: list[int] = []
     accepted_rows: list[dict[str, object]] = []
     for scatter, row in pending_rows:
         if scatter_limit is not None and scatter > scatter_limit:
             rejected_high_scatter += 1
+            rejected_frame_indices.append(int(row["frame_index"]))
             continue
         accepted_rows.append(row)
 
     final_metadata = augment_result_metadata_from_rows(metadata, accepted_rows)
+    final_metadata["ZERO_POINT_SCATTER_REJECTED_FRAME_INDICES"] = ",".join(
+        str(index) for index in rejected_frame_indices
+    )
     with path.open("w", newline="") as fh:
         write_result_metadata_header(fh, final_metadata)
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
@@ -14363,7 +14453,7 @@ class LightCurveWindow(QWidget):
         open_lightcurve_layout.addWidget(self.open_result_vsx_button)
 
         open_lightcurve_layout.addStretch(1)
-        binning_group = QGroupBox("Result Binning")
+        binning_group = QGroupBox("Photometric Binning")
         binning_layout = QHBoxLayout(binning_group)
         self.binning_mode_combo = QComboBox()
         self.binning_mode_combo.addItem("N images", "count")
@@ -14388,7 +14478,7 @@ class LightCurveWindow(QWidget):
         self.use_raw_curve_button.setToolTip("Make the unmodified source result the active curve again.")
         self.use_raw_curve_button.clicked.connect(self.activate_raw_curve)
         binning_layout.addWidget(self.use_raw_curve_button)
-        self.binning_eligibility_label = QLabel("Requires a newly created original-image result.")
+        self.binning_eligibility_label = QLabel()
         binning_layout.addWidget(self.binning_eligibility_label, 1)
         lightcurve_layout.addWidget(binning_group)
 
@@ -14731,6 +14821,8 @@ class LightCurveWindow(QWidget):
             if not isinstance(bav_tab, QWidget):
                 raise RuntimeError("create_bav_tab(context) did not return a QWidget")
 
+            bav_tab.setProperty("context_help_body", module.PLUGIN_HELP_BODY)
+            bav_tab.setProperty("context_help_footer", module.PLUGIN_HELP_FOOTER)
             label = str(getattr(module, "PLUGIN_TAB_LABEL", "BAV")).strip() or "BAV"
             self.bav_tab = bav_tab
             self.tabs.addTab(bav_tab, label)
@@ -15840,6 +15932,7 @@ class LightCurveWindow(QWidget):
             first_result_row_float(row, "target_calibrated_mag_error", "calibrated_mag_error"),
             4,
         )
+        target_snr = format_optional_float(first_result_row_float(row, "target_snr"), 1)
         references = csv_text(row.get("field_reference_used"), "n/a")
         zp_scatter = csv_text(row.get("field_zero_point_scatter"), "n/a")
         image_source = csv_text(row.get("image_source"), "n/a")
@@ -15852,7 +15945,7 @@ class LightCurveWindow(QWidget):
         self.set_single_result_quality_banner(quality_status, quality_flag)
         target_prefix = "Target: " if row_valid else "Diagnostic value only: "
         self.single_result_target_label.setText(
-            f"{target_prefix}{mag} +/- {err} mag, refs={references}, "
+            f"{target_prefix}{mag} +/- {err} mag, SNR={target_snr}, refs={references}, "
             f"ZP scatter={zp_scatter} mag, filter={aavso_filter} ({image_source})"
         )
 
@@ -16194,7 +16287,7 @@ class LightCurveWindow(QWidget):
         self.show_running_mean_checkbox.setChecked(False)
         self.binning_mode_combo.setCurrentIndex(0)
         self.binning_value_spin.setValue(10)
-        self.binning_eligibility_label.setText("Requires a newly created original-image result.")
+        self.binning_eligibility_label.clear()
         self.clear_single_result_summary()
         self.lightcurve_figure.clear()
         self.lightcurve_axis = None
@@ -18559,7 +18652,11 @@ class LightCurveWindow(QWidget):
             with instrumental_csv.open(newline="") as handle:
                 instrumental_rows = list(csv_data_dict_reader(handle))
             fingerprint = module.source_fingerprint(instrumental_rows)
-            frames, excluded = module.calibrated_frames_from_instrumental_rows(instrumental_rows)
+            scatter_rejected_frames = module.scatter_rejected_frame_indices(source_metadata)
+            frames, excluded = module.calibrated_frames_from_instrumental_rows(
+                instrumental_rows,
+                excluded_frame_indices=scatter_rejected_frames,
+            )
             mode = str(self.binning_mode_combo.currentData())
             value = int(self.binning_value_spin.value())
             groups, skipped = module.plan_bins(frames, mode, value)
@@ -18590,6 +18687,13 @@ class LightCurveWindow(QWidget):
                 raise RuntimeError("Central result-file contract is unavailable.")
             output_csv = Path(output_path_builder(source_csv, mode, value))
             metadata = dict(source_metadata)
+            for trim_key in (
+                "LIGHTCURVE_TRIMMED",
+                "LIGHTCURVE_ORIGINAL_OBS_COUNT",
+                "LIGHTCURVE_TRIM_JD_START",
+                "LIGHTCURVE_TRIM_JD_END",
+            ):
+                metadata.pop(trim_key, None)
             metadata.update({
                 "SOURCE_PROVENANCE": "BINNED_RESULT",
                 "BINNING_ALLOWED": "0",
@@ -20586,7 +20690,7 @@ class LightCurveWindow(QWidget):
         dialog = QDialog(self)
         dialog.setWindowTitle(window_title)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dialog.resize(1120 if browser_single else 940, 420)
+        dialog.resize(1210 if browser_single else 940, 420)
         setattr(self, dialog_attribute, dialog)
         layout = QVBoxLayout(dialog)
 
@@ -20606,16 +20710,16 @@ class LightCurveWindow(QWidget):
 
         update_browser_status()
 
-        table = QTableWidget(len(candidates), 10)
+        table = QTableWidget(len(candidates), 11 if browser_single else 10)
         table.setHorizontalHeaderLabels(
             (
                 [
-                    "Star", "Date", "Image folder", "Mag", "Error",
+                    "Star", "VSX Type", "Date", "Image folder", "Mag", "Error",
                     "Status", "Refs", "Check Δ", "AAVSO", "BAV",
                 ]
                 if browser_single
                 else [
-                    "Star", "Type", "Date", "Image folder", "Variant", "Rows",
+                    "Star", "VSX Type", "Date", "Image folder", "Variant", "Rows",
                     "Check", "PNG", "AAVSO", "BAV",
                 ]
             )
@@ -20625,19 +20729,13 @@ class LightCurveWindow(QWidget):
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.verticalHeader().setVisible(False)
         table.horizontalHeader().setStretchLastSection(False)
-        table.setColumnWidth(0, 170)
-        table.setColumnWidth(1, 95 if browser_single else 90)
-        table.setColumnWidth(2, 270 if browser_single else 95)
-        table.setColumnWidth(3, 90 if browser_single else 270)
-        table.setColumnWidth(4, 70 if browser_single else 95)
-        table.setColumnWidth(5, 150 if browser_single else 60)
-        table.setColumnWidth(6, 55 if browser_single else 55)
-        table.setColumnWidth(7, 75 if browser_single else 65)
-        if browser_single:
-            table.setColumnWidth(8, 65)
-            table.setColumnWidth(9, 55)
-        else:
-            table.setColumnWidth(8, 55)
+        column_widths = (
+            (170, 90, 95, 270, 90, 70, 150, 55, 75, 65, 55)
+            if browser_single else
+            (170, 90, 95, 270, 95, 60, 55, 65, 55, 55)
+        )
+        for column_index, width in enumerate(column_widths):
+            table.setColumnWidth(column_index, width)
 
         def candidate_values(candidate: object) -> list[str]:
             if browser_single:
@@ -20650,6 +20748,7 @@ class LightCurveWindow(QWidget):
                     status = f"{status}: {quality_flag}"
                 return [
                     candidate.target_name,
+                    candidate.variable_type,
                     candidate.report_date,
                     candidate.source_directory_name,
                     str(getattr(candidate, "calibrated_mag", "")),
@@ -20673,10 +20772,23 @@ class LightCurveWindow(QWidget):
                 str(candidate.bav_file_count),
             ]
 
-        for row_index, candidate in enumerate(candidates):
-            values = candidate_values(candidate)
-            for column_index, value in enumerate(values):
-                table.setItem(row_index, column_index, QTableWidgetItem(value))
+        numeric_columns = {4, 5, 7, 8} if browser_single else {5, 9}
+
+        def populate_browser_table() -> None:
+            sorting_enabled = table.isSortingEnabled()
+            table.setSortingEnabled(False)
+            table.setRowCount(len(candidates))
+            for row_index, candidate in enumerate(candidates):
+                for column_index, value in enumerate(candidate_values(candidate)):
+                    item = ResultBrowserTableItem(
+                        value, numeric=column_index in numeric_columns
+                    )
+                    item.setData(Qt.ItemDataRole.UserRole, row_index)
+                    table.setItem(row_index, column_index, item)
+            table.setSortingEnabled(sorting_enabled)
+
+        populate_browser_table()
+        table.setSortingEnabled(True)
         table.selectRow(0)
         layout.addWidget(table)
 
@@ -20697,9 +20809,11 @@ class LightCurveWindow(QWidget):
 
         def selected_candidate() -> object | None:
             row = table.currentRow()
-            if row < 0 or row >= len(candidates):
+            item = table.item(row, 0) if row >= 0 else None
+            candidate_index = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if not isinstance(candidate_index, int) or not 0 <= candidate_index < len(candidates):
                 return None
-            return candidates[row]
+            return candidates[candidate_index]
 
         def preview_selected() -> None:
             candidate = selected_candidate()
@@ -20779,11 +20893,7 @@ class LightCurveWindow(QWidget):
             scan_report = refreshed_report
             log_scan_report(scan_report)
             candidates[:] = refreshed
-            table.setRowCount(len(candidates))
-            for row_index, candidate in enumerate(candidates):
-                values = candidate_values(candidate)
-                for column_index, value in enumerate(values):
-                    table.setItem(row_index, column_index, QTableWidgetItem(value))
+            populate_browser_table()
             if candidates:
                 table.selectRow(0)
             preview_button.setEnabled(bool(candidates))
@@ -21252,12 +21362,8 @@ class LightCurveWindow(QWidget):
             self.append_log("Light Curve trim aborted by user.")
             return
 
-        deleted_exports: list[Path] = []
         try:
-            for path in export_files:
-                path.unlink()
-                deleted_exports.append(path)
-            write_lightcurve_trim_plan(plan)
+            deleted_exports, failed_exports = apply_lightcurve_trim_plan(plan, export_files)
         except Exception as exc:
             self.append_log(f"ERROR: Light Curve trim failed: {type(exc).__name__}: {exc}")
             QMessageBox.critical(
@@ -21269,9 +21375,10 @@ class LightCurveWindow(QWidget):
 
         self.clear_extremum_fit(redraw=False, reset_status=True)
         self.reset_export_status()
-        self.export_status_label.setText(
-            f"Current export source was trimmed; recreate AAVSO/BAV exports: {result_csv}"
-        )
+        export_status = f"Current export source was trimmed; recreate AAVSO/BAV exports: {result_csv}"
+        if failed_exports:
+            export_status += f"; {len(failed_exports)} old export file(s) could not be deleted"
+        self.export_status_label.setText(export_status)
         output_png = result_csv.with_suffix(".png")
         self.plot_light_curve_csv(
             result_csv,
@@ -21286,17 +21393,26 @@ class LightCurveWindow(QWidget):
         )
         self.lightcurve_status_label.setText(message)
         self.append_log(message)
+        for path, exc in failed_exports:
+            self.append_log(f"WARNING: Could not remove stale export {path}: {exc}")
         self.refresh_plugin_tab_views()
         try:
             self.write_run_log(result_csv.parent)
         except Exception as exc:
             self.append_log(f"WARNING: Run log update after Light Curve trim failed: {exc}")
-        QMessageBox.information(
-            self,
-            "Trim Light Curve",
+        completion_message = (
             f"Light Curve trimmed.\n\nKept {len(plan.rows)} of "
-            f"{plan.original_row_count} rows.",
+            f"{plan.original_row_count} rows."
         )
+        if failed_exports:
+            completion_message += (
+                "\n\nSome old AAVSO/BAV export files could not be deleted. "
+                "Recreate them before use:\n"
+                + "\n".join(str(path) for path, _ in failed_exports)
+            )
+            QMessageBox.warning(self, "Trim Light Curve", completion_message)
+        else:
+            QMessageBox.information(self, "Trim Light Curve", completion_message)
 
     def clear_extremum_fit(
         self,
@@ -21541,6 +21657,7 @@ class LightCurveWindow(QWidget):
             body {{ color: {colors['text']}; }}
             h2 {{ color: {colors['title_text']}; margin-bottom: 4px; }}
             h3 {{ color: {colors['title_text']}; margin-top: 18px; margin-bottom: 4px; }}
+            h4 {{ color: {colors['title_text']}; margin-top: 10px; margin-bottom: 4px; }}
             p {{ margin-top: 4px; margin-bottom: 7px; }}
             ul {{ margin-top: 4px; margin-bottom: 8px; }}
             li {{ margin-bottom: 3px; }}
@@ -21562,36 +21679,56 @@ class LightCurveWindow(QWidget):
         </head>
         <body>
             <h2>{WINDOW_TITLE}</h2>
-            <p><b>Light Curve workflow</b></p>
+            <h3>Purpose</h3>
+            <p>SeePhot creates light curves for variable stars from prepared FITS image
+            sequences. It finds targets in VSX, measures their brightness against comparison
+            stars, and provides plots and reports for the results.</p>
+
+            <h3>Workflow and navigation</h3>
+            <h4>Using the interface</h4>
             <p>Work through the tabs from left to right. Within each tab, follow the controls
             from top to bottom.</p>
+            <p>The lower pane shows progress, warnings, and rejection details.<br>
+            <b>Reset</b> clears the session and temporary SeePhot files.<br>
+            <b>Close</b> exits the window.</p>
 
+            <h4>Workflow</h4>
+            <ul>
+                <li>Prepare original CFA images by extracting channels and, optionally,
+                stacking frames in groups.</li>
+                <li>Choose <b>Light Curve</b> or <b>Single Measurement</b> mode.</li>
+                <li>Detect variable stars in the image using the AAVSO VSX catalog.</li>
+                <li>Select one or more stars for photometry.</li>
+                <li>Perform aperture photometry.</li>
+                <li>Optionally fit a brightness maximum or minimum.</li>
+                <li>Generate AAVSO report files.</li>
+            </ul>
+
+            <br>
             <table class="tabs" width="100%" cellspacing="4" cellpadding="5">
                 <tr>
-                    <td class="tab" align="center"><b>1&nbsp; Prepare</b></td>
-                    <td class="tab" align="center"><b>2&nbsp; Variables</b></td>
-                    <td class="tab" align="center"><b>3&nbsp; Photometry</b></td>
-                    <td class="tab" align="center"><b>4&nbsp; Export</b></td>
+                    <td class="tab" align="center"><b>Prepare</b></td>
+                    <td class="tab" align="center"><b>Variables</b></td>
+                    <td class="tab" align="center"><b>Photometry</b></td>
+                    <td class="tab" align="center"><b>Export</b></td>
+                    <td class="tab" align="center"><b>Tools</b></td>
                 </tr>
             </table>
 
-            <h3>1. Prepare</h3>
+            <h3>Prepare</h3>
             <ul>
-                <li>If necessary, use <b>CFA Channels / Stack</b> to prepare original
-                Seestar CFA images.</li>
-                <li>Keep <b>Mode</b> set to <b>Light Curve</b>.</li>
+                <li>Use <b>CFA Channels / Stack</b> to extract the L (luminance) or G
+                (green) channel from the original Seestar CFA images.</li>
+                <li>Optionally, stack the images in suitable groups. Use <b>Tools</b> &gt;
+                <b>Stack Profiling</b> for a grouping recommendation.</li>
+                <li>Set <b>Mode</b> to <b>Light Curve</b> or <b>Single Measurement</b>.</li>
                 <li>Click <b>Browse...</b> and select the prepared FITS folder.</li>
                 <li>Click <b>Run</b>.</li>
             </ul>
             <p>SeePhot registers and plate-solves the sequence, selects a reference frame,
             and queries VSX for variables in the field.</p>
-            <div class="note">
-                The FITS folder is read only. Frames without usable data or WCS are skipped.<br>
-                Temporary files are stored in the sibling folder
-                <code>{TMP_DIRECTORY_NAME}</code>.
-            </div>
 
-            <h3>2. Variables</h3>
+            <h3>Variables</h3>
             <ul>
                 <li>Filter the VSX list by name, type, or maximum magnitude if required.</li>
                 <li>For variable types, use one of the two Seestar presets or enter your own
@@ -21601,12 +21738,19 @@ class LightCurveWindow(QWidget):
                 <li>Click <b>Open VSX</b> to view the selected target's catalog page.</li>
             </ul>
 
-            <h3>3. Photometry</h3>
-            <p><b>Create the Light Curve</b></p>
+            <h3>Photometry</h3>
+            <p><b>Light Curve mode</b></p>
             <ul>
+                <li>Select <b>Light Curve</b> in <b>Mode</b>.</li>
                 <li>Click <b>Create Light Curve</b>.</li>
                 <li>Comparison stars and an independent check star are selected automatically.</li>
                 <li>Click <b>Show Comparison Stars</b> to inspect the selected ensemble.</li>
+            </ul>
+            <p><b>Single Measurement mode</b></p>
+            <ul>
+                <li>Select <b>Single Measurement</b> in <b>Mode</b>.</li>
+                <li>Run the measurement for the selected target. A field zero point is determined
+                automatically; comparison stars are not used.</li>
             </ul>
             <p>Measurements can be rejected for:</p>
             <ul>
@@ -21643,8 +21787,11 @@ class LightCurveWindow(QWidget):
 
             <p><b>Open and plot a result</b></p>
             <ul>
-                <li><b>Light Curve CSV</b> opens an existing result.</li>
-                <li><b>Results Folder</b> opens the result browser.</li>
+                <li>Select <b>Light Curve</b> or <b>Single Measurement</b> in <b>Mode</b>
+                before opening results. The CSV picker and <b>Results Folder</b> browser
+                show results for the selected mode only.</li>
+                <li><b>Light Curve CSV</b> opens an existing result for the selected mode.</li>
+                <li><b>Results Folder</b> opens the result browser for the selected mode.</li>
                 <li><b>VSX</b> opens the current target's catalog page.</li>
                 <li><b>Plot Light Curve</b> opens the graph.</li>
                 <li><b>Running mean</b> adds an overlay without changing the CSV.</li>
@@ -21679,7 +21826,9 @@ class LightCurveWindow(QWidget):
             <p>An accepted fit is marked in the plot and recorded in the run log.
             <b>Clear Fit</b> removes the annotation.</p>
 
-            <h3>4. Export</h3>
+            <h3>Export</h3>
+            <p>Choose the mode and result to export. SeePhot creates the export files
+            that match the selected mode and result.</p>
             <ol>
                 <li>Enter your AAVSO observer code.</li>
                 <li>Check the displayed telescope.</li>
@@ -21694,11 +21843,6 @@ class LightCurveWindow(QWidget):
                 <li><b>AAVSO apps</b> opens the web tools, where you can upload the report.</li>
             </ul>
 
-            <div class="note">
-                The lower pane shows progress, warnings, and rejection details.<br>
-                <b>Reset</b> clears the session and temporary SeePhot files.<br>
-                <b>Close</b> exits the window.
-            </div>
         </body>
         </html>
         """
@@ -21710,36 +21854,73 @@ class LightCurveWindow(QWidget):
         tab_name = self.tabs.tabText(tab_index) if tab_index >= 0 else "SeePhot"
         help_by_tab = {
             "Prepare": (
-                "Select the folder with the prepared FITS sequence and click <b>Run</b>. "
-                "Use <b>CFA Channels / Stack</b> first when original Seestar CFA frames "
-                "still need to be prepared. Progress and skipped-frame details appear in the log."
+                "<h3>Process single directory</h3>"
+                "<ul><li><b>CFA Channels / Stack</b> prepares original Seestar CFA frames "
+                "from one folder.</li>"
+                "<li>Choose channels and stack groups; see progress in the log.</li></ul>"
+                "<h3>Process multiple directories</h3>"
+                "<ul><li><b>Batch Mode</b> prepares several CFA folders with shared settings.</li>"
+                "<li>See the status and log for the batch.</li></ul>"
+                "<h3>Detect Variables</h3>"
+                "<ul><li>Choose <b>Mode</b>, then enter an input path or use <b>Browse...</b>.</li>"
+                "<li>Check <b>Status</b> and click <b>Run</b> to prepare the input "
+                "and query VSX.</li></ul>"
             ),
             "Variables": (
-                "Filter the VSX list if needed, then double-click a row or use "
-                "<b>Select Target</b>. <b>Open VSX</b> opens the catalog entry for the "
-                "selected variable."
+                "<h3>Filter the VSX list</h3>"
+                "<ul><li><b>Name</b> finds matching stars; <b>Type</b> limits variable "
+                "types. The preset menu fills the type field.</li>"
+                "<li><b>Mag &le;</b> sets the maximum catalog magnitude. Press Enter "
+                "in a field to update the list.</li></ul>"
+                "<h3>Select a target</h3>"
+                "<ul><li>Double-click a row or click <b>Select Target</b> to use that star.</li>"
+                "<li><b>Open VSX</b> shows its catalog entry.</li></ul>"
             ),
             "Photometry": (
-                "Click <b>Create Light Curve</b> to measure the selected target. Use "
-                "<b>Show Comparison Stars</b> to inspect the ensemble. Existing result CSVs "
-                "can be opened, plotted, trimmed, and fitted here. Quality limits distinguish "
-                f"target blends ({TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag), reference-annulus "
-                f"contamination ({REFERENCE_ANNULUS_IMPACT_INVALID_MAG:.2f} mag), and target-annulus "
-                f"warnings/invalid measurements ({TARGET_ANNULUS_IMPACT_WARNING_MAG:.2f}/"
-                f"{TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag)."
+                "<h3>Single target</h3>"
+                "<ul><li>Click <b>Create Light Curve</b> for the selected target.</li>"
+                "<li>Use <b>Show Comparison Stars</b> to inspect the selected stars.</li></ul>"
+                "<h3>Multiple targets</h3>"
+                "<ul><li>Click <b>Select targets</b>, choose VSX targets, and run the batch.</li>"
+                "<li>See each target's status and result CSV; <b>Show</b> opens a result.</li></ul>"
+                "<h3>Result</h3>"
+                "<ul><li>For a single measurement, see its status and target/check values.</li></ul>"
+                "<h3>Measurement quality</h3>"
+                "<ul><li>A fully modeled Gaia target-neighbor blend is invalid from "
+                f"{TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag expected impact for a single "
+                f"measurement, or {SERIES_TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag in a series. "
+                "Missing or ambiguous Gaia evidence is a warning.</li>"
+                "<li>Comparison and check-star annulus contamination is invalid from "
+                f"{REFERENCE_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact.</li>"
+                "<li>Target annulus contamination warns from "
+                f"{TARGET_ANNULUS_IMPACT_WARNING_MAG:.2f} mag and is invalid from "
+                f"{TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact.</li></ul>"
+                "<h3>Photometric Binning</h3>"
+                "<ul><li>Combine measured fluxes from eligible original images into a separate photometry result.</li>"
+                "<li>Use <b>Use Raw Curve</b> to return to the source result.</li></ul>"
+                "<h3>Plot / Fit</h3>"
+                "<ul><li>Plot the curve and optionally show its running mean.</li>"
+                "<li>Select a JD range to fit a minimum/maximum or permanently trim the CSV.</li></ul>"
+                "<h3>Open</h3>"
+                "<ul><li><b>Light Curve CSV</b> opens one result directly.</li>"
+                "<li><b>Results Folder</b> lists the results in the selected folder. "
+                "Select a result and click <b>Load</b>, or double-click its row, to open it.</li>"
+                "<li><b>VSX</b> opens the current target's catalog page.</li></ul>"
             ),
             "Export": (
-                "Enter your AAVSO observer code, check the displayed telescope, and click "
-                "<b>Export AAVSO Report</b>. The export uses the currently selected or opened "
-                "Light Curve result."
+                "<h3>Config</h3>"
+                "<ul><li>Enter your AAVSO observer code.</li>"
+                "<li>Check the telescope shown for the current result.</li></ul>"
+                "<h3>Export</h3>"
+                "<ul><li>Click <b>Export AAVSO Report</b> for the selected or opened "
+                "Light Curve result.</li>"
+                "<li>Use <b>Open Folder</b> to see the report. <b>AAVSO apps</b> "
+                "opens the web tools and copies the export folder path to the clipboard. "
+                "Paste it into the upload file chooser, then select the report file.</li></ul>"
             ),
             "QC": (
                 "Use this developer-oriented tab to run or compare focused quality checks for "
                 "the current result. Read the log before saving a new reference result."
-            ),
-            "BAV": (
-                "Complete the BAV configuration, then create the BAV files from the current "
-                "Light Curve result. Use <b>Ordner öffnen</b> to inspect the generated files."
             ),
             "Archive": (
                 "Choose a results folder, review its worklist and status, then archive only the "
@@ -21750,8 +21931,12 @@ class LightCurveWindow(QWidget):
                 "this tab. Any findings and errors are reported in the log."
             ),
             "Tools": (
-                "Choose a FITS image for the photometric-linearity check, or select a source "
-                "folder and run <b>Analyze Timing</b> for stack profiling."
+                "<h3>Photometric linearity</h3>"
+                "<ul><li>Choose a solved FITS image; adjust the BP-RP range if needed.</li>"
+                "<li>See the Gaia V comparison and residual plots.</li></ul>"
+                "<h3>Stack Profiling</h3>"
+                "<ul><li>Choose an original FITS folder and click <b>Analyze Timing</b>.</li>"
+                "<li>See frame timing, grouping options, and a recommendation when available.</li></ul>"
             ),
         }
         body = help_by_tab.get(
@@ -21759,17 +21944,26 @@ class LightCurveWindow(QWidget):
             "Use the controls on this tab from top to bottom. Progress, warnings, and errors "
             "appear in the log below.",
         )
+        tab = self.tabs.currentWidget()
+        if tab is not None:
+            body = tab.property("context_help_body") or body
+        footer = (
+            tab.property("context_help_footer") if tab is not None else None
+        ) or "For the complete workflow, click <b>Overview</b>."
         colors = THEME_COLORS
         return f"""
         <html><head><style>
             body {{ color: {colors['text']}; }}
             h2 {{ color: {colors['title_text']}; margin-bottom: 8px; }}
+            h3 {{ color: {colors['title_text']}; margin-top: 10px; margin-bottom: 4px; }}
+            ul {{ margin-top: 4px; margin-bottom: 8px; }}
+            li {{ margin-bottom: 3px; }}
             .note {{ background-color: {colors['status']}; border-left: 3px solid
                 {colors['status_accent']}; padding: 9px; }}
         </style></head><body>
             <h2>{tab_name}</h2>
             <div class="note">{body}</div>
-            <p>For the complete workflow, click <b>Overview</b>.</p>
+            <p>{footer}</p>
         </body></html>
         """
 
