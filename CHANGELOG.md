@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.60 - 2026-09-30
+
+- Added Single Measurement targets from SIMBAD, Gaia DR3, or manually entered
+  coordinates, with source provenance and safeguards for references and
+  scientific exports.
+- Added an informational field zero-point result when reference signal-to-noise
+  is below the export threshold.
+- Improved multiple-target batch selection and reset behavior.
+- Enabled CFA channel extraction from a single frame without creating a stack.
+
 ## 0.8.40 - 2026-09-26
 
 - Improved result browsing with VSX type display, numeric sorting, and clearer

@@ -105,13 +105,11 @@ class BatchTab(QWidget):
         layout = QVBoxLayout(self)
 
         controls = QHBoxLayout()
-        self.reload_button = QPushButton("Reload")
         self.select_all_button = QPushButton("Select All")
         self.select_none_button = QPushButton("Select None")
         self.clear_button = QPushButton("Clear")
         self.run_button = QPushButton("Run")
         for button in (
-            self.reload_button,
             self.select_all_button,
             self.select_none_button,
             self.clear_button,
@@ -145,13 +143,11 @@ class BatchTab(QWidget):
         layout.addWidget(self.table, stretch=1)
 
         self.action_buttons = [
-            self.reload_button,
             self.select_all_button,
             self.select_none_button,
             self.clear_button,
             self.run_button,
         ]
-        self.reload_button.clicked.connect(self.reload_visible_targets)
         self.select_all_button.clicked.connect(lambda: self.set_all_checked(True))
         self.select_none_button.clicked.connect(lambda: self.set_all_checked(False))
         self.clear_button.clicked.connect(self.clear_targets)
@@ -171,13 +167,12 @@ class BatchTab(QWidget):
 
     def update_buttons(self) -> None:
         has_targets = bool(self.targets)
-        self.reload_button.setEnabled(not self.running)
         self.select_all_button.setEnabled(not self.running and has_targets)
         self.select_none_button.setEnabled(not self.running and has_targets)
         self.clear_button.setEnabled(not self.running and has_targets)
         self.run_button.setEnabled(
             not self.running
-            and any(row.checked and row.status == "queued" for row in self.targets)
+            and any(row.checked for row in self.targets)
         )
 
     def set_status(self, message: str) -> None:
@@ -226,12 +221,18 @@ class BatchTab(QWidget):
         self.refresh_table()
         self.update_buttons()
 
-    def reload_visible_targets(self) -> None:
-        """Explicitly leave the completed-run scope and reload visible VSX targets."""
+    def sync_visible_targets(self) -> None:
+        """Start a fresh selection from the currently visible Variables rows."""
 
         if self.running:
             return
         self.run_scope_locked = False
+        for row in self.targets:
+            row.status = "queued" if row.checked else "not selected"
+            row.step = ""
+            row.result_csv = None
+            row.outcome = ""
+            row.message = ""
         self.refresh_plugin_view()
 
     def clear_targets(self) -> None:
@@ -263,7 +264,9 @@ class BatchTab(QWidget):
             return
         self.targets.clear()
         self.current_index = None
+        self.current_signal_result = None
         self.run_scope_locked = False
+        self.batch_mode = ""
         self.refresh_table()
         self.status_label.setText("No VSX targets available. Run Detect Variables first.")
         self.update_buttons()

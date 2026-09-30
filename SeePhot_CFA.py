@@ -757,6 +757,14 @@ def stack_meets_minimum(frames: list[FitsFrame], plan: StackPlan) -> tuple[bool,
     ), total_exposure, minimum_exposure
 
 
+def stack_plans_for_input(
+    plans: tuple[StackPlan, ...], frames: list[FitsFrame], needs_cfa_split: bool,
+) -> tuple[StackPlan, ...]:
+    """A lone CFA exposure produces channels, but cannot produce a stack."""
+
+    return () if needs_cfa_split and len(frames) == 1 else plans
+
+
 def stack_minimum_text(plan: StackPlan) -> str:
     minimum_exposure = minimum_stack_exposure(plan)
     if minimum_exposure <= 0:
@@ -1219,6 +1227,14 @@ class StackWorker(QThread):
         needs_cfa_split = frames_need_cfa_split(source_frames)
         if needs_cfa_split and not self.selected_channels:
             raise ValueError("Select at least one CFA output channel.")
+        effective_plans = stack_plans_for_input(
+            self.selected_plans, source_frames, needs_cfa_split,
+        )
+        if needs_cfa_split and len(source_frames) == 1:
+            self.emit_log(
+                "[INFO] One CFA frame: exporting selected channels without stacking."
+            )
+        self.selected_plans = effective_plans
         if self.require_lightcurve_filter and not needs_cfa_split:
             image_source = require_supported_lightcurve_source(source_frames, self.source_dir)
             self.emit_log(
@@ -1299,23 +1315,29 @@ class StackWorker(QThread):
         try:
             frame_count = len(source_frames)
             channel_labels = ", ".join(cfa_channel_label(channel_key) for channel_key in self.selected_channels)
-            self.emit_log(f"[INFO] Copying CFA source frames: {frame_count} files.")
-            for index, frame in enumerate(source_frames, start=1):
-                shutil.copy2(frame.path, cfa_split_dir / frame.path.name)
-                if should_log_progress(index, frame_count):
-                    self.emit_log(f"[INFO] CFA source frames copied: {index}/{frame_count}.")
+            if frame_count == 1:
+                self.emit_log("[INFO] Extracting one CFA frame directly; Siril needs a sequence for seqsplit_cfa.")
+            else:
+                self.emit_log(f"[INFO] Copying CFA source frames: {frame_count} files.")
+                for index, frame in enumerate(source_frames, start=1):
+                    shutil.copy2(frame.path, cfa_split_dir / frame.path.name)
+                    if should_log_progress(index, frame_count):
+                        self.emit_log(f"[INFO] CFA source frames copied: {index}/{frame_count}.")
 
-            self.run_cmd(siril, f"requires {SIRIL_REQUIRES}")
-            self.run_cmd(siril, OUTPUT_BITS_COMMAND)
-            self.run_cmd(siril, f'cd "{siril_path(cfa_split_dir)}"')
-            self.emit_log(f"[INFO] Running Siril CFA split on {frame_count} frames.")
-            self.run_cmd(siril, "link tmp -out=.")
-            self.run_cmd(siril, "seqsplit_cfa tmp")
-            self.emit_log(f"[OK] Siril CFA split complete: {frame_count} frames.")
+                self.run_cmd(siril, f"requires {SIRIL_REQUIRES}")
+                self.run_cmd(siril, OUTPUT_BITS_COMMAND)
+                self.run_cmd(siril, f'cd "{siril_path(cfa_split_dir)}"')
+                self.emit_log(f"[INFO] Running Siril CFA split on {frame_count} frames.")
+                self.run_cmd(siril, "link tmp -out=.")
+                self.run_cmd(siril, "seqsplit_cfa tmp")
+                self.emit_log(f"[OK] Siril CFA split complete: {frame_count} frames.")
 
             for index, frame in enumerate(source_frames, start=1):
                 suffix = f"{index:05d}"
-                cfa_data = self.read_cfa_split(cfa_split_dir, suffix)
+                cfa_data = (
+                    self.read_single_cfa_samples(frame.path)
+                    if frame_count == 1 else self.read_cfa_split(cfa_split_dir, suffix)
+                )
                 for channel_key, channel_dir in channel_dirs.items():
                     output_path = self.write_cfa_photometry_channel_output(
                         frame.path,
@@ -1357,6 +1379,17 @@ class StackWorker(QThread):
         return tuple(
             fits.getdata(workdir / f"CFA{position}_tmp_{suffix}.fit").astype(np.float32)
             for position in range(4)
+        )
+
+    def read_single_cfa_samples(self, path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Extract one Bayer frame in Siril's CFA0..CFA3 pixel order."""
+
+        data = fits.getdata(path)
+        if data.ndim != 2 or data.shape[0] % 2 or data.shape[1] % 2:
+            raise ValueError(f"{path.name}: CFA channel extraction needs an even-sized 2D image.")
+        return tuple(
+            data[row::2, column::2].astype(np.float32)
+            for row, column in ((0, 0), (0, 1), (1, 0), (1, 1))
         )
 
     def expand_cfa_blocks_to_full_resolution(self, data: np.ndarray) -> np.ndarray:
@@ -1961,6 +1994,9 @@ class StackWindow(QWidget):
                 raise ValueError("Select at least one CFA output channel.")
             if self.lightcurve_mode and not needs_cfa_split:
                 require_supported_lightcurve_source(source_frames, source_path)
+            selected_plans = stack_plans_for_input(
+                selected_plans, source_frames, needs_cfa_split,
+            )
         except Exception as exc:
             self.append_log(f"Cannot start stacking: {exc}")
             QMessageBox.critical(
@@ -2082,6 +2118,8 @@ class StackWindow(QWidget):
             <h3>Stack acceptance</h3>
             <ul>
                 <li>A stack block must have at least {MIN_FRAMES_PER_STACK} registered frames.</li>
+                <li>With one CFA frame, selected channels are exported without stacking,
+                even when ALL is selected.</li>
                 <li>Time-based blocks also need at least
                 {MIN_STACK_COMPLETION_FRACTION * 100:g}% of the requested duration.</li>
                 <li>End-of-sequence blocks are accepted when these criteria are met.</li>

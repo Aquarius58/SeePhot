@@ -5,7 +5,7 @@ light-curve analysis, and related CFA/stack workflows.
 
 ## Current Main Release
 
-- SeePhot Main: `0.8.40`
+- SeePhot Main: `0.8.60`
 - SeePhot CFA: `0.5.0`
 
 The Main release is a manually tested snapshot. The Main and CFA applications
@@ -39,6 +39,9 @@ Keep all ten Python files in the same Siril script directory:
 - AAVSO and BAV export workflows, including multiple extrema and optional
   period information.
 - Multi-target photometry batches and multi-folder CFA/stack batches.
+- Additional Single Measurement targets from SIMBAD, Gaia DR3, or entered
+  coordinates, with clearly marked informational results when needed.
+- CFA channel extraction from a single frame without stacking.
 - Pause-aware and dynamic stacking modes with stack profiling and planning
   recommendations.
 - Photometric linearity analysis and support for Seestar S50 and S50 Pro

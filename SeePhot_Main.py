@@ -47,7 +47,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.8.40"
+SCRIPT_VERSION = "0.8.60"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
@@ -109,7 +109,7 @@ EXTREMUM_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Parabolic spline", "parabolic_spline"),
     ("Automatic model comparison (classic)", EXTREMUM_MODEL_AUTOMATIC),
 )
-SERIES_MODE_VSX_TYPE_SUGGESTION = "EA*,EB*,EW*,RR*,HADS"
+SERIES_MODE_VSX_TYPE_SUGGESTION = "EA*,EB*,EW*,RR*,HADS*"
 SINGLE_MODE_VSX_TYPE_SUGGESTION = (
     "M,RVA*,RVB*,CWA*,DCEP*,N,NA*,NB*,NC*,NR*"
 )
@@ -217,6 +217,7 @@ SINGLE_FIELD_ZP_MIN_CATALOG_ERR_MAG = 0.001
 SINGLE_FIELD_ZP_MAX_CATALOG_ERR_MAG = 0.12
 SINGLE_FIELD_ZP_MAX_REFERENCES = 300
 SINGLE_FIELD_ZP_MIN_SNR = 15.0
+SINGLE_FIELD_ZP_INFORMATIONAL_MIN_SNR = 10.0
 SINGLE_FIELD_ZP_MAX_INST_MAG_ERROR = 0.12
 SINGLE_FIELD_ZP_MAX_B_MINUS_V = 1.35
 SINGLE_FIELD_ZP_MAX_G_MINUS_R = 1.35
@@ -469,7 +470,7 @@ ensure_importable_module("pyvo")
 import astropy.units as u  # noqa: E402
 import numpy as np  # noqa: E402
 import pyvo  # noqa: E402
-from astropy.coordinates import SkyCoord  # noqa: E402
+from astropy.coordinates import Angle, SkyCoord  # noqa: E402
 from astropy.io import fits  # noqa: E402
 from astropy.io.fits.verify import VerifyWarning  # noqa: E402
 from astropy.time import Time  # noqa: E402
@@ -5627,6 +5628,11 @@ def result_target_metadata(target: CatalogObject) -> dict[str, str]:
     mag_range, mag_max_raw, mag_min_raw, mag_band = vsx_mag_range(target)
     return {
         "OBJECT_NAME": target.name.strip(),
+        "OBJECT_CATALOG_SOURCE": target.catalog_source if is_added_target(target) else "VSX",
+        "OBJECT_CATALOG_ID": (
+            target.catalog_id if is_added_target(target)
+            else target.value_for(("OID", "oid")) or target.name
+        ),
         "OBJECT_RA": target_ra,
         "OBJECT_DEC": target_dec,
         "OBJECT_VAR_TYPE": target.object_type.strip(),
@@ -5639,6 +5645,128 @@ def result_target_metadata(target: CatalogObject) -> dict[str, str]:
         "OBJECT_VSX_OID": vsx_oid,
         "OBJECT_VSX_URL": aavso_vsx_detail_url(vsx_oid) if vsx_oid else "",
     }
+
+
+ADDED_TARGET_SOURCES = frozenset({"SIMBAD", "GAIA_DR3", "MANUAL"})
+
+
+def is_added_target(target: CatalogObject | None) -> bool:
+    return target is not None and target.catalog_source in ADDED_TARGET_SOURCES
+
+
+def parse_added_target_coordinates(ra_text: str, dec_text: str) -> tuple[float, float]:
+    """Read ICRS degrees or RA hourangle/Dec degree sexagesimal coordinates."""
+
+    try:
+        ra_value = ra_text.strip().replace(",", ".")
+        dec_value = dec_text.strip().replace(",", ".")
+        ra_deg = (
+            float(Angle(ra_value, unit=u.hourangle).degree)
+            if ":" in ra_value or "h" in ra_value.lower()
+            else float(ra_value)
+        )
+        dec_deg = (
+            float(Angle(dec_value, unit=u.deg).degree)
+            if ":" in dec_value or "d" in dec_value.lower()
+            else float(dec_value)
+        )
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Use ICRS decimal degrees or RA hh:mm:ss / Dec ±dd:mm:ss.") from exc
+    if not math.isfinite(ra_deg) or not 0 <= ra_deg < 360:
+        raise ValueError("RA must be in decimal degrees from 0 (inclusive) to 360 (exclusive).")
+    if not math.isfinite(dec_deg) or not -90 <= dec_deg <= 90:
+        raise ValueError("Dec must be in decimal degrees from -90 to +90.")
+    return ra_deg, dec_deg
+
+
+def added_target_object(
+    name: str, source: str, catalog_id: str, ra_deg: float, dec_deg: float,
+    object_type: str = "",
+) -> CatalogObject:
+    if not name.strip() or source not in ADDED_TARGET_SOURCES:
+        raise ValueError("Added target needs a name and a supported coordinate source.")
+    ra_deg, dec_deg = parse_added_target_coordinates(str(ra_deg), str(dec_deg))
+    return CatalogObject({
+        "Name": name.strip(), "id": catalog_id.strip(), "catalog_source": source,
+        "RA": f"{ra_deg:.10f}", "DEC": f"{dec_deg:.10f}", "Type": object_type.strip(),
+    })
+
+
+def resolve_simbad_target(identifier: str, object_type: str = "") -> CatalogObject:
+    """Resolve one literal identifier using SIMBAD's documented degree columns."""
+
+    identifier = identifier.strip()
+    if not identifier or any(char in identifier for char in "*?[]"):
+        raise ValueError("Enter one complete SIMBAD identifier without wildcards.")
+    ensure_importable_module("astroquery")
+    from astroquery.simbad import Simbad
+
+    rows = Simbad.query_object(identifier, wildcard=False)
+    if rows is None or len(rows) != 1:
+        raise ValueError(f"SIMBAD did not resolve exactly one object for {identifier!r}.")
+    row = rows[0]
+    main_id = str(row["main_id"]).strip()
+    return added_target_object(
+        identifier, "SIMBAD", main_id, float(row["ra"]), float(row["dec"]), object_type,
+    )
+
+
+def resolve_gaia_dr3_target(identifier: str, object_type: str = "") -> CatalogObject:
+    """Resolve a DR3 source_id in the release-specific Gaia source table."""
+
+    match = re.fullmatch(r"(?:Gaia\s+DR3\s+)?([0-9]{1,19})", identifier.strip(), re.I)
+    if match is None:
+        raise ValueError("Enter a Gaia DR3 source ID as digits or 'Gaia DR3 <digits>'.")
+    source_id = int(match.group(1))
+    if not 0 < source_id <= 2**63 - 1:
+        raise ValueError("Gaia DR3 source ID is outside the valid 64-bit range.")
+    ensure_importable_module("astroquery")
+    from astroquery.gaia import Gaia
+
+    job = Gaia.launch_job(
+        "SELECT source_id, ra, dec FROM gaiadr3.gaia_source "
+        f"WHERE source_id = {source_id}"
+    )
+    rows = job.get_results()
+    if len(rows) != 1 or int(rows[0]["source_id"]) != source_id:
+        raise ValueError(f"Gaia DR3 source {source_id} was not found.")
+    return added_target_object(
+        f"Gaia DR3 {source_id}", "GAIA_DR3", str(source_id),
+        float(rows[0]["ra"]), float(rows[0]["dec"]), object_type,
+    )
+
+
+def exclude_target_from_field_references(
+    candidates: list[CatalogObject], target: CatalogObject,
+    frame: ReferenceFrame, minimum_distance_px: float,
+) -> list[CatalogObject]:
+    """Never let a manually added target calibrate its own measurement."""
+
+    target_x, target_y, problem = object_pixel_position_in_frame(target, frame)
+    if problem is not None:
+        raise ValueError(f"Target position is unusable: {problem}")
+    separated = []
+    for candidate in candidates:
+        x, y, problem = object_pixel_position_in_frame(candidate, frame)
+        if problem is None and math.hypot(x - target_x, y - target_y) > minimum_distance_px:
+            separated.append(candidate)
+    return separated
+
+
+def assess_single_target_catalog_blend(
+    target: CatalogObject, frame: ReferenceFrame,
+    aperture_settings: ApertureSettings, progress: Callable[[str], None] | None = None,
+) -> TargetBlendAssessment:
+    """Keep historical catalog fluxes from rejecting a newly added transient."""
+
+    if is_added_target(target):
+        return TargetBlendAssessment(
+            QUALITY_STATUS_WARNING, "TARGET_BLEND_EVIDENCE_INCOMPLETE", False,
+            "Gaia blend model skipped: an added target may have changed brightness "
+            "since Gaia DR3; inspect nearby sources in the image.",
+            evidence_complete=False,
+        )
+    return assess_target_catalog_blend(target, frame, aperture_settings, progress)
 
 
 def catalog_object_report_entry(obj: CatalogObject) -> str:
@@ -8943,7 +9071,10 @@ def select_single_field_zp_candidates_with_ucac4_fallback(
     return candidates
 
 
-def single_field_zp_reference_quality(measurement: ApertureMeasurement) -> tuple[bool, str]:
+def single_field_zp_reference_quality(
+    measurement: ApertureMeasurement,
+    min_snr: float = SINGLE_FIELD_ZP_MIN_SNR,
+) -> tuple[bool, str]:
     """Return whether one measured field reference can be used for the ZP fit."""
 
     reasons: list[str] = []
@@ -8951,7 +9082,7 @@ def single_field_zp_reference_quality(measurement: ApertureMeasurement) -> tuple
         reasons.append(measurement.quality_flag)
     if measurement.inst_mag is None:
         reasons.append("NO_INST_MAG")
-    if not np.isfinite(measurement.snr) or measurement.snr < SINGLE_FIELD_ZP_MIN_SNR:
+    if not np.isfinite(measurement.snr) or measurement.snr < min_snr:
         reasons.append("LOW_SNR")
     if (
         measurement.inst_mag_error is None
@@ -8974,12 +9105,13 @@ def single_field_zp_reference_quality(measurement: ApertureMeasurement) -> tuple
 
 def single_field_zp_references_from_measurements(
     measurements: list[ApertureMeasurement],
+    min_snr: float = SINGLE_FIELD_ZP_MIN_SNR,
 ) -> list[SingleFieldZpReference]:
     """Build field-ZP reference rows from raw aperture measurements."""
 
     references: list[SingleFieldZpReference] = []
     for measurement in measurements:
-        used_for_fit, reject_reason = single_field_zp_reference_quality(measurement)
+        used_for_fit, reject_reason = single_field_zp_reference_quality(measurement, min_snr)
         references.append(SingleFieldZpReference(measurement, used_for_fit, reject_reason))
     return references
 
@@ -14268,7 +14400,7 @@ class LightCurveWindow(QWidget):
         self.prepare_button.clicked.connect(self.prepare_sequence)
         detect_layout.addWidget(self.prepare_button)
         self.prepare_description_label = QLabel(
-            "Register frames · plate solve · load reference · query VSX"
+            "Register frames · Plate solve · Load reference · Query VSX"
         )
         self.prepare_description_label.setWordWrap(True)
         self.prepare_description_label.setSizePolicy(
@@ -14287,6 +14419,10 @@ class LightCurveWindow(QWidget):
         target_row = QHBoxLayout()
         target_row.addWidget(self.target_label)
         target_row.addStretch(1)
+        self.add_target_button = QPushButton("Add Target")
+        self.add_target_button.clicked.connect(self.add_target)
+        target_row.addWidget(self.add_target_button)
+
         self.select_target_button = QPushButton("Select Target")
         self.select_target_button.setEnabled(False)
         self.select_target_button.clicked.connect(self.select_target)
@@ -14896,6 +15032,7 @@ class LightCurveWindow(QWidget):
 
         if self.batch_dialog is None:
             return
+        self.batch_tab.sync_visible_targets()
         self.batch_dialog.show()
         self.batch_dialog.raise_()
         self.batch_dialog.activateWindow()
@@ -15030,7 +15167,11 @@ class LightCurveWindow(QWidget):
 
         busy = self.is_busy()
         prepared_field = self.prepare_completed and self.reference_frame is not None
-        selected_vsx = self.current_vsx_selection() is not None
+        selected_object = self.current_vsx_selection()
+        selected_vsx = selected_object is not None and not is_added_target(selected_object)
+        selected_for_mode = selected_object is not None and (
+            self.photometry_mode == MODE_SINGLE_MEASUREMENT or selected_vsx
+        )
         selected_target = self.selected_target is not None
         has_compstars = bool(self.comparison_stars)
         has_result = self.current_export_lightcurve() is not None
@@ -15064,11 +15205,13 @@ class LightCurveWindow(QWidget):
             not busy
             and prepared_field
             and selected_target
+            and (not lightcurve_mode or not is_added_target(self.selected_target.catalog_object))
             and (lightcurve_mode or self.single_target_precheck_ready)
         )
         return {
             "prepare": not busy and self.current_scan is not None,
-            "select_target": not busy and prepared_field and selected_vsx,
+            "select_target": not busy and prepared_field and selected_for_mode,
+            "add_target": not busy and prepared_field and self.photometry_mode == MODE_SINGLE_MEASUREMENT,
             "open_selected_vsx": not busy and prepared_field and selected_vsx,
             "create_light_curve": can_run_photometry,
             "show_comparison_stars": not busy and has_compstars,
@@ -15099,6 +15242,7 @@ class LightCurveWindow(QWidget):
         buttons = {
             "prepare_button": "prepare",
             "select_target_button": "select_target",
+            "add_target_button": "add_target",
             "vsx_selected_button": "open_selected_vsx",
             "run_light_curve_button": "create_light_curve",
             "show_compstars_button": "show_comparison_stars",
@@ -15874,7 +16018,17 @@ class LightCurveWindow(QWidget):
             return
         normalized = str(status or "").strip().upper()
         flags = str(quality_flag or "").strip()
-        if normalized == QUALITY_STATUS_INVALID:
+        if "INFORMATIONAL_FIELD_ZP" in flags.split("|"):
+            text = (
+                "INFORMATIONAL ONLY — FIELD-ZP REFERENCES BELOW EXPORT SNR\n"
+                "DIAGNOSTIC VALUE — NOT A VALID MEASUREMENT — EXPORT DISABLED"
+            )
+            style = (
+                "color: #1f1600; background-color: #e0a72f; "
+                "border: 2px solid #ffd166; border-radius: 5px; "
+                "font-size: 15px; font-weight: 700; padding: 10px;"
+            )
+        elif normalized == QUALITY_STATUS_INVALID:
             if "TARGET_BLEND_MODELED_CONTAMINATION" in flags.split("|"):
                 reason = "TARGET CONTAMINATION"
             elif "ANNULUS_CONTAMINATION" in flags.split("|"):
@@ -16270,17 +16424,14 @@ class LightCurveWindow(QWidget):
         self.current_scan = None
         self.prepare_completed = False
         self.reference_frame = None
-        self.catalog_objects = []
-        self.filtered_catalog_objects = []
+        self.clear_visible_vsx_targets()
         self.selected_target = None
         self.single_target_precheck_ready = False
         self.clear_comparison_star_state()
         self.set_selected_target_labels()
-        self.vsx_tree.clear()
-        self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
         self.prepare_button.setText("Run")
         self.prepare_description_label.setText(
-            "Register frames · plate solve · load reference · query VSX"
+            "Register frames · Plate solve · Load reference · Query VSX"
         )
         self.lightcurve_status_label.setText("No Light Curve generated yet.")
         self.export_status_label.setText("Exports the selected or opened Light Curve CSV as AAVSO Extended Format.")
@@ -16314,6 +16465,17 @@ class LightCurveWindow(QWidget):
         self.refresh_action_availability()
         self.update_overall_status()
 
+    def clear_visible_vsx_targets(self) -> None:
+        """Clear Variables and its separate multi-target selection together."""
+
+        self.catalog_objects = []
+        self.filtered_catalog_objects = []
+        self.vsx_tree.clear()
+        self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
+        batch_tab = getattr(self, "batch_tab", None)
+        if batch_tab is not None:
+            batch_tab.reset_plugin_view()
+
     def close_siril_display_context(
         self,
         context: str,
@@ -16346,6 +16508,9 @@ class LightCurveWindow(QWidget):
     def reset_application_state(self) -> None:
         """Return the GUI to its initial state and remove temporary work files."""
 
+        if self.batch_tab is not None and getattr(self.batch_tab, "running", False):
+            QMessageBox.warning(self, "Reset", "Multiple-target photometry is still running.")
+            return
         if self.solve_worker is not None and self.solve_worker.isRunning():
             QMessageBox.warning(
                 self,
@@ -16422,10 +16587,12 @@ class LightCurveWindow(QWidget):
         )
 
     def reset_plugin_tab_views(self) -> None:
-        """Reset plugin-tab views that expose a reset hook."""
+        """Reset plugin views, including the separate multi-target dialog."""
 
-        for index in range(self.tabs.count()):
-            widget = self.tabs.widget(index)
+        widgets = [self.tabs.widget(index) for index in range(self.tabs.count())]
+        if self.batch_tab is not None:
+            widgets.append(self.batch_tab)
+        for widget in widgets:
             reset_view = getattr(widget, "reset_plugin_view", None)
             if not callable(reset_view):
                 reset_view = getattr(widget, "reset_qc_view", None)
@@ -16625,19 +16792,16 @@ class LightCurveWindow(QWidget):
         results_dir = results_directory_for(scan.directory)
         self.prepare_completed = False
         self.reference_frame = None
-        self.catalog_objects = []
-        self.filtered_catalog_objects = []
+        self.clear_visible_vsx_targets()
         self.selected_target = None
         self.comparison_stars = []
         self.check_star = None
         self.series_optimized_aperture_settings = None
         self.set_selected_target_labels()
-        self.vsx_tree.clear()
-        self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
         self.comp_tree.clear()
         self.prepare_button.setText("Run")
         self.prepare_description_label.setText(
-            "Register frames · plate solve · load reference · query VSX"
+            "Register frames · Plate solve · Load reference · Query VSX"
         )
         self.lightcurve_status_label.setText(
             f"No target selected for {scan.directory.name}."
@@ -16687,6 +16851,11 @@ class LightCurveWindow(QWidget):
         return self.current_scan is not None and self.current_scan.first_fits is not None
 
     def prepare_sequence(self) -> None:
+        if self.batch_tab is not None and getattr(self.batch_tab, "running", False):
+            QMessageBox.information(
+                self, "Detect Variables", "Multiple-target photometry is still running."
+            )
+            return
         if self.solve_worker is not None:
             QMessageBox.information(self, "Detect Variables", "Plate solving is already running.")
             return
@@ -16730,15 +16899,12 @@ class LightCurveWindow(QWidget):
         self.export_status = "none"
         self.current_exports.clear()
         self.reference_frame = None
-        self.catalog_objects = []
-        self.filtered_catalog_objects = []
+        self.clear_visible_vsx_targets()
         self.selected_target = None
         self.comparison_stars = []
         self.check_star = None
         self.series_optimized_aperture_settings = None
         self.set_selected_target_labels()
-        self.vsx_tree.clear()
-        self.vsx_filter_status_label.setText("Showing 0 / 0 VSX Objects")
         self.comp_tree.clear()
         self.append_log("Detect Variables requested.")
         if not self.register_sequence(show_success=False):
@@ -16752,11 +16918,16 @@ class LightCurveWindow(QWidget):
     def retry_vsx_query(self) -> None:
         """Refresh VSX while retaining the already registered and solved sequence."""
 
+        added_targets = [obj for obj in self.catalog_objects if is_added_target(obj)]
         if not self.begin_busy_action(
             "FIELD_SETUP_RUNNING",
             "Retrying VSX query with the prepared reference frame.",
         ):
             return
+        self.clear_visible_vsx_targets()
+        self.selected_target = None
+        self.single_target_precheck_ready = False
+        self.set_selected_target_labels()
         self.set_varstars_status("detecting")
         self.last_vsx_failure_message = ""
         self.append_log(
@@ -16777,6 +16948,9 @@ class LightCurveWindow(QWidget):
                 )
                 self.append_log(message)
         finally:
+            self.catalog_objects.extend(added_targets)
+            if added_targets:
+                self.apply_vsx_filter()
             self.finish_busy_action("FIELD_SETUP_RUNNING")
         self.automatic_prepare_finished.emit(success, message)
 
@@ -17157,7 +17331,7 @@ class LightCurveWindow(QWidget):
         for obj in objects:
             item = VsxTreeWidgetItem(
                 [
-                    obj.name,
+                    f"{obj.name} [{obj.catalog_source}]" if is_added_target(obj) else obj.name,
                     obj.object_type,
                     obj.period,
                     vsx_magnitude_display(obj),
@@ -17174,7 +17348,7 @@ class LightCurveWindow(QWidget):
         for column in range(self.vsx_tree.columnCount()):
             self.vsx_tree.resizeColumnToContents(column)
         self.vsx_filter_status_label.setText(
-            f"Showing {len(objects)} / {len(self.catalog_objects)} VSX Objects"
+            f"Showing {len(objects)} / {len(self.catalog_objects)} Targets"
         )
 
     def restore_pending_vsx_selection(self) -> None:
@@ -17283,6 +17457,9 @@ class LightCurveWindow(QWidget):
 
         filtered: list[CatalogObject] = []
         for obj in self.catalog_objects:
+            if is_added_target(obj):
+                filtered.append(obj)
+                continue
             if name_filter and not self.filter_token_matches(obj.name, name_filter):
                 continue
             if type_filter and not self.filter_token_matches(
@@ -17318,7 +17495,7 @@ class LightCurveWindow(QWidget):
         batch_tab = self.batch_tab
         if batch_tab is None:
             return
-        refresh = getattr(batch_tab, "refresh_plugin_view", None)
+        refresh = getattr(batch_tab, "sync_visible_targets", None)
         if callable(refresh):
             refresh()
 
@@ -17448,6 +17625,9 @@ class LightCurveWindow(QWidget):
         obj = self.current_vsx_selection()
         if obj is None:
             QMessageBox.warning(self, "Open VSX", "Select a variable first.")
+            return
+        if is_added_target(obj):
+            QMessageBox.warning(self, "Open VSX", "This target has no VSX entry.")
             return
 
         oid = obj.value_for(("OID", "oid")).strip()
@@ -17588,15 +17768,15 @@ class LightCurveWindow(QWidget):
     def selected_vsx_targets_for_batch(self) -> list[CatalogObject]:
         """Return unique VSX rows selected for the required Batch component."""
 
-        return self.vsx_targets_from_items_for_batch(self.vsx_tree.selectedItems())
+        return [obj for obj in self.vsx_targets_from_items_for_batch(self.vsx_tree.selectedItems()) if not is_added_target(obj)]
 
     def visible_vsx_targets_for_batch(self) -> list[CatalogObject]:
         """Return unique VSX rows currently visible in the Variables table."""
 
-        return self.vsx_targets_from_items_for_batch(
+        return [obj for obj in self.vsx_targets_from_items_for_batch(
             self.vsx_tree.topLevelItem(row)
             for row in range(self.vsx_tree.topLevelItemCount())
-        )
+        ) if not is_added_target(obj)]
 
     def vsx_targets_from_items_for_batch(self, items: Iterable[QTreeWidgetItem]) -> list[CatalogObject]:
         """Return unique catalog objects represented by VSX tree items."""
@@ -17647,8 +17827,8 @@ class LightCurveWindow(QWidget):
                     "ra_deg": target_ra,
                     "dec_deg": target_dec,
                     "catalog_mag": target.magnitude_float(),
-                    "catalog_source": "VSX",
-                    "catalog_id": target.value_for(("OID", "oid")) or target.name,
+                    "catalog_source": target.catalog_source or "VSX",
+                    "catalog_id": target.catalog_id if is_added_target(target) else target.value_for(("OID", "oid")) or target.name,
                 }
             ],
             aperture_settings.aperture_radius_px,
@@ -17742,9 +17922,13 @@ class LightCurveWindow(QWidget):
                 "ra_deg": target_ra,
                 "dec_deg": target_dec,
                 "catalog_mag": self.selected_target.catalog_object.magnitude_float(),
-                "catalog_source": "VSX",
-                "catalog_id": self.selected_target.catalog_object.value_for(("OID", "oid"))
-                or self.selected_target.catalog_object.name,
+                "catalog_source": self.selected_target.catalog_object.catalog_source or "VSX",
+                "catalog_id": (
+                    self.selected_target.catalog_object.catalog_id
+                    if is_added_target(self.selected_target.catalog_object)
+                    else self.selected_target.catalog_object.value_for(("OID", "oid"))
+                    or self.selected_target.catalog_object.name
+                ),
                 "image_source": image_source,
                 "aavso_filter": aavso_filter,
             }
@@ -17911,11 +18095,117 @@ class LightCurveWindow(QWidget):
         if obj is None:
             QMessageBox.warning(self, "Select Target", "Select a variable first.")
             return
+        if is_added_target(obj) and self.photometry_mode != MODE_SINGLE_MEASUREMENT:
+            QMessageBox.warning(self, "Select Target", "Added targets are for Single Measurement only.")
+            return
         self.set_selected_target_object(obj)
+
+    def add_target(self) -> None:
+        """Add a named single-measurement target from one of three position sources."""
+
+        if self.photometry_mode != MODE_SINGLE_MEASUREMENT or self.reference_frame is None:
+            QMessageBox.warning(self, "Add Target", "Prepare a field in Single Measurement mode first.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add Target for Single Measurement")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        layout.addLayout(form)
+        source = QComboBox()
+        source.addItem("SIMBAD identifier", "SIMBAD")
+        source.addItem("Gaia DR3 source ID", "GAIA_DR3")
+        source.addItem("Manual RA / Dec", "MANUAL")
+        form.addRow("Position source:", source)
+        identifier = QLineEdit()
+        identifier.setPlaceholderText("Object name or identifier")
+        form.addRow("Identifier:", identifier)
+        name = QLineEdit()
+        name.setPlaceholderText("Required for manual coordinates")
+        form.addRow("Target name:", name)
+        object_type = QLineEdit()
+        object_type.setPlaceholderText("Optional, e.g. nova candidate")
+        form.addRow("Type (optional):", object_type)
+        ra = QLineEdit()
+        ra.setPlaceholderText("ICRS degrees or hh:mm:ss")
+        form.addRow("RA (degrees):", ra)
+        dec = QLineEdit()
+        dec.setPlaceholderText("ICRS degrees or ±dd:mm:ss")
+        form.addRow("Dec (degrees):", dec)
+
+        def update_inputs(_index: int | None = None) -> None:
+            manual = source.currentData() == "MANUAL"
+            identifier.setEnabled(not manual)
+            name.setEnabled(manual)
+            ra.setEnabled(manual)
+            dec.setEnabled(manual)
+
+        source.currentIndexChanged.connect(update_inputs)
+        update_inputs()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Resolve and Add")
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def resolve_and_add() -> None:
+            try:
+                selected_source = str(source.currentData())
+                if selected_source == "SIMBAD":
+                    obj = resolve_simbad_target(identifier.text(), object_type.text())
+                elif selected_source == "GAIA_DR3":
+                    obj = resolve_gaia_dr3_target(identifier.text(), object_type.text())
+                else:
+                    ra_deg, dec_deg = parse_added_target_coordinates(ra.text(), dec.text())
+                    obj = added_target_object(
+                        name.text(), "MANUAL", name.text(), ra_deg, dec_deg,
+                        object_type.text(),
+                    )
+                settings = resolve_aperture_settings(self.reference_frame)
+                margin = settings.annulus_outer_px + PHOTOMETRY_EDGE_MARGIN_EXTRA_PX
+                _x, _y, problem = object_pixel_position_in_frame(obj, self.reference_frame, margin)
+                if problem is not None:
+                    raise ValueError(f"Target is outside the usable image area: {problem}")
+            except Exception as exc:
+                self.append_log(f"WARNING: Add Target failed: {exc}")
+                QMessageBox.warning(dialog, "Add Target", str(exc))
+                return
+            if QMessageBox.question(
+                dialog, "Confirm Target",
+                f"{obj.name}\n{obj.catalog_source}: {obj.catalog_id}\n"
+                f"ICRS RA={obj.ra}°, Dec={obj.dec}°\n\nAdd this target?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            for existing in self.catalog_objects:
+                if (existing.catalog_source, existing.catalog_id) == (obj.catalog_source, obj.catalog_id):
+                    QMessageBox.warning(dialog, "Add Target", "This target is already in Variables.")
+                    return
+                if catalog_object_filename_stem(existing).casefold() == catalog_object_filename_stem(obj).casefold():
+                    QMessageBox.warning(dialog, "Add Target", "A target with this result filename is already in Variables.")
+                    return
+            self.catalog_objects.append(obj)
+            self.apply_vsx_filter()
+            for index in range(self.vsx_tree.topLevelItemCount()):
+                item = self.vsx_tree.topLevelItem(index)
+                if self.catalog_objects[item.data(0, VSX_CATALOG_INDEX_ROLE)] is obj:
+                    self.vsx_tree.setCurrentItem(item)
+                    self.vsx_tree.scrollToItem(item)
+                    break
+            self.append_log(
+                f"Added single-measurement target {obj.name}: "
+                f"{obj.catalog_source}:{obj.catalog_id}, RA={obj.ra}, Dec={obj.dec}."
+            )
+            dialog.accept()
+
+        buttons.accepted.connect(resolve_and_add)
+        dialog.exec()
 
     def set_selected_target_object(self, obj: CatalogObject) -> bool:
         """Set the current target from a catalog object without relying on tree selection."""
 
+        if is_added_target(obj) and self.photometry_mode != MODE_SINGLE_MEASUREMENT:
+            self.show_lightcurve_failure_dialog("Added targets are for Single Measurement only.")
+            return False
         if self.reference_frame is None:
             if self.photometry_mode == MODE_SINGLE_MEASUREMENT:
                 self.show_single_measurement_warning(
@@ -19142,7 +19432,7 @@ class LightCurveWindow(QWidget):
             return
 
         aperture_settings = resolve_aperture_settings(self.reference_frame)
-        blend_assessment = assess_target_catalog_blend(
+        blend_assessment = assess_single_target_catalog_blend(
             self.selected_target.catalog_object,
             self.reference_frame,
             aperture_settings,
@@ -19275,6 +19565,7 @@ class LightCurveWindow(QWidget):
             "MODE": MODE_SINGLE_MEASUREMENT,
             "SINGLE_FIELD_ZP_METHOD": SINGLE_FIELD_ZP_METHOD_ID,
             **result_target_metadata(self.selected_target.catalog_object),
+            **({"EXPORT_ALLOWED": 0} if is_added_target(self.selected_target.catalog_object) else {}),
             **field_metadata,
             "SOURCE_FILE": str(self.current_source_fits_file() or ""),
             "WORK_FILE": str(frame_path),
@@ -19308,6 +19599,11 @@ class LightCurveWindow(QWidget):
             aperture_settings,
             self.append_log,
         )
+        if is_added_target(self.selected_target.catalog_object):
+            field_zp_candidates = exclude_target_from_field_references(
+                field_zp_candidates, self.selected_target.catalog_object,
+                self.reference_frame, aperture_settings.annulus_outer_px,
+            )
         field_zp_specs = [field_zp_catalog_spec(candidate) for candidate in field_zp_candidates]
         field_zp_measurements = aperture_measurements_for_frame(
             frame_path,
@@ -19324,6 +19620,28 @@ class LightCurveWindow(QWidget):
         field_zp_references, field_zp_check_reference = reserve_single_field_zp_check_reference(
             field_zp_references
         )
+        field_zp_fit = fit_single_field_zero_point(field_zp_references)
+        informational_result = False
+        if not field_zp_fit.success or field_zp_fit.zero_point is None:
+            informational_references = single_field_zp_references_from_measurements(
+                field_zp_measurements,
+                SINGLE_FIELD_ZP_INFORMATIONAL_MIN_SNR,
+            )
+            informational_references, informational_check = reserve_single_field_zp_check_reference(
+                informational_references
+            )
+            informational_fit = fit_single_field_zero_point(informational_references)
+            if informational_fit.success and informational_fit.zero_point is not None:
+                informational_result = True
+                field_zp_references = informational_references
+                field_zp_check_reference = informational_check
+                field_zp_fit = informational_fit
+                self.append_log(
+                    "WARNING: Single field-ZP export threshold was not met; "
+                    f"an informational fit uses references with SNR >= "
+                    f"{SINGLE_FIELD_ZP_INFORMATIONAL_MIN_SNR:.0f}. "
+                    "The result is diagnostic only and cannot be exported."
+                )
         if field_zp_check_reference is not None:
             check_measurement = field_zp_check_reference.measurement
             self.append_log(
@@ -19345,7 +19663,6 @@ class LightCurveWindow(QWidget):
             for reference in field_zp_references
         )
         self.append_log(f"Single field-ZP reference quality: {format_counter(reference_quality_counts)}.")
-        field_zp_fit = fit_single_field_zero_point(field_zp_references)
         if not field_zp_fit.success or field_zp_fit.zero_point is None:
             message = (
                 "Single field-ZP measurement failed: "
@@ -19417,12 +19734,35 @@ class LightCurveWindow(QWidget):
             target_measurement,
             blend_assessment,
         )
+        informational_only = informational_result and target_measurement.valid
+        if informational_only:
+            target_measurement = replace(
+                target_measurement,
+                valid=False,
+                quality_status=QUALITY_STATUS_INVALID,
+                quality_flag=combine_quality_flag(
+                    target_measurement.quality_flag, "INFORMATIONAL_FIELD_ZP"
+                ),
+                note=combine_quality_note(
+                    target_measurement.note,
+                    "Field-ZP references did not meet the export SNR threshold; "
+                    "calibrated magnitude is informational only",
+                ),
+            )
         measurements = [
             target_measurement if item.role == "target" else item
             for item in measurements
         ]
         field_zp_metadata = {
             **metadata,
+            **({
+                "RESULT_PURPOSE": "INFORMATIONAL_SINGLE_FIELD_ZP",
+                "EXPORT_ALLOWED": 0,
+                "ARCHIVE_ALLOWED": 0,
+                "DIAGNOSTIC_REASON": "FIELD_ZP_REFERENCE_SNR_BELOW_EXPORT_LIMIT",
+                "FIELD_ZP_INFORMATIONAL_MIN_SNR": SINGLE_FIELD_ZP_INFORMATIONAL_MIN_SNR,
+                "FIELD_ZP_EXPORT_MIN_SNR": SINGLE_FIELD_ZP_MIN_SNR,
+            } if informational_result else {}),
             "SINGLE_TARGET_BACKGROUND_MASKED": int(target_measurement.annulus_masked),
             "SINGLE_TARGET_BACKGROUND_MASKED_PIXELS": target_measurement.annulus_masked_pixel_count,
             "SINGLE_TARGET_BACKGROUND_MASKED_FRACTION": format_csv_float(
@@ -19465,6 +19805,42 @@ class LightCurveWindow(QWidget):
             field_zp_references,
             field_zp_fit,
         )
+        if informational_only:
+            self.current_result_origin = "single"
+            self.loaded_lightcurve_csv = result_csv
+            self.loaded_lightcurve_target_name = (
+                self.selected_target.catalog_object.name.strip() or target_measurement.object_id
+            )
+            self.loaded_lightcurve_source_label = source_dir.name if source_dir is not None else ""
+            self.current_exports.clear()
+            self.set_result_status("warning")
+            self.set_single_result_summary(
+                target_measurement,
+                check_measurement,
+                calibrated_mag,
+                calibrated_error,
+                check_calibrated_mag,
+                check_delta_mag,
+                zero_point_scatter,
+                field_zp_fit.used_count,
+                "refs",
+            )
+            self.lightcurve_status_label.setText(
+                f"Informational Single Measurement: mag={calibrated_mag:.3f} +/- "
+                f"{calibrated_error:.3f}; field refs={field_zp_fit.used_count}. "
+                f"Export disabled. Output: {result_csv}"
+            )
+            self.export_status_label.setText(
+                "Informational Single Measurement only; AAVSO, BAV and archive export disabled."
+            )
+            self.refresh_bav_tab_view()
+            self.refresh_action_availability()
+            self.append_log(
+                "Informational Single Measurement written: "
+                f"{result_csv.name}; mag={calibrated_mag:.4f} +/- "
+                f"{calibrated_error:.4f}; export disabled."
+            )
+            return
         if not target_measurement.valid:
             message = (
                 target_contamination_failure_message()
@@ -20418,6 +20794,8 @@ class LightCurveWindow(QWidget):
             4,
         )
         measurement = f"mag={magnitude} +/- {error}"
+        if "INFORMATIONAL_FIELD_ZP" in quality_flag.split("|"):
+            return "WARN", f"informational only; {measurement}; export disabled"
         if not result_row_is_valid(row) or quality_status == QUALITY_STATUS_INVALID:
             return "ERROR", f"{quality_flag or 'INVALID'}; {measurement} (diagnostic only)"
         if quality_status == QUALITY_STATUS_WARNING:
@@ -20977,14 +21355,27 @@ class LightCurveWindow(QWidget):
                 raise RuntimeError("Single Measurement result has no data row")
             self.set_loaded_single_result_summary(path, rows)
             if not any(result_row_is_valid(row) for row in rows):
-                self.set_result_status("failed")
-                self.lightcurve_status_label.setText(
-                    f"Rejected Single Measurement diagnostic loaded: {path}"
+                informational = (
+                    result_metadata.get("RESULT_PURPOSE") == "INFORMATIONAL_SINGLE_FIELD_ZP"
+                    and "INFORMATIONAL_FIELD_ZP" in rows[0].get("quality_flag", "").split("|")
                 )
-                self.export_status_label.setText(
-                    "Rejected Single Measurement diagnostic; no valid row for export."
-                )
-                self.append_log(f"Rejected Single Measurement diagnostic loaded: {path}")
+                self.set_result_status("warning" if informational else "failed")
+                if informational:
+                    self.lightcurve_status_label.setText(
+                        f"Informational Single Measurement loaded: {path}"
+                    )
+                    self.export_status_label.setText(
+                        "Informational Single Measurement only; export disabled."
+                    )
+                    self.append_log(f"Informational Single Measurement loaded: {path}")
+                else:
+                    self.lightcurve_status_label.setText(
+                        f"Rejected Single Measurement diagnostic loaded: {path}"
+                    )
+                    self.export_status_label.setText(
+                        "Rejected Single Measurement diagnostic; no valid row for export."
+                    )
+                    self.append_log(f"Rejected Single Measurement diagnostic loaded: {path}")
             else:
                 quality_status = csv_text(rows[0].get("quality_status"), QUALITY_STATUS_OK).upper()
                 self.set_result_status(
