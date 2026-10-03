@@ -47,7 +47,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.8.60"
+SCRIPT_VERSION = "0.8.70"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
@@ -295,9 +295,8 @@ APASS_DR10_MAX_QUERY_ROWS = 5000
 APASS_DR10_QUERY_TIMEOUT_SECONDS = 90
 APASS_DR10_QUERY_RETRIES = 3
 UCAC4_QUERY_TIMEOUT_SECONDS = 60
-TARGET_BLEND_VIZIER_QUERY_TIMEOUT_SECONDS = 20
-TARGET_BLEND_VIZIER_QUERY_RETRIES = 2
-TARGET_BLEND_VIZIER_QUERY_RETRY_DELAY_SECONDS = 2.0
+TARGET_BLEND_ARI_QUERY_RETRIES = 2
+TARGET_BLEND_ARI_QUERY_RETRY_DELAY_SECONDS = 2.0
 COMPARISON_CATALOG_COLUMNS = (
     "id",
     "APASS_DR10_ID",
@@ -6831,49 +6830,35 @@ def parse_ucac4_tsv(payload: str) -> list[CatalogObject]:
     return rows
 
 
-def parse_gaia_dr3_target_blend_tsv(payload: str) -> list[CatalogObject]:
-    """Parse VizieR Gaia DR3 rows for target-neighbor blend detection."""
+def gaia_target_blend_objects_from_ari_table(table: object) -> list[CatalogObject]:
+    """Convert ARI Gaia DR3 neighbors, preserving missing optional evidence."""
 
-    source_columns = (
-        "Source",
-        "RA_ICRS",
-        "DE_ICRS",
-        "Gmag",
-        "BPmag",
-        "RPmag",
-        "Dup",
-        "IPDfmp",
-        "IPDfow",
-    )
-    rows: list[CatalogObject] = []
-    for line in payload.splitlines():
-        if not line.strip() or line.startswith("#"):
-            continue
-        parts = [part.strip().strip('"') for part in line.split("\t")]
-        if parts and parts[0] == "Source":
-            continue
-        if len(parts) < len(source_columns):
-            continue
-        raw_values = dict(zip(source_columns, parts, strict=False))
-        source_id = raw_values.get("Source", "").strip()
+    columns = {
+        "source_id": "gaia_source_id",
+        "ra": "ra",
+        "dec": "dec",
+        "phot_g_mean_mag": "gaia_g_mag",
+        "phot_bp_mean_mag": "gaia_bp_mag",
+        "phot_rp_mean_mag": "gaia_rp_mag",
+        "duplicated_source": "gaia_duplicated_source",
+        "ipd_frac_multi_peak": "gaia_ipd_frac_multi_peak",
+        "ipd_frac_odd_win": "gaia_ipd_frac_odd_win",
+    }
+    missing = [name for name in columns if name not in table.colnames]
+    if missing:
+        raise RuntimeError(f"ARI Gaia TAP response is missing column(s): {', '.join(missing)}")
+    objects: list[CatalogObject] = []
+    for row in table:
+        values = {}
+        for name, destination in columns.items():
+            value = _gaia_ari_row_value(row, name)
+            values[destination] = "" if value is None else str(value)
+        source_id = values["gaia_source_id"]
         if not source_id:
             continue
-        values = {
-            "id": source_id,
-            "Name": source_id,
-            "gaia_source_id": source_id,
-            "catalog_source": GAIA_DR3_SOURCE_NAME,
-            "ra": raw_values.get("RA_ICRS", "").strip(),
-            "dec": raw_values.get("DE_ICRS", "").strip(),
-            "gaia_g_mag": raw_values.get("Gmag", "").strip(),
-            "gaia_bp_mag": raw_values.get("BPmag", "").strip(),
-            "gaia_rp_mag": raw_values.get("RPmag", "").strip(),
-            "gaia_duplicated_source": raw_values.get("Dup", "").strip(),
-            "gaia_ipd_frac_multi_peak": raw_values.get("IPDfmp", "").strip(),
-            "gaia_ipd_frac_odd_win": raw_values.get("IPDfow", "").strip(),
-        }
-        rows.append(CatalogObject(values))
-    return rows
+        values.update(id=source_id, Name=source_id, catalog_source=GAIA_DR3_SOURCE_NAME)
+        objects.append(CatalogObject(values))
+    return objects
 
 
 def query_apass_dr10_region(
@@ -7069,63 +7054,46 @@ def query_gaia_dr3_target_neighbors(
     min_mag = 0.0
     max_mag = 21.0
     query = f"""
-SELECT TOP {TARGET_BLEND_GAIA_QUERY_MAX_ROWS} Source, RA_ICRS, DE_ICRS, Gmag, BPmag, RPmag,
-       Dup, IPDfmp, IPDfow,
+SELECT TOP {TARGET_BLEND_GAIA_QUERY_MAX_ROWS}
+       source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
+       duplicated_source, ipd_frac_multi_peak, ipd_frac_odd_win,
        DISTANCE(
-         POINT('ICRS', RA_ICRS, DE_ICRS),
+         POINT('ICRS', ra, dec),
          POINT('ICRS', {ra_deg:.8f}, {dec_deg:.8f})
        ) AS target_distance_deg
-FROM "I/355/gaiadr3"
+FROM gaiadr3.gaia_source
 WHERE 1=CONTAINS(
-  POINT('ICRS', RA_ICRS, DE_ICRS),
+  POINT('ICRS', ra, dec),
   CIRCLE('ICRS', {ra_deg:.8f}, {dec_deg:.8f}, {radius_deg:.8f})
 )
-  AND Gmag IS NOT NULL
-  AND Gmag BETWEEN {min_mag:.2f} AND {max_mag:.2f}
+  AND phot_g_mean_mag IS NOT NULL
+  AND phot_g_mean_mag BETWEEN {min_mag:.2f} AND {max_mag:.2f}
 ORDER BY target_distance_deg
 """
-    payload = urllib.parse.urlencode(
-        {
-            "REQUEST": "doQuery",
-            "LANG": "ADQL",
-            "FORMAT": "tsv",
-            "MAXREC": "1000",
-            "QUERY": query,
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        UCAC4_TAP_URL,
-        data=payload,
-        headers={"User-Agent": f"SeePhot/{SCRIPT_VERSION}"},
-    )
     last_exc: Exception | None = None
-    for attempt in range(1, TARGET_BLEND_VIZIER_QUERY_RETRIES + 1):
+    for attempt in range(1, TARGET_BLEND_ARI_QUERY_RETRIES + 1):
         if progress is not None:
             progress(
-                "Gaia DR3 target-blend request "
-                f"{attempt}/{TARGET_BLEND_VIZIER_QUERY_RETRIES} "
-                f"(radius={radius_arcsec:.1f} arcsec, "
-                f"timeout {TARGET_BLEND_VIZIER_QUERY_TIMEOUT_SECONDS}s)."
+                "Gaia DR3 target-blend ARI TAP sync request "
+                f"{attempt}/{TARGET_BLEND_ARI_QUERY_RETRIES} "
+                f"(radius={radius_arcsec:.1f} arcsec)."
             )
         try:
-            with urllib.request.urlopen(
-                request,
-                timeout=TARGET_BLEND_VIZIER_QUERY_TIMEOUT_SECONDS,
-            ) as response:
-                text = response.read().decode("utf-8", "replace")
-            return parse_gaia_dr3_target_blend_tsv(text)
+            service = pyvo.dal.TAPService(GAIA_ARI_TAP_URL)
+            result = service.run_sync(query, maxrec=TARGET_BLEND_GAIA_QUERY_MAX_ROWS)
+            return gaia_target_blend_objects_from_ari_table(result.to_table())
         except Exception as exc:
             last_exc = exc
             if progress is not None:
                 progress(
                     "WARNING: Gaia DR3 target-blend request "
-                    f"{attempt}/{TARGET_BLEND_VIZIER_QUERY_RETRIES} failed: {exc}"
+                    f"{attempt}/{TARGET_BLEND_ARI_QUERY_RETRIES} failed: {exc}"
                 )
-            if attempt < TARGET_BLEND_VIZIER_QUERY_RETRIES:
-                time.sleep(TARGET_BLEND_VIZIER_QUERY_RETRY_DELAY_SECONDS)
+            if attempt < TARGET_BLEND_ARI_QUERY_RETRIES:
+                time.sleep(TARGET_BLEND_ARI_QUERY_RETRY_DELAY_SECONDS)
     raise RuntimeError(
         "Gaia DR3 target-blend query failed after "
-        f"{TARGET_BLEND_VIZIER_QUERY_RETRIES} attempt(s): {last_exc}"
+        f"{TARGET_BLEND_ARI_QUERY_RETRIES} attempt(s): {last_exc}"
     ) from last_exc
 
 

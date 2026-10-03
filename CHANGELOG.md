@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.70 - 2026-10-03
+
+- Switched Gaia DR3 target-blend queries to the ARI Heidelberg TAP
+  service, retaining neighbors without BP/RP photometry and preserving
+  duplicate-source and IPD quality information.
+- Retry failed target-blend queries once and report incomplete blend
+  evidence if both attempts fail.
+
 ## 0.8.60 - 2026-09-30
 
 - Added Single Measurement targets from SIMBAD, Gaia DR3, or manually entered

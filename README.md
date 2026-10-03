@@ -5,7 +5,7 @@ light-curve analysis, and related CFA/stack workflows.
 
 ## Current Main Release
 
-- SeePhot Main: `0.8.60`
+- SeePhot Main: `0.8.70`
 - SeePhot CFA: `0.5.0`
 
 The Main release is a manually tested snapshot. The Main and CFA applications
