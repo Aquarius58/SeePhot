@@ -2,7 +2,7 @@
 
 Author: Thomas Rudolph (Aquarius58)
 Contact: https://github.com/Aquarius58/siril-seestar-stack/issues
-Repository: https://github.com/Aquarius58/siril-seestar-stack
+Repository: https://github.com/Aquarius58/SeePhot
 Copyright (c) 2026 Thomas Rudolph (Aquarius58)
 SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -78,7 +78,7 @@ from __future__ import annotations
 # Seestar Photometry Stack
 # Author: Thomas Rudolph (Aquarius58)
 # Contact: https://github.com/Aquarius58/siril-seestar-stack/issues
-# Repository: https://github.com/Aquarius58/siril-seestar-stack
+# Repository: https://github.com/Aquarius58/SeePhot
 # Copyright (c) 2026 Thomas Rudolph (Aquarius58)
 # SPDX-License-Identifier: GPL-3.0-or-later
 

@@ -70,14 +70,24 @@ standalone system-Python application.
 beginning with `sp_mod_` are support modules and should not be started
 directly.
 
-## CFA Release
+## Standalone CFA Installation
 
-The standalone public CFA/stack application is maintained separately at:
+`SeePhot_CFA.py` is part of SeePhot and can also be used on its own as a
+Siril script. This repository is its only public code source. Updates are
+published with SeePhot Main releases; there is no separate CFA release.
 
-https://github.com/Aquarius58/siril-seestar-stack
+1. [Download SeePhot_CFA.py](https://raw.githubusercontent.com/Aquarius58/SeePhot/main/SeePhot_CFA.py)
+   and save it with that filename in a Siril Python script directory.
+2. Select that directory in Siril's Python scripts settings.
+3. Start `SeePhot_CFA.py` from Siril's Scripts menu.
 
-The CFA file included here is the version tested as part of this Main release
-snapshot and can therefore differ from a later standalone CFA release.
+The standalone script requires Siril 1.3.0 or newer, `sirilpy` 1.0.13 or
+newer, and `PyQt6`, `astropy`, and `numpy`. No SeePhot support modules are
+required. It must run inside Siril.
+
+The independent [Seestar CFA project page](https://github.com/Aquarius58/siril-seestar-stack)
+provides technical documentation, screenshots, and
+[support](https://github.com/Aquarius58/siril-seestar-stack/issues).
 
 ## Repository Status
 
