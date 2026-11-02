@@ -1,98 +1,109 @@
 # SeePhot
 
-SeePhot is a Siril Python application for Seestar variable-star photometry,
-light-curve analysis, and related CFA/stack workflows.
+SeePhot is a Siril Python application for variable-star photometry with FITS
+images, primarily designed for Seestar data. Other FITS images can be used
+when their format, filter information, and headers are suitable for plate
+solving and accurate photometric timing.
 
-## Current Main Release
+It combines image preparation, automatic comparison-star selection,
+calibrated measurements, light-curve analysis, and AAVSO/BAV reporting.
 
-- SeePhot Main: `0.8.70`
-- SeePhot CFA: `0.5.0`
+Two measurement workflows are available: **Light Curve** measures a time
+series, while **Single Measurement** measures targets in an individual image.
 
-The Main release is a manually tested snapshot. The Main and CFA applications
-keep independent internal version numbers; the GitHub release version follows
-SeePhot Main.
+The included **SeePhot CFA** companion extracts CFA channels and stacks
+images. It can be opened from SeePhot or used independently in Siril.
+
+## Current Release
+
+- SeePhot Main: `1.0.0`
+- SeePhot CFA: `1.0.0`
 
 ## Release Bundle
 
-Keep all ten Python files in the same Siril script directory:
+Keep all twelve Python files and both Overview images together in the same
+Siril script directory:
 
 - `SeePhot_Main.py` — main photometry and analysis application.
 - `SeePhot_CFA.py` — CFA channel extraction and stacking companion.
-- `sp_mod_analyze.py` — standalone analysis and photometric linearity tools.
+- `sp_mod_airmass.py` — airmass calculation for photometry and reporting.
+- `sp_mod_analyze.py` — light-curve analysis tools.
 - `sp_mod_auto.py` — multi-folder CFA/stack batch workflow.
 - `sp_mod_batch.py` — multi-target photometry batch workflow.
 - `sp_mod_bav.py` — BAV report and export support.
 - `sp_mod_binning.py` — scientific flux-based light-curve binning.
+- `sp_mod_config.py` — observer, site, and application settings.
 - `sp_mod_linearity.py` — linearity and dynamic-range diagnostics.
 - `sp_mod_profiling.py` — stack timing analysis and recommendations.
-- `sp_mod_results.py` — result discovery, metadata, and output-path helpers.
-
+- `sp_mod_results.py` — result and output-file management.
+- `seephot_workflow.png` — General workflow image.
+- `seephot_files_and_folders.png` — Files and folders image.
 
 ## Main Features
 
-- Series photometry and Single Measurement workflows for Seestar FITS data.
-- Variable-star discovery, comparison-star handling, and calibrated result
-  generation.
-- Light-curve plotting, scientific binning, and robust extremum fitting.
-- Gaia-based target and annulus contamination assessment with explicit
-  rejection and diagnostic outcomes.
-- AAVSO and BAV export workflows, including multiple extrema and optional
-  period information.
+- **Light Curve** photometry for image series and **Single Measurement**
+  for individual images.
+- Variable-star discovery with a configurable VSX magnitude limit,
+  automatic comparison-star selection, and calibrated measurements.
+- Light-curve plotting, scientific flux-based binning, and extremum fitting.
+- Gaia-based assessment of target contamination and background-annulus
+  quality, with diagnostic results.
+- AAVSO photometry reports and BAV extrema reports, including multiple
+  extrema and optional period information.
 - Multi-target photometry batches and multi-folder CFA/stack batches.
 - Additional Single Measurement targets from SIMBAD, Gaia DR3, or entered
   coordinates, with clearly marked informational results when needed.
-- CFA channel extraction from a single frame without stacking.
-- Pause-aware and dynamic stacking modes with stack profiling and planning
+- CFA channel extraction, including single-frame processing without stacking.
+- Continuous and Gap-aware stacking, with stack profiling and grouping
   recommendations.
-- Photometric linearity analysis and support for Seestar S50 and S50 Pro
-  metadata.
+- Shared observer and site settings.
+- Photometric linearity and dynamic-range analysis.
 
 ## Requirements
 
 - Siril 1.3.0 or newer with Python scripting support.
 - `sirilpy` 1.0.13 or newer.
-- Python packages used by the core workflow: `PyQt6`, `astropy`, `numpy`, and
-  `matplotlib`.
-- Some workflows additionally use `scipy`, `astroquery`, or `reportlab`.
+- Python packages: `PyQt6`, `astropy`, `numpy`, `scipy`, `matplotlib`,
+  and `pyvo`.
+- Some catalog queries additionally use `astroquery`; BAV PDF reports
+  require `reportlab`.
+- SeePhot automatically requests installation of missing core packages
+  through Siril.
 
-SeePhot is intended to run inside Siril's Python environment, not as a
-standalone system-Python application.
+Run SeePhot inside Siril's Python environment.
 
 ## Installation
 
-1. Download the source archive from the GitHub release page.
-2. Copy the ten `.py` files listed under **Release Bundle** into the same Siril
-   Python script directory.
-3. In Siril, select that directory under the Python scripts settings.
-4. Start `SeePhot_Main.py` from Siril's Scripts menu.
+1. Download **Source code (zip)** from the **Latest** release on the
+   [SeePhot releases page](https://github.com/Aquarius58/SeePhot/releases)
+   and extract the archive.
+2. Create a separate folder on your drive for the SeePhot scripts,
+   for example `SeePhot`.
+3. Copy all `.py` files and both `.png` images from the archive into
+   that folder.
+4. In Siril's settings, add this folder as an additional Python script
+   directory.
+5. The folder name you chose, for example **SeePhot**, then appears
+   automatically in Siril's **Python Scripts** menu. Open it and start
+   `SeePhot_Main.py`.
 
-`SeePhot_Main.py` and `SeePhot_CFA.py` are the executable applications. Files
-beginning with `sp_mod_` are support modules and should not be started
-directly.
+`SeePhot_Main.py` and `SeePhot_CFA.py` are the executable applications.
+Files beginning with `sp_mod_` are support modules and should not be
+started directly.
 
-## Standalone CFA Installation
+## Standalone CFA Usage
 
-`SeePhot_CFA.py` is part of SeePhot and can also be used on its own as a
-Siril script. This repository is its only public code source. Updates are
-published with SeePhot Main releases; there is no separate CFA release.
+To use CFA channel extraction and stacking independently, follow the
+installation steps above and start `SeePhot_CFA.py` instead of
+`SeePhot_Main.py`.
 
-1. [Download SeePhot_CFA.py](https://raw.githubusercontent.com/Aquarius58/SeePhot/main/SeePhot_CFA.py)
-   and save it with that filename in a Siril Python script directory.
-2. Select that directory in Siril's Python scripts settings.
-3. Start `SeePhot_CFA.py` from Siril's Scripts menu.
+For a minimal installation, only `SeePhot_CFA.py` is needed. It requires
+Siril with Python scripting support, `sirilpy`, `PyQt6`, `astropy`, and
+`numpy`.
 
-The standalone script requires Siril 1.3.0 or newer, `sirilpy` 1.0.13 or
-newer, and `PyQt6`, `astropy`, and `numpy`. No SeePhot support modules are
-required. It must run inside Siril.
-
-The independent [Seestar CFA project page](https://github.com/Aquarius58/siril-seestar-stack)
+The [Seestar CFA project page](https://github.com/Aquarius58/siril-seestar-stack)
 provides technical documentation, screenshots, and
 [support](https://github.com/Aquarius58/siril-seestar-stack/issues).
-
-## Repository Status
-
-This repository contains tagged SeePhot Main releases. Repository visibility
-is managed independently on GitHub and does not change the release contents.
 
 ## License
 

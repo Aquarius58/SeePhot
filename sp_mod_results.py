@@ -71,6 +71,7 @@ class LightcurveResultCandidate:
     png_exists: bool
     aavso_exists: bool
     bav_file_count: int
+    location: str = ""
     result_kind: str = RESULT_KIND_LIGHTCURVE
     quality_status: str = ""
     quality_flag: str = ""
@@ -576,6 +577,7 @@ def lightcurve_result_candidate_from_csv(
         target_name=target_name,
         variable_type=metadata.get("OBJECT_VAR_TYPE", "").strip(),
         report_date=report_date,
+        location=metadata.get("OBSERVER_SITE", "").strip(),
         source_directory_name=result_csv.parent.name,
         row_count=row_count,
         png_exists=result_csv.with_suffix(".png").exists(),

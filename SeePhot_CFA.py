@@ -23,7 +23,8 @@ Inputs
 Input files are the original Seestar `.fit` frames located directly in the
 selected folder. `DATE-OBS` is required; files without it are skipped. Seestar
 frames with `DATE-EXP` use `DATE-OBS` as the exposure start and `DATE-EXP` as
-the exposure end; without `DATE-EXP`, `DATE-OBS` is treated as the exposure
+an acquisition-end diagnostic; the exposure end is DATE-OBS + EXPTIME.
+Without `DATE-EXP`, `DATE-OBS` is treated as the exposure
 end. If `EXPTIME` is missing, the script uses a 10 second fallback.
 
 Outputs
@@ -149,7 +150,7 @@ warnings.filterwarnings(
 )
 
 # User settings
-SCRIPT_VERSION = "0.5.0"
+SCRIPT_VERSION = "1.0.0"
 SIRIL_REQUIRES = "1.3.0"
 OUTPUT_BITS_COMMAND = "set16bits"
 SSAP_HEADER_VALUE = "SeePhot_CFA.py"
@@ -465,10 +466,12 @@ def read_frame(path: Path, log_callback) -> FitsFrame:
             header_exposure = (end_time - start_time).total_seconds()
             tolerance = max(TIMING_INTERVAL_TOLERANCE_SECONDS, exptime * 0.01)
             if header_exposure <= 0 or abs(header_exposure - exptime) > tolerance:
-                raise ValueError(
-                    f"{path.name} has inconsistent DATE-OBS/DATE-EXP interval "
-                    f"({header_exposure:g}s; EXPTIME={exptime:g}s)"
+                log_callback(
+                    f"[WARN] {path.name}: DATE-EXP interval differs from EXPTIME "
+                    f"({header_exposure:g}s; EXPTIME={exptime:g}s); "
+                    "using DATE-OBS start + EXPTIME for exposure timing."
                 )
+            end_time = start_time + timedelta(seconds=exptime)
             return FitsFrame(path, end_time, exptime, "date_obs_date_exp")
         if "DATE-END" in header:
             return FitsFrame(
@@ -493,7 +496,7 @@ def timing_summary(frames: list[FitsFrame]) -> str:
     parts: list[str] = []
     if counts["date_obs_date_exp"]:
         parts.append(
-            f"{counts['date_obs_date_exp']} modern DATE-OBS start + DATE-EXP end"
+            f"{counts['date_obs_date_exp']} modern DATE-OBS start + EXPTIME duration"
         )
     if counts["legacy_date_obs_end"]:
         parts.append(
@@ -1158,10 +1161,13 @@ class StackWorker(QThread):
         self.cfa_split_dirs: tuple[Path, ...] | None = None
         self.plan_temp_dirs = tuple(plan_temp_dir(self.source_dir, plan, grouping_behavior) for plan in selected_plans)
         self.stats = RunStats()
+        self.stack_skip_reasons: list[str] = []
 
     def emit_log(self, message: str) -> None:
         if message.startswith("[WARN]"):
             self.stats.warnings += 1
+        if message.startswith("[WARN] Skipping stack_") and len(self.stack_skip_reasons) < 3:
+            self.stack_skip_reasons.append(message.removeprefix("[WARN] "))
         print(message)
         self.log.emit(message)
 
@@ -1200,10 +1206,18 @@ class StackWorker(QThread):
             self.emit_summary()
             if self.selected_plans:
                 message = f"Stacking complete. Latest results are in {result_dir}"
+                if self.stats.skipped_stack_blocks:
+                    message = (
+                        f"Stacking finished with skipped blocks: "
+                        f"{self.stats.stack_results_written} stacks written, "
+                        f"{self.stats.skipped_stack_blocks} blocks skipped.\n"
+                        f"Latest results are in {result_dir}\nSee the log for details."
+                    )
             else:
                 message = f"Channel export complete. Results are in {result_dir}"
             self.finished.emit(True, message, str(result_dir))
         except Exception as exc:
+            self.emit_summary()
             self.finished.emit(False, str(exc), "")
 
     def run_stack(self) -> Path:
@@ -1255,7 +1269,9 @@ class StackWorker(QThread):
             self.keep_channel_images(frames_by_channel)
             for channel_key, frames in frames_by_channel.items():
                 for plan in self.selected_plans:
-                    final_result_dir = self.run_stack_plan(siril, plan, frames, channel_key)
+                    result_dir = self.run_stack_plan(siril, plan, frames, channel_key)
+                    if result_dir is not None:
+                        final_result_dir = result_dir
             completed = True
         finally:
             try:
@@ -1271,10 +1287,18 @@ class StackWorker(QThread):
                         cleanup_remove_dir(directory, self.emit_log)
 
         if final_result_dir is None:
-            if needs_cfa_split and KEEP_CHANNEL_IMAGES:
+            if self.selected_plans:
+                reasons = "\n".join(self.stack_skip_reasons)
+                raise RuntimeError(
+                    f"No stack results were created; {self.stats.skipped_stack_blocks} "
+                    "stack blocks were skipped.\n"
+                    + (f"First reasons:\n{reasons}\n" if reasons else "")
+                    + "See the log for details."
+                )
+            if needs_cfa_split and KEEP_CHANNEL_IMAGES and self.stats.channel_frames_preserved:
                 return channel_result_dir(self.source_dir, self.selected_channels[-1])
             raise RuntimeError(
-                "No stack results were created. Select at least one stack group."
+                "No results were created. Select at least one stack group or export CFA channels."
             )
         return final_result_dir
 
@@ -1319,8 +1343,12 @@ class StackWorker(QThread):
                 self.emit_log("[INFO] Extracting one CFA frame directly; Siril needs a sequence for seqsplit_cfa.")
             else:
                 self.emit_log(f"[INFO] Copying CFA source frames: {frame_count} files.")
+                # Siril numbers the split sequence by filename. Keep that order
+                # identical to source_frames, which also supplies the headers.
+                sequence_digits = max(5, len(str(frame_count)))
                 for index, frame in enumerate(source_frames, start=1):
-                    shutil.copy2(frame.path, cfa_split_dir / frame.path.name)
+                    copy_name = f"source_{index:0{sequence_digits}d}.fit"
+                    shutil.copy2(frame.path, cfa_split_dir / copy_name)
                     if should_log_progress(index, frame_count):
                         self.emit_log(f"[INFO] CFA source frames copied: {index}/{frame_count}.")
 
@@ -1498,9 +1526,10 @@ class StackWorker(QThread):
         plan: StackPlan,
         frames: list[FitsFrame],
         channel_key: str | None,
-    ) -> Path:
+    ) -> Path | None:
         tmp_dir = plan_temp_dir(self.source_dir, plan, self.grouping_behavior)
         result_dir = plan_result_dir(self.source_dir, plan, channel_key, self.grouping_behavior)
+        initial_stack_count = self.stats.stack_results_written
         completed = False
 
         self.prepare_result_dir(result_dir)
@@ -1642,7 +1671,7 @@ class StackWorker(QThread):
                 cleanup_remove_dir(block_tmp_dir, self.emit_log)
 
             completed = True
-            return result_dir
+            return result_dir if self.stats.stack_results_written > initial_stack_count else None
         finally:
             if completed:
                 try:
@@ -2056,10 +2085,23 @@ class StackWindow(QWidget):
         if self.lightcurve_mode:
             lightcurve_note = """
             <div class="note">
-                This window was opened from SeePhot. Only <b>L</b> or <b>G</b>
-                outputs are used for V-calibrated Light Curves.
+                This window was opened from SeePhot. Channel selection is limited
+                to <b>L</b> and <b>G</b> because SeePhot currently supports only
+                V-band photometry. To use <b>R</b> or <b>B</b>, start this tool
+                directly in Siril.
             </div>
             """
+        else:
+            lightcurve_note = """
+            <div class="note">
+                In standalone mode, <b>L</b>, <b>R</b>, <b>G</b> and <b>B</b>
+                channels are available.
+            </div>
+            """
+        red_blue_note = (
+            "" if self.lightcurve_mode else
+            "<li>R and B use the measured red and blue CFA samples.</li>"
+        )
         return f"""
         <html><head><style>
             body {{ color: #eceff4; }}
@@ -2092,7 +2134,7 @@ class StackWindow(QWidget):
                 <li>Each measured CFA value is replicated over its original 2x2 Bayer block.</li>
                 <li>L is the mean of one Bayer cell: (R + G1 + G2 + B) / 4.</li>
                 <li>G is the mean of the two green samples: (G1 + G2) / 2.</li>
-                <li>R and B use the measured red and blue CFA samples.</li>
+                {red_blue_note}
                 <li><code>FILTER</code> and <code>CHANMODE</code> document the derived channel
                 in the FITS header.</li>
                 <li>Non-CFA input is stacked directly.</li>
@@ -2136,7 +2178,7 @@ class StackWindow(QWidget):
             <ul>
                 <li><code>DATE-OBS</code> is required; files without it are skipped.</li>
                 <li>With <code>DATE-EXP</code>, <code>DATE-OBS</code> is the exposure start
-                and <code>DATE-EXP</code> the end.</li>
+                and its duration is <code>EXPTIME</code>; <code>DATE-EXP</code> is diagnostic.</li>
                 <li>Without <code>DATE-EXP</code>, <code>DATE-OBS</code> is treated as the
                 exposure end.</li>
                 <li>This distinction reflects a change by ZWO in the meaning of
@@ -2158,6 +2200,20 @@ class StackWindow(QWidget):
         """
 
     def build_help_html(self) -> str:
+        profiling_note = (
+            "For a grouping recommendation, use <b>Tools</b> &gt; "
+            "<b>Stack Profiling</b> in SeePhot. "
+            if self.lightcurve_mode else ""
+        )
+        channel_note = (
+            "For SeePhot photometry, choose <b>L</b> (luminance) or <b>G</b> "
+            "(green). Channel selection is limited to L and G because SeePhot "
+            "currently supports only V-band photometry. To use <b>R</b> or <b>B</b>, "
+            "start this tool directly in Siril."
+            if self.lightcurve_mode else
+            "In standalone mode, choose <b>L</b> (luminance), <b>R</b> (red), "
+            "<b>G</b> (green) or <b>B</b> (blue)."
+        )
         return """
         <html><head><style>
             body { color: #eceff4; }
@@ -2171,14 +2227,22 @@ class StackWindow(QWidget):
                 <p>Select the folder containing the original Seestar FITS frames. Choose
                 grouping by seconds or frames, enable the required groups and CFA channels,
                 then click <b>Start</b>.</p>
+                <p>CHANNEL_NOTE</p>
+                <p>Image stacking is optional; leave all stack groups unchecked
+                to extract channels only. Original input frames are never modified.</p>
                 <p><b>Continuous</b> grouping spans observation pauses; <b>Gap-aware</b>
-                grouping starts a new block after a long pause. Existing result folders
+                grouping starts a new block after a long pause. PROFILING_NOTE
+                Existing result folders
                 are changed only after you confirm the overwrite prompt.</p>
             </div>
             <p>Progress, skipped inputs, warnings, and the final summary appear in the log.
+            A run with stack groups succeeds only if at least one stack is saved.
+            Skipped blocks are reported as a warning when other stacks succeed;
+            if none succeed, the failure message gives the first reasons.
+            Channel-only export succeeds when the channel images are saved.
             For details about outputs, timing, and CFA processing, click <b>Overview</b>.</p>
         </body></html>
-        """
+        """.replace("CHANNEL_NOTE", channel_note).replace("PROFILING_NOTE", profiling_note)
 
     def show_overview(self) -> None:
         dialog = QDialog(self)
@@ -2221,9 +2285,12 @@ class StackWindow(QWidget):
         if success:
             if result_dir:
                 self.stack_result_ready.emit(result_dir)
-            QMessageBox.information(self, "Stack", "Stack complete.")
+            if self.worker is not None and self.worker.stats.skipped_stack_blocks:
+                QMessageBox.warning(self, "Stack", message)
+            else:
+                QMessageBox.information(self, "Stack", message)
         else:
-            QMessageBox.critical(self, "Stack", "Stack failed.\n\nSee the log for details.")
+            QMessageBox.critical(self, "Stack", f"Stack failed.\n\n{message}")
         self.worker = None
 
     def closeEvent(self, event) -> None:  # noqa: N802

@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.0 - 2026-11-02
+
+- Added shared observer and multi-site configuration, including site
+  selection for measurements and reporting.
+- Added saved airmass values to measurement results, binned results,
+  AAVSO reports, and BAV single-measurement reports.
+- Added a configurable VSX query magnitude limit.
+- Added Overview workflow and file-location images with zoom controls,
+  integrated contextual Help, and revised workflow guidance.
+- Added a non-blocking check for new GitHub releases at startup.
+- Improved result browsing and persistent display of the observation
+  site, selected target, and result file.
+- Preserved original image samples and precision during Tools plate
+  solving and corrected right-ascension hints for affected FITS headers.
+- Corrected CFA and stack-profiling timing for modern Seestar headers,
+  using DATE-OBS and EXPTIME for exposure timing.
+- Preserved source-frame identity through Siril CFA sequence splitting
+  and corrected success reporting when no stacks are produced.
+- Added dedicated CFA/stack batch logs and automatic use of eligible
+  cleaned backgrounds during Single Measurement batches.
+- Rejected mixed-filter image series before light-curve measurement.
+- Preserved existing AAVSO reports when validation or writing fails.
+- Added confirmation and stale-export cleanup when regenerating
+  binned results.
+- Expanded the release bundle with shared configuration and airmass
+  modules and two Overview images.
+- Updated installation instructions and standalone CFA guidance.
+
 ## 0.8.70 - 2026-10-03
 
 - Switched Gaia DR3 target-blend queries to the ARI Heidelberg TAP

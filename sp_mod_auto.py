@@ -50,6 +50,7 @@ class AutomaticDialog(QDialog):
         self.run_grouping_behavior = "continuous"
         self.run_allow_overwrite = False
         self.run_total = 0
+        self.run_log_path: Path | None = None
         self.last_source_dialog_directory = Path.home()
 
         layout = QVBoxLayout(self)
@@ -299,6 +300,16 @@ class AutomaticDialog(QDialog):
             self.set_status("CFA Channels / Stack hook is not available from the main app.")
             return
 
+        begin_log = self.context.get("begin_cfa_batch_log")
+        if not callable(begin_log) or not callable(self.context.get("end_cfa_batch_log")):
+            self.set_status("CFA/Stack batch logging is not available from the main app.")
+            return
+        try:
+            self.run_log_path = begin_log(sources)
+        except Exception as exc:
+            self.set_status(f"Could not create CFA/Stack batch log: {exc}")
+            return
+
         self.pending_sources = list(sources)
         self.current_source = None
         self.completed_results = []
@@ -319,6 +330,9 @@ class AutomaticDialog(QDialog):
             f"behavior={self.grouping_behavior_combo.currentText()}, "
             f"overwrite={'yes' if self.run_allow_overwrite else 'no'}."
         )
+        self.log(f"Batch log: {self.run_log_path}")
+        for index, source in enumerate(sources, start=1):
+            self.log(f"Source {index}/{self.run_total}: {source}")
         self.start_next_source()
 
     def start_next_source(self) -> None:
@@ -393,7 +407,10 @@ class AutomaticDialog(QDialog):
         self.stage = "idle"
         self.current_source = None
         self.set_run_controls_enabled(True)
-        self.select_last_successful_result()
+        try:
+            self.select_last_successful_result()
+        except Exception as exc:
+            self.log(f"[WARN] Last stack result could not be selected: {exc}")
         summary = (
             f"CFA/Stack batch finished: {completed} succeeded, {failed} failed, "
             f"{self.run_total} total."
@@ -401,6 +418,9 @@ class AutomaticDialog(QDialog):
         self.set_status(summary)
         for source, message in self.failed_results:
             self.log(f"[FAILED] {source}: {message}")
+        end_log = self.context["end_cfa_batch_log"]
+        assert callable(end_log)
+        end_log()
         self.show_completion_dialog(completed, failed)
 
     def show_completion_dialog(self, completed: int, failed: int) -> None:
@@ -410,6 +430,7 @@ class AutomaticDialog(QDialog):
             f"Failed: {failed}\n"
             f"Total: {self.run_total}"
         )
+        message += f"\n\nBatch log: {self.run_log_path}"
         if failed:
             message += "\n\nSee the log for details about failed folders."
             QMessageBox.warning(self, "CFA/Stack Batch Finished", message)

@@ -377,6 +377,38 @@ def create_analyze_tab(context: dict[str, object]) -> object:
     profiling_action_row.addStretch(1)
     profiling_layout.addLayout(profiling_action_row)
     layout.addWidget(profiling_group)
+    tab.landolt_dialog = None
+    # Optional feature: no imports, controls or errors when its bundle is absent.
+    landolt_files = ("sp_mod_landolt.py", "sp_mod_landolt_catalog.py",
+                     "sp_mod_landolt_stack.py", "sp_mod_landolt_ui.py")
+    if all(Path(__file__).with_name(name).is_file() for name in landolt_files):
+        landolt_group = QGroupBox("Landolt-Transformation")
+        landolt_layout = QVBoxLayout(landolt_group)
+        landolt_description = QLabel(
+            "Stack original CFA images into B/G/R/L, measure standards and determine experimental colour terms with Run."
+        )
+        landolt_description.setWordWrap(True)
+        landolt_layout.addWidget(landolt_description)
+        landolt_button = QPushButton("Open Landolt-Transformation...")
+        landolt_layout.addWidget(landolt_button)
+        layout.addWidget(landolt_group)
+
+        def open_landolt():
+            if tab.landolt_dialog is not None:
+                tab.landolt_dialog.show()
+                tab.landolt_dialog.raise_()
+                return
+            from sp_mod_landolt_ui import create_landolt_dialog
+            dialog = create_landolt_dialog(tab, context=context)
+            tab.landolt_dialog = dialog
+
+            def release_dialog():
+                tab.landolt_dialog = None
+
+            dialog.destroyed.connect(release_dialog)
+            dialog.show()
+
+        landolt_button.clicked.connect(open_landolt)
     layout.addStretch(1)
     active_worker: QThread | None = None
     selected_path: Path | None = None

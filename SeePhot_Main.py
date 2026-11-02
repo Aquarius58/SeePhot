@@ -12,6 +12,7 @@ import csv
 import hashlib
 import html
 import importlib.util
+import json
 import math
 import os
 import re
@@ -21,6 +22,7 @@ import stat
 import time
 import traceback
 import tempfile
+import threading
 import urllib.parse
 import urllib.request
 import warnings
@@ -38,6 +40,7 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 import sp_mod_results as lightcurve_results
+import sp_mod_config as app_config
 
 warnings.filterwarnings(
     "ignore",
@@ -47,9 +50,12 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "0.9.00"
+SCRIPT_VERSION = "1.0.0"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
+GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Aquarius58/SeePhot/releases/latest"
+GITHUB_LATEST_RELEASE_URL = "https://github.com/Aquarius58/SeePhot/releases/latest"
+VERSION_CHECK_TIMEOUT_SECONDS = 3.0
 SOFTWARE_NAME = f"{APP_DISPLAY_NAME} {SCRIPT_VERSION}"
 
 
@@ -66,8 +72,8 @@ SINGLE_INSTANCE_LOCK_PATH = Path(tempfile.gettempdir()) / "seephot_seestar.lock"
 SIRIL_CONNECT_ATTEMPTS = 6
 SIRIL_CONNECT_RETRY_DELAY_SECONDS = 0.2
 WINDOW_WIDTH = 860
-WINDOW_HEIGHT = 700
-MAIN_SPLITTER_START_SIZES = (420, 210)
+WINDOW_HEIGHT = 800
+MAIN_SPLITTER_START_SIZES = (470, 230)
 COMPACT_COMBO_WIDTH = 190
 SHORT_EDIT_WIDTH = 95
 THEME_COLORS = {
@@ -137,8 +143,7 @@ DEFAULT_RESULT_TELESCOPE = lightcurve_results.DEFAULT_RESULT_TELESCOPE
 RESULT_TELESCOPE_SPECS = lightcurve_results.RESULT_TELESCOPE_SPECS
 
 # VSX target search defaults.
-# Limit magnitude is passed to Siril's VSX conesearch.
-DEFAULT_VSX_LIMIT_MAG = 16.0
+# The query limit is read from user Config for each new query.
 VSX_QUERY_ATTEMPTS = 2
 VSX_QUERY_RETRY_DELAY_SECONDS = 1.0
 
@@ -200,7 +205,7 @@ SERIES_RINGSET_APERTURE_FWHM_FACTORS = (1.2, 1.4, 1.6, 1.8, 2.1)
 SERIES_RINGSET_ANNULUS_INNER_FWHM_FACTORS = (2.4, 2.8, 3.2, 3.6)
 SERIES_RINGSET_ANNULUS_WIDTH_FWHM_FACTORS = (1.2, 1.6, 2.0, 2.6)
 SINGLE_FIELD_ZP_METHOD_ID = "FIELD_ZERO_POINT_AUTO_CATALOG_V1"
-CURRENT_RESULT_METADATA_VERSION = 1
+CURRENT_RESULT_METADATA_VERSION = 2
 FIELD_FOOTPRINT_ORDER = "x0_y0;xmax_y0;xmax_ymax;x0_ymax"
 SINGLE_FIELD_ZP_LEGACY_METHOD_ID = "FIELD_ZERO_POINT_APASS_DR10_V1"
 SINGLE_FIELD_ZP_METHOD_KEYS = {
@@ -372,10 +377,10 @@ REFERENCE_ANNULUS_IMPACT_WARNING_MAG = 0.02
 REFERENCE_ANNULUS_IMPACT_INVALID_MAG = 0.05
 TARGET_ANNULUS_IMPACT_WARNING_MAG = 0.05
 TARGET_ANNULUS_IMPACT_INVALID_MAG = 0.10
-# A single-image target may mask isolated bright annulus islands only after an
-# explicit user confirmation.  At least roughly two thirds of the ring must
-# remain, keeping the background estimate supported by hundreds of pixels for
-# the normal SeePhot ringset while also covering crowded single-image fields.
+# A single-image target may mask isolated bright annulus islands after explicit
+# user confirmation, or automatically during Batch. At least roughly two thirds
+# of the ring must remain, keeping the background estimate supported by hundreds
+# of pixels for the normal ringset while also covering crowded single-image fields.
 SINGLE_ANNULUS_MASK_MIN_REMAINING_FRACTION = 0.65
 SINGLE_ANNULUS_MASK_DILATION_PX = 2
 
@@ -496,7 +501,7 @@ from matplotlib.backends.backend_qtagg import (  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.widgets import SpanSelector  # noqa: E402
 from PyQt6.QtCore import QEventLoop, Qt, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
-from PyQt6.QtGui import QColor, QDesktopServices, QPalette  # noqa: E402
+from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPalette, QPixmap  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
     QApplication,
@@ -507,6 +512,8 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QFormLayout,
     QFrame,
     QGroupBox,
+    QGraphicsScene,
+    QGraphicsView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -521,6 +528,7 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -535,6 +543,7 @@ import sp_mod_analyze as analyze_tools  # noqa: E402
 import sp_mod_auto as automatic_tools  # noqa: E402
 import sp_mod_batch as batch_tools  # noqa: E402
 import sp_mod_binning as measurement_binning  # noqa: E402
+import sp_mod_airmass as airmass_tools  # noqa: E402
 import sp_mod_linearity as linearity_tools  # noqa: E402
 import sp_mod_profiling as profiling_tools  # noqa: E402
 
@@ -1024,6 +1033,19 @@ class ApertureMeasurement:
     image_source: str = ""
     aavso_filter: str = ""
     quality_status: str = ""
+    airmass: float = float("nan")
+    altitude_deg: float = float("nan")
+    airmass_status: str = "NOT_CALCULATED"
+    airmass_eop_status: str = "NOT_CHECKED"
+
+    def airmass_csv_fields(self) -> dict[str, str]:
+        """Serialize missing geometry as empty fields, retaining its reason."""
+        return {
+            "airmass": f"{self.airmass:.8f}" if np.isfinite(self.airmass) else "",
+            "altitude_deg": f"{self.altitude_deg:.8f}" if np.isfinite(self.altitude_deg) else "",
+            "airmass_status": self.airmass_status,
+            "airmass_eop_status": self.airmass_eop_status,
+        }
 
 
 @dataclass(frozen=True)
@@ -1430,6 +1452,60 @@ def infer_image_filter_metadata(
     return None
 
 
+def require_uniform_series_filter_metadata(
+    sequence_files: list[Path] | tuple[Path, ...],
+) -> tuple[str, str, str]:
+    """Validate every measured frame; never infer a series filter from a sample."""
+
+    if not sequence_files:
+        raise ValueError("No FITS images available for Light Curve filter validation.")
+    sources: dict[str, list[Path]] = {}
+    origins: set[str] = set()
+    problems: list[str] = []
+    for path in sequence_files:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FITSFixedWarning)
+                warnings.simplefilter("ignore", VerifyWarning)
+                header = fits.getheader(path)
+        except Exception as exc:
+            problems.append(f"{path}: cannot read FITS header ({exc})")
+            continue
+        source = image_source_from_header(header)
+        if not source:
+            declared = ", ".join(
+                f"{key}={header[key]}"
+                for key in ("FILTER", "CHANMODE", "CHANNEL", "CFA_CHAN", "CFA_CHANNEL")
+                if key in header
+            )
+            problems.append(
+                f"{path}: missing, conflicting or unsupported filter/channel metadata "
+                f"({declared or 'no filter/channel values'})."
+            )
+            continue
+        sources.setdefault(source, []).append(path)
+        origin = str(header.get("SPORIGIN", header.get("SSAP", ""))).strip()
+        if origin:
+            origins.add(origin)
+    if len(sources) > 1:
+        problems.append(
+            "Mixed filters/channels are not supported in one Light Curve. "
+            "Separate the images by filter/channel and process each series separately.\n"
+            + "\n".join(
+                f"{source}/{aavso_filter_for_image_source(source)}: "
+                + ", ".join(str(path) for path in paths)
+                for source, paths in sorted(sources.items())
+            )
+        )
+    if problems:
+        raise ValueError("Light Curve filter validation failed:\n" + "\n".join(problems))
+    source = next(iter(sources))
+    origin = next(iter(origins)) if len(origins) == 1 else (
+        "MIXED_DERIVED_ORIGIN" if origins else ""
+    )
+    return source, aavso_filter_for_image_source(source), origin
+
+
 def frame_series_provenance(sample_files: list[Path] | tuple[Path, ...]) -> str:
     """Classify a series without relying on its directory or file name.
 
@@ -1441,6 +1517,7 @@ def frame_series_provenance(sample_files: list[Path] | tuple[Path, ...]) -> str:
     if not sample_files:
         return "UNVERIFIED"
     kinds: set[str] = set()
+    image_sources: set[str] = set()
     for path in sample_files:
         try:
             with warnings.catch_warnings():
@@ -1451,6 +1528,7 @@ def frame_series_provenance(sample_files: list[Path] | tuple[Path, ...]) -> str:
             return "UNVERIFIED"
         origin = str(header.get("SPORIGIN", "")).strip().upper()
         image_source = image_source_from_header(header)
+        image_sources.add(image_source)
         try:
             ncombine = int(header.get("NCOMBINE", 0))
         except (TypeError, ValueError):
@@ -1461,7 +1539,7 @@ def frame_series_provenance(sample_files: list[Path] | tuple[Path, ...]) -> str:
             kinds.add("DERIVED_FITS")
         else:
             kinds.add("SINGLE_FRAME_LG_SERIES")
-    return next(iter(kinds)) if len(kinds) == 1 else "UNVERIFIED"
+    return next(iter(kinds)) if len(kinds) == 1 and len(image_sources) == 1 else "UNVERIFIED"
 
 
 def uniform_stack_image_count(sample_files: list[Path] | tuple[Path, ...]) -> int | None:
@@ -1539,7 +1617,9 @@ def read_plate_solve_center_deg(header: fits.Header) -> tuple[float, float]:
                 0.0 <= ra_value <= 24.0
                 and 0.0 <= telescope_ra_deg < 360.0
                 and -90.0 <= telescope_dec_deg <= 90.0
-                and math.isclose(ra_difference_deg, 0.0, abs_tol=1e-4)
+                # OSL coordinates can differ by 1.5 arcsec between these
+                # fields. Allow 2 arcsec when recognizing decimal hours.
+                and math.isclose(ra_difference_deg, 0.0, abs_tol=2.0 / 3600.0)
                 and math.isclose(telescope_dec_deg, dec_value, abs_tol=1e-4)
             ):
                 return telescope_ra_deg, telescope_dec_deg
@@ -5787,76 +5867,104 @@ def catalog_object_report_entry(obj: CatalogObject) -> str:
 
 
 def load_optional_observer_result_settings() -> dict[str, str]:
-    """Return optional observer metadata from the current legacy config source."""
-
-    settings = {
-        "TELESCOPE": DEFAULT_RESULT_TELESCOPE,
-        "TELESCOPE_SOURCE": "built-in default",
-        "OBSERVER_BAV": "",
-        "OBSERVER_NAME": "",
-        "OBSERVER_AAVSO": "",
-        "OBSERVER_SITE": "",
-        "OBSERVER_LATITUDE": "",
-        "OBSERVER_LONGITUDE": "",
-    }
+    """Read shared observer metadata independently of the optional BAV module."""
 
     try:
-        plugin_path = Path(__file__).with_name("sp_mod_bav.py")
-        if not plugin_path.exists():
-            return settings
-        spec = importlib.util.spec_from_file_location(
-            "sp_mod_bav_metadata",
-            plugin_path,
-        )
-        if spec is None or spec.loader is None:
-            return settings
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    except Exception:
-        return settings
-    load_config = getattr(module, "load_config", None)
-    validate_config = getattr(module, "validate_config", None)
-    if not callable(load_config):
-        return settings
-    try:
-        raw_config = load_config()
-    except Exception:
-        return settings
-    if not isinstance(raw_config, dict):
+        return app_config.observer_result_settings()
+    except (OSError, ValueError):
+        settings = app_config.observer_result_settings(app_config.defaults())
+        settings["TELESCOPE_SOURCE"] = "built-in default"
         return settings
 
-    telescope = str(raw_config.get("telescope", "") or "").strip()
-    if telescope in RESULT_TELESCOPE_SPECS:
-        settings["TELESCOPE"] = telescope
-        settings["TELESCOPE_SOURCE"] = "BAV telescope preference"
 
-    settings["OBSERVER_NAME"] = str(
-        raw_config.get("observer_name", "") or ""
-    ).strip()
-    settings["OBSERVER_SITE"] = str(raw_config.get("site_name", "") or "").strip()
-    bav_code = str(raw_config.get("bav_code", "") or "").strip().upper()
-    if re.fullmatch(r"[A-Z]+", bav_code):
-        settings["OBSERVER_BAV"] = bav_code
-    aavso_code = str(raw_config.get("aavso_code", "") or "").strip().upper()
-    if re.fullmatch(r"[A-Z0-9]{1,5}", aavso_code):
-        settings["OBSERVER_AAVSO"] = aavso_code
-
-    # A fully valid BAV config can also supply normalized decimal coordinates.
-    # Validation failure is intentionally ignored here: BAV is optional for
-    # photometry and remains strictly validated only by the BAV workflow.
-    if callable(validate_config):
+def calculate_result_airmass(
+    measurements: list[ApertureMeasurement],
+    settings: dict[str, object],
+    append_log: Callable[[str], None] | None = None,
+) -> tuple[list[ApertureMeasurement], dict[str, object]]:
+    """Attach geometry without changing photometric values or quality decisions."""
+    def coordinate(key):
+        raw = settings.get(key, "")
+        if raw is None or str(raw).strip() == "":
+            return None
         try:
-            validated_config = validate_config(raw_config)
-        except Exception:
-            validated_config = None
-        if isinstance(validated_config, dict):
-            settings["OBSERVER_LATITUDE"] = str(
-                validated_config.get("latitude", "") or ""
-            ).strip()
-            settings["OBSERVER_LONGITUDE"] = str(
-                validated_config.get("longitude", "") or ""
-            ).strip()
-    return settings
+            return float(raw)
+        except (ValueError, TypeError):
+            return float("nan")
+
+    result = airmass_tools.calculate_airmass(
+        latitude_deg=coordinate("OBSERVER_LATITUDE"),
+        longitude_deg=coordinate("OBSERVER_LONGITUDE"),
+        ra_deg=[item.ra_deg for item in measurements],
+        dec_deg=[item.dec_deg for item in measurements],
+        # Result CSVs use eight decimal places for UTC JD.
+        jd_utc=[float(f"{item.jd:.8f}") for item in measurements],
+    )
+    annotated = [replace(item, airmass=float(result.airmass[index]),
+                         altitude_deg=float(result.altitude_deg[index]),
+                         airmass_status=str(result.status[index]),
+                         airmass_eop_status=str(result.earth_orientation_status[index]))
+                 for index, item in enumerate(measurements)]
+    metadata = {
+        "AIRMASS_MODEL": result.model_id,
+        "AIRMASS_MIN_ALTITUDE_DEG": airmass_tools.MIN_ALTITUDE_DEG,
+        "AIRMASS_TIME_REFERENCE": "RESULT_JD_UTC",
+        "AIRMASS_POSITION_FRAME": "ICRS",
+        "AIRMASS_PRESSURE_HPA": 0,
+        "AIRMASS_ELEVATION_M": 0,
+        "AIRMASS_ELEVATION_SOURCE": result.elevation_source,
+        "AIRMASS_EARTH_ORIENTATION": json.dumps(result.earth_orientation, sort_keys=True),
+        "AIRMASS_WARNINGS": json.dumps(result.warnings),
+    }
+    target = next((item for item in measurements if item.role == "target"), None)
+    if target is not None:
+        metadata.update(AIRMASS_TARGET_RA_DEG=target.ra_deg,
+                        AIRMASS_TARGET_DEC_DEG=target.dec_deg)
+    if append_log is not None:
+        counts = Counter(str(value) for value in result.status)
+        prefix = "WARNING: Airmass: " if any(key != "OK" for key in counts) else "Airmass: "
+        append_log(prefix + "; ".join(f"{key}={count}" for key, count in sorted(counts.items())))
+        if np.any(result.earth_orientation_status == "PREDICTED"):
+            append_log("WARNING: Airmass uses predicted local Earth-orientation data.")
+        for message in result.warnings:
+            append_log(f"WARNING: Airmass: {message}")
+    return annotated, metadata
+
+
+def add_binned_result_airmass(
+    rows: list[dict[str, object]],
+    metadata: dict[str, object],
+    append_log: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    """Compute at bin JD using saved provenance; old Results remain without airmass."""
+    if not metadata.get("AIRMASS_MODEL"):
+        return metadata
+    if metadata["AIRMASS_MODEL"] != airmass_tools.MODEL_ID:
+        raise ValueError("Unsupported airmass model in source result.")
+    # Positions were saved with the measurement, independently of today's catalog.
+    result = airmass_tools.calculate_airmass(
+        latitude_deg=float(metadata["OBSERVER_LATITUDE"]) if metadata.get("OBSERVER_LATITUDE") else None,
+        longitude_deg=float(metadata["OBSERVER_LONGITUDE"]) if metadata.get("OBSERVER_LONGITUDE") else None,
+        ra_deg=float(metadata["AIRMASS_TARGET_RA_DEG"]),
+        dec_deg=float(metadata["AIRMASS_TARGET_DEC_DEG"]),
+        jd_utc=[float(row["jd"]) for row in rows])
+    for index, row in enumerate(rows):
+        row.update(airmass=format_csv_float(result.airmass[index], 8),
+                   altitude_deg=format_csv_float(result.altitude_deg[index], 8),
+                   airmass_status=str(result.status[index]),
+                   airmass_eop_status=str(result.earth_orientation_status[index]))
+    metadata = dict(metadata)
+    metadata.update(AIRMASS_EARTH_ORIENTATION=json.dumps(result.earth_orientation, sort_keys=True),
+                    AIRMASS_WARNINGS=json.dumps(result.warnings))
+    if append_log is not None:
+        counts = Counter(str(value) for value in result.status)
+        append_log("Binned airmass at saved UTC JD: " +
+                   "; ".join(f"{key}={count}" for key, count in sorted(counts.items())))
+        if np.any(result.earth_orientation_status == "PREDICTED"):
+            append_log("WARNING: Airmass uses predicted local Earth-orientation data.")
+        for message in result.warnings:
+            append_log(f"WARNING: Airmass: {message}")
+    return metadata
 
 
 def result_instrument_defaults() -> tuple[str, dict[str, dict[str, object]], str]:
@@ -6034,6 +6142,50 @@ def apply_lightcurve_trim_plan(
     """Commit the trimmed CSV before removing local exports derived from it."""
 
     write_lightcurve_trim_plan(plan)
+    deleted: list[Path] = []
+    failed: list[tuple[Path, OSError]] = []
+    for path in export_files:
+        try:
+            path.unlink()
+            deleted.append(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            failed.append((path, exc))
+    return tuple(deleted), tuple(failed)
+
+
+def write_binned_result_with_export_cleanup(
+    result_csv: Path,
+    metadata: dict[str, object],
+    fieldnames: list[str],
+    rows: list[dict[str, object]],
+    export_files: tuple[Path, ...],
+) -> tuple[tuple[Path, ...], tuple[tuple[Path, OSError], ...]]:
+    """Atomically commit a new bin result before removing its confirmed exports."""
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="",
+            prefix=f".{result_csv.name}.", suffix=".tmp", dir=result_csv.parent,
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            write_result_metadata_header(handle, metadata)
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if result_csv.exists():
+            os.chmod(temporary_path, stat.S_IMODE(result_csv.stat().st_mode))
+        os.replace(temporary_path, result_csv)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
     deleted: list[Path] = []
     failed: list[tuple[Path, OSError]] = []
     for path in export_files:
@@ -7401,13 +7553,13 @@ def parse_aavso_vsx_api_xml(payload: str) -> list[CatalogObject]:
     return rows
 
 
-def query_aavso_vsx_region(frame: ReferenceFrame) -> list[CatalogObject]:
+def query_aavso_vsx_region(frame: ReferenceFrame, limit_mag: float) -> list[CatalogObject]:
     """Query the live AAVSO VSX field API with the maximum-magnitude limit."""
 
     radius_deg = reference_frame_search_radius_arcmin(frame) / 60.0
     url = "https://vsx.aavso.org/index.php?" + urllib.parse.urlencode({
         "view": "api.list", "ra": f"{frame.ra_deg:.8f}", "dec": f"{frame.dec_deg:.8f}",
-        "radius": f"{radius_deg:.8f}", "tomag": f"{DEFAULT_VSX_LIMIT_MAG:.2f}", "format": "xml",
+        "radius": f"{radius_deg:.8f}", "tomag": f"{limit_mag:.2f}", "format": "xml",
     })
     request = urllib.request.Request(url, headers={"User-Agent": f"SeePhot/{SCRIPT_VERSION}"})
     with urllib.request.urlopen(request, timeout=45) as response:
@@ -7415,7 +7567,7 @@ def query_aavso_vsx_region(frame: ReferenceFrame) -> list[CatalogObject]:
     return parse_aavso_vsx_api_xml(payload)
 
 
-def query_vizier_vsx_region_tap(frame: ReferenceFrame) -> list[CatalogObject]:
+def query_vizier_vsx_region_tap(frame: ReferenceFrame, limit_mag: float) -> list[CatalogObject]:
     """Query the remote CDS VizieR VSX mirror via TAP."""
 
     radius_deg = reference_frame_search_radius_arcmin(frame) / 60.0
@@ -7426,7 +7578,7 @@ WHERE 1=CONTAINS(
   POINT('ICRS', RAJ2000, DEJ2000),
   CIRCLE('ICRS', {frame.ra_deg:.8f}, {frame.dec_deg:.8f}, {radius_deg:.8f})
 )
-  AND max <= {DEFAULT_VSX_LIMIT_MAG:.2f}
+  AND max <= {limit_mag:.2f}
 """
     payload = urllib.parse.urlencode(
         {"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "tsv", "QUERY": query}
@@ -7441,7 +7593,7 @@ WHERE 1=CONTAINS(
     return parse_vizier_tap_tsv(text)
 
 
-def query_vizier_vsx_region_astroquery(frame: ReferenceFrame) -> list[CatalogObject]:
+def query_vizier_vsx_region_astroquery(frame: ReferenceFrame, limit_mag: float) -> list[CatalogObject]:
     """Query the remote CDS VizieR VSX mirror through Astroquery."""
 
     try:
@@ -7456,7 +7608,7 @@ def query_vizier_vsx_region_astroquery(frame: ReferenceFrame) -> list[CatalogObj
             "OID", "Name", "Type", "Period", "Epoch", "l_max", "max", "u_max",
             "n_max", "f_min", "l_min", "min", "u_min", "n_min", "RAJ2000", "DEJ2000",
         ],
-        column_filters={"max": f"<={DEFAULT_VSX_LIMIT_MAG:.2f}"},
+        column_filters={"max": f"<={limit_mag:.2f}"},
         row_limit=-1,
     )
     tables = vizier.query_region(center, radius=radius_deg * u.deg, catalog="B/vsx/vsx")
@@ -7475,6 +7627,8 @@ def query_vizier_vsx_region_astroquery(frame: ReferenceFrame) -> list[CatalogObj
 def query_vsx_region(
     frame: ReferenceFrame,
     progress: Callable[[str], None] | None = None,
+    *,
+    limit_mag: float,
 ) -> list[CatalogObject]:
     """Query live AAVSO VSX, then two independent remote VizieR routes."""
 
@@ -7488,7 +7642,7 @@ def query_vsx_region(
     for source_name, method in methods:
         for attempt in range(1, VSX_QUERY_ATTEMPTS + 1):
             try:
-                rows = method(frame)
+                rows = method(frame, limit_mag)
                 if rows:
                     if progress is not None:
                         progress(f"{source_name} returned {len(rows)} object(s).")
@@ -7568,12 +7722,12 @@ def aavso_vsx_detail_url(oid: str) -> str:
 
 
 def current_result_vsx_url(metadata: dict[str, str]) -> str:
-    """Return the VSX URL from the one supported current result format."""
+    """Return stored VSX identity for Results with and without airmass."""
 
-    if metadata.get("RESULT_METADATA_VERSION", "").strip() != str(
-        CURRENT_RESULT_METADATA_VERSION
-    ):
-        raise ValueError("The result is not in the current result format.")
+    if metadata.get("RESULT_METADATA_VERSION", "").strip() not in {
+        "1", str(CURRENT_RESULT_METADATA_VERSION)
+    }:
+        raise ValueError("The result has an unsupported metadata version.")
     required = (
         "OBJECT_NAME",
         "OBJECT_RA",
@@ -7593,10 +7747,12 @@ def current_result_vsx_url(metadata: dict[str, str]) -> str:
 def vizier_vsx_objects_for_table(
     reference_frame: ReferenceFrame,
     progress: Callable[[str], None] | None = None,
+    *,
+    limit_mag: float,
 ) -> list[CatalogObject]:
     """Return live AAVSO VSX objects in the shape the table expects."""
 
-    rows = query_vsx_region(reference_frame, progress)
+    rows = query_vsx_region(reference_frame, progress, limit_mag=limit_mag)
     objects: list[CatalogObject] = []
     for row in rows:
         values = dict(row.values)
@@ -12059,7 +12215,7 @@ def aperture_measurement_from_loaded_frame(
             "BACKGROUND_MASKED",
             True,
             (
-                "bright annulus source region(s) masked after user confirmation; "
+                "bright annulus source region(s) masked; "
                 f"{masked_pixel_count} pixel(s) ({masked_pixel_fraction:.1%}) excluded"
             ),
         )
@@ -12318,6 +12474,10 @@ def write_instrumental_photometry(
     """Write raw instrumental photometry measurements to CSV."""
 
     fieldnames = [
+        "airmass",
+        "altitude_deg",
+        "airmass_status",
+        "airmass_eop_status",
         "frame_index",
         "filename",
         "image_source",
@@ -12380,6 +12540,7 @@ def write_instrumental_photometry(
         for item in measurements:
             writer.writerow(
                 {
+                    **item.airmass_csv_fields(),
                     "frame_index": item.frame_index,
                     "filename": item.filename,
                     "image_source": item.image_source,
@@ -12514,6 +12675,10 @@ def write_calibrated_light_curve(
         by_frame.setdefault(item.frame_index, []).append(item)
 
     fieldnames = [
+        "airmass",
+        "altitude_deg",
+        "airmass_status",
+        "airmass_eop_status",
         "frame_index",
         "filename",
         "image_source",
@@ -12622,6 +12787,7 @@ def write_calibrated_light_curve(
             (
                 scatter,
                 {
+                    **target.airmass_csv_fields(),
                     "frame_index": frame_index,
                     "filename": target.filename,
                     "image_source": target.image_source,
@@ -12850,6 +13016,10 @@ def write_single_field_zp_measurement_csv(
     field_catalog_sources = str(metadata.get("FIELD_ZP_CATALOG_SOURCES", "")).strip()
 
     fieldnames = [
+        "airmass",
+        "altitude_deg",
+        "airmass_status",
+        "airmass_eop_status",
         "filename",
         "image_source",
         "aavso_filter",
@@ -12903,12 +13073,13 @@ def write_single_field_zp_measurement_csv(
         writer.writeheader()
         writer.writerow(
             {
+                **target.airmass_csv_fields(),
                 "filename": target.filename,
                 "image_source": target.image_source,
                 "aavso_filter": target.aavso_filter,
                 "phot_time": target.phot_time,
                 "phot_time_source": target.phot_time_source,
-                "jd": format_csv_float(target.jd),
+                "jd": format_csv_float(target.jd, 8),
                 "target_id": target.object_id,
                 "target_inst_mag": format_csv_float(target.inst_mag),
                 "target_snr": format_csv_float(target.snr),
@@ -12963,6 +13134,11 @@ def write_single_field_zp_references_csv(
     """Write field-wide catalog reference measurements for a single target."""
 
     fieldnames = [
+        "airmass",
+        "altitude_deg",
+        "airmass_status",
+        "airmass_eop_status",
+        "jd",
         "object_id",
         "catalog_source",
         "catalog_mag",
@@ -13009,6 +13185,8 @@ def write_single_field_zp_references_csv(
             )
             writer.writerow(
                 {
+                    **measurement.airmass_csv_fields(),
+                    "jd": format_csv_float(measurement.jd, 8),
                     "object_id": measurement.object_id,
                     "catalog_source": measurement.catalog_source,
                     "catalog_mag": format_csv_float(measurement.catalog_mag),
@@ -13163,7 +13341,7 @@ def validated_aavso_observer_code(value: object) -> str:
 
     observer_code = str(value or "").strip().upper()
     if not observer_code:
-        raise ValueError("Enter your AAVSO observer code first.")
+        raise ValueError("Enter your AAVSO observer code in the Config tab first.")
     if not re.fullmatch(r"[A-Z0-9]{1,5}", observer_code):
         raise ValueError(
             "AAVSO observer code must contain 1 to 5 letters A-Z or digits 0-9 only."
@@ -13252,80 +13430,136 @@ def result_csv_has_calibrated_check(result_csv: Path) -> bool:
     return False
 
 
-def write_aavso_extended_report(
-    result_csv: Path,
-    output_path: Path,
-    target_name: str,
-    observer_code: str,
-    instrument: str,
-) -> int:
-    """Write an AAVSO Extended Format report from a result_curve CSV."""
+def aavso_export_rows(result_csv: Path) -> list[tuple[dict[str, str], str]]:
+    """Validate exactly the exported rows before opening an output file."""
 
-    observer_code = validated_aavso_observer_code(observer_code)
-    rows_written = 0
-    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with result_csv.open(newline="") as input_fh, output_path.open("w", newline="") as output_fh:
-        reader = csv_data_dict_reader(input_fh)
-        output_fh.write("#TYPE=Extended\n")
-        output_fh.write(f"#OBSCODE={observer_code}\n")
-        output_fh.write(f"#SOFTWARE={WINDOW_TITLE}\n")
-        output_fh.write("#DELIM=,\n")
-        output_fh.write("#DATE=JD\n")
-        output_fh.write(f"#GENERATED={generated}\n")
-        output_fh.write("#" + ",".join(AAVSO_EXTENDED_FIELDS) + "\n")
-        writer = csv.writer(output_fh, lineterminator="\n")
-        for row in reader:
+    metadata = read_result_metadata_header(result_csv)
+    requires_airmass = airmass_tools.validate_export_metadata(
+        metadata, source=result_csv.name, export_name="AAVSO",
+    )
+    output_rows = []
+    problems = []
+    with result_csv.open(newline="") as handle:
+        for index, row in enumerate(csv_data_dict_reader(handle), 1):
             if not result_row_is_valid(row):
                 continue
             jd = first_result_row_float(row, "jd")
             mag = first_result_row_float(row, "target_calibrated_mag", "calibrated_mag")
             if not np.isfinite(jd) or not np.isfinite(mag):
                 continue
-            mag_error = first_result_row_float(
-                row,
-                "target_calibrated_mag_error",
-                "calibrated_mag_error",
-            )
-            filt = row.get("aavso_filter", "").strip()
+            filt = (row.get("aavso_filter") or "").strip()
             if not filt:
-                raise ValueError(f"{result_csv.name}: missing aavso_filter column value")
-            if filt not in VALID_AAVSO_FILTERS:
-                raise ValueError(
-                    f"{result_csv.name}: unsupported aavso_filter {filt!r}; "
+                problems.append(f"row {index} (JD {jd:.8f}): missing aavso_filter column value")
+            elif filt not in VALID_AAVSO_FILTERS:
+                problems.append(
+                    f"row {index} (JD {jd:.8f}): unsupported aavso_filter {filt!r}; "
                     "only CV, TG and V are supported"
                 )
-            single_field_zp = is_single_field_zp_result_row(row)
-            check_name = aavso_safe_id(
-                row.get("check_catalog_source"),
-                row.get("check_catalog_id"),
-                row.get("check_object_id"),
-            )
-            if single_field_zp:
-                field_catalog_sources = csv_text(row.get("field_catalog_sources"), APASS_DR10_SOURCE_NAME)
-                chart = f"{field_catalog_sources.replace(';', '+')} FIELD ZP"
-            else:
-                chart = "AUTO CATALOG"
-            writer.writerow(
-                [
-                    target_name,
-                    f"{jd:.8f}",
-                    f"{mag:.3f}",
-                    f"{mag_error:.3f}" if np.isfinite(mag_error) and mag_error > 0 else "na",
-                    filt,
-                    "NO",
-                    "STD",
-                    "ENSEMBLE",
-                    "na",
-                    check_name,
-                    aavso_magnitude_text(row.get("check_calibrated_mag")),
-                    "na",
-                    "na",
-                    chart,
-                    aavso_notes_from_row(row, instrument),
-                ]
-            )
-            rows_written += 1
-    return rows_written
+            try:
+                amass = airmass_tools.saved_export_airmass(row, required=requires_airmass)
+            except ValueError as exc:
+                problems.append(f"row {index} (JD {jd:.8f}): {exc}")
+                amass = "na"
+            output_rows.append((row, amass))
+    if problems:
+        raise ValueError(
+            f"{result_csv.name}: AAVSO export validation failed: "
+            + "; ".join(problems)
+        )
+    return output_rows
+
+
+def write_aavso_extended_report(
+    result_csv: Path,
+    output_path: Path,
+    target_name: str,
+    observer_code: str,
+    instrument: str,
+    *,
+    site_metadata: dict[str, str] | None = None,
+) -> int:
+    """Validate and atomically replace an AAVSO report from result rows."""
+
+    observer_code = validated_aavso_observer_code(observer_code)
+    export_rows = aavso_export_rows(result_csv)
+    output_rows: list[list[object]] = []
+    for row, amass in export_rows:
+        if not result_row_is_valid(row):
+            continue
+        jd = first_result_row_float(row, "jd")
+        mag = first_result_row_float(row, "target_calibrated_mag", "calibrated_mag")
+        if not np.isfinite(jd) or not np.isfinite(mag):
+            continue
+        mag_error = first_result_row_float(
+            row,
+            "target_calibrated_mag_error",
+            "calibrated_mag_error",
+        )
+        filt = row.get("aavso_filter", "").strip()
+        single_field_zp = is_single_field_zp_result_row(row)
+        check_name = aavso_safe_id(
+            row.get("check_catalog_source"),
+            row.get("check_catalog_id"),
+            row.get("check_object_id"),
+        )
+        if single_field_zp:
+            field_catalog_sources = csv_text(row.get("field_catalog_sources"), APASS_DR10_SOURCE_NAME)
+            chart = f"{field_catalog_sources.replace(';', '+')} FIELD ZP"
+        else:
+            chart = "AUTO CATALOG"
+        output_rows.append(
+            [
+                target_name,
+                f"{jd:.8f}",
+                f"{mag:.3f}",
+                f"{mag_error:.3f}" if np.isfinite(mag_error) and mag_error > 0 else "na",
+                filt,
+                "NO",
+                "STD",
+                "ENSEMBLE",
+                "na",
+                check_name,
+                aavso_magnitude_text(row.get("check_calibrated_mag")),
+                amass,
+                "na",
+                chart,
+                aavso_notes_from_row(row, instrument),
+            ]
+        )
+    if not output_rows:
+        return 0
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    headers = [
+        "#TYPE=Extended\n", f"#OBSCODE={observer_code}\n", f"#SOFTWARE={WINDOW_TITLE}\n",
+        "#DELIM=,\n", "#DATE=JD\n", f"#GENERATED={generated}\n",
+    ]
+    if site_metadata is not None:
+        for key in ("OBSERVER_SITE", "OBSERVER_LATITUDE", "OBSERVER_LONGITUDE"):
+            value = str(site_metadata.get(key, "")).replace("\r", " ").replace("\n", " ")
+            headers.append(f"# {key}={value}\n")
+    headers.append("#" + ",".join(AAVSO_EXTENDED_FIELDS) + "\n")
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="",
+            prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent,
+            delete=False,
+        ) as output_fh:
+            temporary_path = Path(output_fh.name)
+            output_fh.write("".join(headers))
+            writer = csv.writer(output_fh, lineterminator="\n")
+            writer.writerows(output_rows)
+            output_fh.flush()
+            os.fsync(output_fh.fileno())
+        if output_path.exists():
+            os.chmod(temporary_path, stat.S_IMODE(output_path.stat().st_mode))
+        os.replace(temporary_path, output_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return len(output_rows)
 
 
 def photometry_summary_lines(
@@ -14120,6 +14354,42 @@ class PlateSolveWorker(QThread):
             self.result = (False, f"Prepare failed: {exc}")
 
 
+def preserve_solved_image_pixels(source: Path, solved: Path, progress: Callable[[str], None]) -> None:
+    """Keep source sample units and precision in the solver's verified geometry."""
+
+    original = fits.getdata(source)
+    pixels, header = fits.getdata(solved, header=True)
+    if original.ndim != 2 or pixels.shape != original.shape:
+        raise ValueError("Plate solve changed the image geometry.")
+    if not np.all(np.isfinite(original)) or not np.all(np.isfinite(pixels)):
+        raise ValueError("Cannot verify plate-solve pixel preservation with non-finite samples.")
+    denominator = float(np.median(pixels))
+    if denominator == 0:
+        raise ValueError("Cannot verify plate-solve pixel scale: zero median.")
+    scale = float(np.median(original)) / denominator
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Cannot verify plate-solve pixel scale.")
+    restored = pixels.astype(np.float64) * scale
+    tolerance = .51 if original.dtype.kind in "iu" else max(float(np.max(np.abs(original))) * 2e-7, 1e-12)
+    if np.allclose(original, restored, rtol=1e-6, atol=tolerance):
+        output, orientation = original, "identity"
+    elif np.allclose(original[::-1], restored, rtol=1e-6, atol=tolerance):
+        output, orientation = original[::-1].copy(), "flip_y"
+    else:
+        raise ValueError("Plate solve changed pixels beyond a vertical flip and uniform scale.")
+    # Use the exact source samples, rather than rounding a rescaled solver copy.
+    # The solver WCS belongs to its output orientation.
+    for key in ("BSCALE", "BZERO"):
+        header.remove(key, ignore_missing=True)
+    source_header = fits.getheader(source)
+    if "BUNIT" in source_header:
+        header["BUNIT"] = source_header["BUNIT"]
+    else:
+        header.remove("BUNIT", ignore_missing=True)
+    fits.writeto(solved, output, header, overwrite=True)
+    progress(f"Plate solve preserves original pixel units and precision; orientation={orientation}, solver scale correction={scale:.9g}.")
+
+
 def solve_image_for_analyze(path: Path, progress: Callable[[str], None]) -> tuple[object, Path]:
     """Plate-solve an Analyze image in a disposable copy, never in the original."""
 
@@ -14137,15 +14407,120 @@ def solve_image_for_analyze(path: Path, progress: Callable[[str], None]) -> tupl
         progress(message)
         if not success or read_reference_frame(copied_path, 0) is None:
             raise RuntimeError("Automatic plate solve did not produce a usable WCS image.")
+        preserve_solved_image_pixels(path, copied_path, progress)
         return workspace, copied_path
     except Exception:
         workspace.cleanup()
         raise
 
 
+def newer_github_release(current_version: str) -> tuple[str, str] | None:
+    """Read the latest stable Main release; unavailable checks are non-fatal."""
+    try:
+        current = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", current_version)
+        if current is None:
+            return None
+        request = urllib.request.Request(
+            GITHUB_LATEST_RELEASE_API,
+            headers={"User-Agent": f"SeePhot/{current_version}",
+                     "Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(request, timeout=VERSION_CHECK_TIMEOUT_SECONDS) as response:
+            payload = response.read(65537)
+        if len(payload) > 65536:
+            return None
+        release = json.loads(payload)
+        if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+            return None
+        tag = release.get("tag_name", "")
+        if not isinstance(tag, str):
+            return None
+        latest = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag)
+        if latest is None or tuple(map(int, latest.groups())) <= tuple(map(int, current.groups())):
+            return None
+        return tag.removeprefix("v"), GITHUB_LATEST_RELEASE_URL
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def check_github_release_in_background(current_version: str, notify) -> None:
+    """Worker entry: no widget access and no startup/close wait."""
+    available = newer_github_release(current_version)
+    if available is not None:
+        try:
+            notify(available)
+        except RuntimeError:
+            # The window may have been deleted while the request was running.
+            pass
+
+
+class OverviewImageView(QGraphicsView):
+    """Scrollable diagram with width fitting and explicit user zoom."""
+
+    def __init__(self, image_path: Path, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self.setBackgroundBrush(QColor("white"))
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self._fit_width = True
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            raise ValueError(f"Cannot load Overview image: {image_path.name}")
+        self.scene().addPixmap(pixmap)
+        self.scene().setSceneRect(0, 0, pixmap.width(), pixmap.height())
+        self.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+
+    def fit_width(self):
+        self._fit_width = True
+        factor = max(1, self.viewport().width() - 24) / self.sceneRect().width()
+        self.resetTransform()
+        self.scale(factor, factor)
+
+    def zoom(self, factor):
+        self._fit_width = False
+        new_scale = self.transform().m11() * factor
+        if 0.05 <= new_scale <= 8:
+            self.scale(factor, factor)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._fit_width:
+            self.fit_width()
+
+
+class OverviewImagePanel(QWidget):
+    """Diagram toolbar and a readable error for absent or damaged bundle assets."""
+
+    def __init__(self, image_path: Path, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        try:
+            self.view = OverviewImageView(image_path, self)
+        except ValueError as exc:
+            message = QLabel(f"{exc}\nPlease install the complete SeePhot bundle.")
+            message.setWordWrap(True)
+            layout.addWidget(message)
+            layout.addStretch()
+            return
+        toolbar = QHBoxLayout()
+        for title, callback in (
+            ("Zoom out", lambda: self.view.zoom(1 / 1.25)),
+            ("Zoom in", lambda: self.view.zoom(1.25)),
+            ("Fit to width", self.view.fit_width),
+        ):
+            button = QPushButton(title)
+            button.clicked.connect(callback)
+            toolbar.addWidget(button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+        layout.addWidget(self.view)
+
+
 class LightCurveWindow(QWidget):
     """Main GUI window for the first development milestone."""
 
+    version_check_finished = pyqtSignal(object)
     automatic_prepare_finished = pyqtSignal(bool, str)
     automatic_lightcurve_finished = pyqtSignal(bool, str)
     automatic_stack_finished = pyqtSignal(bool, str, object)
@@ -14163,6 +14538,10 @@ class LightCurveWindow(QWidget):
         self.source_dir_edit.editingFinished.connect(self.scan_entered_directory)
         self.source_dir_edit.returnPressed.connect(self.scan_entered_directory)
         self.is_closing = False
+        self.version_check_started = False
+        self.version_check_finished.connect(
+            self.show_available_github_release, Qt.ConnectionType.QueuedConnection
+        )
         self.local_event_loop: QEventLoop | None = None
         self.last_source_dialog_directory: Path | None = None
         if DEFAULT_FITS_DIRECTORY is not None and DEFAULT_FITS_DIRECTORY.is_dir():
@@ -14192,6 +14571,9 @@ class LightCurveWindow(QWidget):
         self.series_optimized_aperture_settings: ApertureSettings | None = None
         self.session_temp_directories: set[Path] = set()
         self.log_lines: list[str] = []
+        self.cfa_batch_log_path: Path | None = None
+        self.cfa_batch_log_start = 0
+        self.cfa_batch_log_ranges: list[tuple[int, int]] = []
 
         self.target_label = QLabel("Selected target: none")
         self.photometry_target_label = QLabel("Target: none")
@@ -14281,7 +14663,10 @@ class LightCurveWindow(QWidget):
         )
         self.log_lines.append(version_log_line)
         self.log_view.append(version_log_line)
+        _config, config_messages = app_config.initialize()
         self._build_ui()
+        for message in config_messages:
+            self.append_log(message)
         self.update_mode_dependent_controls()
         self.refresh_action_availability()
         self.append_log("Running inside Siril Python.")
@@ -14296,6 +14681,13 @@ class LightCurveWindow(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+        self.version_update_label = QLabel()
+        self.version_update_label.setTextFormat(Qt.TextFormat.RichText)
+        self.version_update_label.setOpenExternalLinks(True)
+        self.version_update_label.setWordWrap(True)
+        self.version_update_label.setContentsMargins(6, 4, 6, 4)
+        self.version_update_label.hide()
+        root.addWidget(self.version_update_label)
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.main_splitter = splitter
         splitter.setHandleWidth(8)
@@ -14444,7 +14836,8 @@ class LightCurveWindow(QWidget):
             self.vsx_type_preset_combo.fontMetrics().horizontalAdvance("Short period") + 72
         )
         self.vsx_type_preset_combo.setToolTip(
-            "Seestar recommended variable-type presets for the VSX type filter."
+            "Suggested variable-type filters for V-band photometry (TG/CV) "
+            "from CFA images, such as Seestar frames."
         )
         self.vsx_type_preset_combo.currentIndexChanged.connect(self.on_vsx_type_preset_changed)
         filter_row.addWidget(self.vsx_type_preset_combo)
@@ -14662,41 +15055,25 @@ class LightCurveWindow(QWidget):
         export_form = QFormLayout(export_config_group)
         export_form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         export_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.aavso_observer_code_edit = QLineEdit()
-        self.aavso_observer_code_edit.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.aavso_observer_code_edit.setPlaceholderText("AAVSO observer code")
-        self.aavso_observer_code_edit.setToolTip(
-            "Required: 1 to 5 letters A-Z or digits 0-9."
-        )
-        self.aavso_observer_code_edit.setFixedWidth(COMPACT_COMBO_WIDTH)
-        try:
-            observer_settings = load_optional_observer_result_settings()
-            bav_observer_code = str(
-                observer_settings.get("OBSERVER_AAVSO", "") or ""
-            ).strip().upper()
-        except Exception:
-            bav_observer_code = ""
-        self._aavso_bav_prefill = bav_observer_code
-        self.aavso_observer_code_edit.setText(bav_observer_code)
-        self.aavso_observer_code_edit.textEdited.connect(
-            self.uppercase_aavso_observer_code_input
-        )
-        export_form.addRow("Observer code:", self.aavso_observer_code_edit)
-
-        self.aavso_instrument_label = QLabel("none")
-        export_form.addRow("Telescope:", self.aavso_instrument_label)
+        self.export_observer_labels = {}
+        for key, title in (("OBSERVER_AAVSO", "Observer code:"),
+                           ("OBSERVER_SITE", "Site name:"),
+                           ("OBSERVER_LATITUDE", "Latitude:"),
+                           ("OBSERVER_LONGITUDE", "Longitude:")):
+            label = QLabel("—")
+            label.setObjectName("export_" + key.lower())
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.export_observer_labels[key] = label
+            export_form.addRow(title, label)
+        export_form.addRow(QLabel("Manage observer and site settings in the Config tab."))
+        self.refresh_export_observer_display()
         export_layout.addWidget(export_config_group)
 
         export_action_group = QGroupBox("Export")
         export_action_row = QHBoxLayout(export_action_group)
         self.export_aavso_button = QPushButton("Export AAVSO Report")
-        self.export_aavso_button.clicked.connect(
-            lambda: self.run_busy_action(
-                "EXPORT_RUNNING",
-                "Exporting AAVSO report.",
-                self.export_aavso_report,
-            )
-        )
+        self.export_aavso_button.clicked.connect(self.export_aavso_report)
         export_action_row.addWidget(self.export_aavso_button)
 
         self.open_aavso_folder_button = QPushButton("Open Folder")
@@ -14736,9 +15113,11 @@ class LightCurveWindow(QWidget):
         footer_current_status_layout = QVBoxLayout(footer_current_status)
         footer_current_status_layout.setContentsMargins(0, 0, 0, 0)
         footer_current_status_layout.setSpacing(0)
+        self.footer_location_label = QLabel()
         self.footer_current_target_label = QLabel()
         self.footer_current_curve_label = QLabel()
         for label in (
+            self.footer_location_label,
             self.footer_current_target_label,
             self.footer_current_curve_label,
         ):
@@ -14785,22 +15164,44 @@ class LightCurveWindow(QWidget):
         self.add_optional_archive_tab()
         self.add_optional_ext_scopes_tab()
         self.add_required_analyze_tab()
-        self.footer_current_status_tabs = tuple(
-            tab
-            for tab in (lightcurve_tab, export_tab, self.bav_tab, self.archive_tab)
-            if tab is not None
+        self.config_tab = app_config.create_config_tab({
+            "config_changed": self.on_config_changed,
+            "append_log": self.append_log,
+            "bav_available": self.bav_tab is not None,
+        })
+        tabs.addTab(self.config_tab, app_config.PLUGIN_TAB_LABEL)
+
+    def start_version_check(self) -> None:
+        """Start at most one independent check after the window is shown."""
+        if self.is_closing or self.version_check_started:
+            return
+        self.version_check_started = True
+        threading.Thread(
+            target=check_github_release_in_background,
+            args=(SCRIPT_VERSION, self.version_check_finished.emit),
+            name="SeePhot version check",
+            daemon=True,
+        ).start()
+
+    def show_available_github_release(self, available: tuple[str, str]) -> None:
+        """Display the worker result on the GUI thread without interrupting work."""
+        if self.is_closing:
+            return
+        version, url = available
+        self.version_update_label.setText(
+            f"SeePhot {html.escape(version)} is available. Running: {SCRIPT_VERSION}. "
+            f'<a href="{html.escape(url, quote=True)}">Open GitHub release</a>'
         )
-        tabs.currentChanged.connect(self.update_footer_current_status_visibility)
-        self.update_footer_current_status_visibility()
+        self.version_update_label.show()
+        self.append_log(f"New SeePhot version available: {version}; running {SCRIPT_VERSION}. {url}")
 
-    def update_footer_current_status_visibility(self, _index: int | None = None) -> None:
-        """Show current-result details only where they are actionable."""
+    def on_config_changed(self) -> None:
+        """Refresh shared observer preferences while preserving manual overrides."""
 
-        footer_status = getattr(self, "footer_current_status", None)
-        tabs = getattr(self, "tabs", None)
-        visible_tabs = getattr(self, "footer_current_status_tabs", ())
-        if footer_status is not None and tabs is not None:
-            footer_status.setVisible(tabs.currentWidget() in visible_tabs)
+        self.refresh_export_observer_display()
+        self.update_footer_current_status_labels()
+        self.refresh_bav_tab_view()
+        self.refresh_action_availability()
 
     def add_required_analyze_tab(self) -> None:
         """Add the required standalone Tools tab."""
@@ -14820,10 +15221,84 @@ class LightCurveWindow(QWidget):
             "read_reference_frame": read_reference_frame,
             "solve_image_for_analyze": solve_image_for_analyze,
             "open_profiling_runner": self.open_profiling_runner,
+            "run_landolt_stack": self.run_landolt_stack,
+            "show_landolt_stack": self.show_landolt_stack,
+            "landolt_cfa_positions": cfa_stack_app.cfa_position_color_map,
+            "landolt_image_cutout": image_cutout_for_radius,
+            "landolt_min_annulus_fraction": SINGLE_ANNULUS_MASK_MIN_REMAINING_FRACTION,
+            "begin_busy_action": self.begin_busy_action,
+            "finish_busy_action": self.finish_busy_action,
             "query_gaia_dr3_region": query_gaia_dr3_region,
             "resolve_aperture_settings": resolve_aperture_settings,
             "aperture_measurements_for_frame": aperture_measurements_for_frame,
         }
+
+    def show_landolt_stack(self, path: Path, progress) -> None:
+        """Show the active persistent G stack without replacing Main run state."""
+        interface = cfa_stack_app.s.SirilInterface()
+        try:
+            cfa_stack_app.connect_siril_interface(interface, progress)
+            interface.cmd(f'load "{siril_path(path)}"')
+            progress(f"Active Landolt G stack displayed: {path}")
+        finally:
+            interface.disconnect()
+
+    def run_landolt_stack(self, source_dir: Path, progress, *, archive_run: Path, quality_enabled: bool | None = None) -> object:
+        """Worker-side joint CFA stack, independent of Detect Variables."""
+        from sp_mod_landolt_stack import directory_command, stack_all_cfa
+
+        # Own subtree only; the application's normal reset/close cleanup tracks it.
+        work_root = temp_directory_for(Path(source_dir).expanduser().resolve()) / "landolt_work"
+        if work_root.parent.is_symlink():
+            raise ValueError("Landolt temporary root must not be a symbolic link.")
+        work_root.parent.mkdir(parents=True, exist_ok=True)
+        remove_temp_directory_tree(work_root, work_root.parent)
+        work_root.mkdir()
+        self.session_temp_directories.add(work_root)
+        siril = None
+
+        def command(command_text: str) -> None:
+            progress(f"> {command_text}")
+            try:
+                siril.cmd(command_text)
+            except Exception as exc:
+                raise RuntimeError(f"Siril command failed: {command_text}: {exc}") from exc
+
+        def close_display() -> None:
+            # A display-close failure must not replace a processing error.
+            try:
+                command("close")
+            except Exception as exc:
+                progress(f"Siril cleanup warning: {exc}")
+
+        def execute(workspace: Path, commands: tuple[str, ...]) -> None:
+            nonlocal siril
+            if siril is None:
+                siril = cfa_stack_app.s.SirilInterface()
+                cfa_stack_app.connect_siril_interface(siril, progress)
+            close_display()
+            command(directory_command(workspace))
+            try:
+                for command_text in commands:
+                    command(command_text)
+            finally:
+                close_display()
+
+        try:
+            return stack_all_cfa(source_dir, cfa_helpers=cfa_stack_app,
+                execute=execute, progress=progress, work_root=work_root, archive_run=archive_run,
+                quality_enabled=quality_enabled)
+        finally:
+            if siril is not None:
+                close_display()
+                try:
+                    command(directory_command(Path(source_dir).expanduser().resolve().parent))
+                except Exception as exc:
+                    progress(f"Siril cleanup warning: {exc}")
+                try:
+                    siril.disconnect()
+                except Exception as exc:
+                    progress(f"Siril disconnect warning: {exc}")
 
     def add_optional_ext_scopes_tab(self) -> None:
         """Load an optional external telescope/FITS tools tab if present."""
@@ -15070,7 +15545,6 @@ class LightCurveWindow(QWidget):
             "get_photometry_mode": self.selected_photometry_mode,
             "get_current_lightcurve": self.current_export_lightcurve,
             "set_current_lightcurve": self.set_current_lightcurve_from_plugin,
-            "set_aavso_observer_code_from_bav": self.set_aavso_observer_code_from_bav,
             "open_bav_results_folder": self.open_bav_result_browser,
             "open_linearity_dialog": linearity_tools.open_linearity_dialog,
             "get_diagnostic_result_csv": self.diagnostic_result_csv,
@@ -15086,6 +15560,8 @@ class LightCurveWindow(QWidget):
             "set_source_directory": self.set_source_directory_for_automation,
             "mark_image_source_archived": self.mark_image_source_archived,
             "start_cfa_stack": self.start_cfa_stack_for_automation,
+            "begin_cfa_batch_log": self.begin_cfa_batch_log,
+            "end_cfa_batch_log": self.end_cfa_batch_log,
             "start_detect_varstars": self.prepare_sequence,
             "select_target_by_name": self.select_target_by_name_for_automation,
             "get_selected_vsx_targets": self.selected_vsx_targets_for_batch,
@@ -15150,6 +15626,13 @@ class LightCurveWindow(QWidget):
                 result_metadata = read_result_metadata_header(current_result[0])
             except OSError:
                 pass
+        aavso_problem = ""
+        if current_result is not None and not busy:
+            try:
+                aavso_export_rows(current_result[0])
+            except (OSError, ValueError) as exc:
+                aavso_problem = str(exc)
+        self.aavso_export_problem = aavso_problem
         can_create_binned_curve = (
             has_result
             and result_metadata.get("SOURCE_PROVENANCE") == "SINGLE_FRAME_LG_SERIES"
@@ -15196,7 +15679,7 @@ class LightCurveWindow(QWidget):
             "clear_extremum_fit": not busy and (
                 bool(self.lightcurve_fit_artists) or has_selected_plot_range
             ),
-            "export_aavso": not busy and has_result,
+            "export_aavso": not busy and has_result and not aavso_problem,
             "open_aavso_folder": not busy and has_aavso_folder,
             "create_binned_curve": not busy and can_create_binned_curve,
             "use_raw_curve": not busy and can_use_raw_curve,
@@ -15230,6 +15713,8 @@ class LightCurveWindow(QWidget):
             button = getattr(self, name, None)
             if isinstance(button, QPushButton):
                 button.setEnabled(state[action])
+
+        self.export_aavso_button.setToolTip(self.aavso_export_problem)
 
         for name in ("binning_mode_combo", "binning_value_spin"):
             widget = getattr(self, name, None)
@@ -15753,17 +16238,6 @@ class LightCurveWindow(QWidget):
 
         self.update_footer_current_status_labels()
 
-        instrument_label = getattr(self, "aavso_instrument_label", None)
-        if instrument_label is not None:
-            export_result = (
-                None
-                if self.current_result_origin == "diagnostic"
-                else self.loaded_lightcurve_csv
-            )
-            instrument_label.setText(
-                aavso_instrument_display_text(export_result)
-            )
-
     def display_result_status(self) -> str:
         """Return the user-facing result state for the compact status line."""
 
@@ -15892,13 +16366,55 @@ class LightCurveWindow(QWidget):
             self.export_status = status
             self.update_overall_status()
 
+    def begin_cfa_batch_log(self, sources: list[Path]) -> Path:
+        """Open a distinct log beside the first source, before starting workers."""
+
+        if self.cfa_batch_log_path is not None:
+            raise RuntimeError("A CFA/Stack batch log is already active.")
+        root = sources[0].parent / RESULTS_DIRECTORY_NAME / "cfa_batch"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        counter = 1
+        while True:
+            name = timestamp if counter == 1 else f"{timestamp}_{counter}"
+            directory = root / name
+            try:
+                directory.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                counter += 1
+        path = directory / "run.log"
+        path.write_text(f"SeePhot version: {SCRIPT_VERSION}\n", encoding="utf-8")
+        self.cfa_batch_log_start = len(self.log_lines)
+        self.cfa_batch_log_path = path
+        return path
+
+    def end_cfa_batch_log(self) -> None:
+        """Finish the batch log and exclude its lines from photometry logs."""
+
+        if self.cfa_batch_log_path is None:
+            return
+        self.autosave_run_log()
+        self.cfa_batch_log_ranges.append((self.cfa_batch_log_start, len(self.log_lines)))
+        self.cfa_batch_log_path = None
+
     def autosave_run_log(self) -> None:
-        """Persist the GUI log when a results directory is known."""
+        """Save an active batch log or update an existing photometry directory."""
+
+        if self.cfa_batch_log_path is not None:
+            try:
+                lines = self.log_lines[self.cfa_batch_log_start:]
+                self.cfa_batch_log_path.write_text(
+                    f"SeePhot version: {SCRIPT_VERSION}\n" + "\n".join(lines) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                self.log_view.append(f"WARNING: Could not save CFA/Stack batch log: {exc}")
+            return
 
         output_dir = self.current_results_directory()
         if output_dir is None and self.loaded_lightcurve_csv is not None:
             output_dir = self.loaded_lightcurve_csv.parent
-        if output_dir is None:
+        if output_dir is None or not output_dir.is_dir():
             return
         try:
             self.write_run_log(output_dir)
@@ -15911,7 +16427,14 @@ class LightCurveWindow(QWidget):
         diagnostics_dir = diagnostics_directory_for_results_dir(output_dir)
         diagnostics_dir.mkdir(parents=True, exist_ok=True)
         path = diagnostics_dir / "run.log"
-        path.write_text("\n".join(self.log_lines) + "\n", encoding="utf-8")
+        ranges = list(self.cfa_batch_log_ranges)
+        if self.cfa_batch_log_path is not None:
+            ranges.append((self.cfa_batch_log_start, len(self.log_lines)))
+        lines = [
+            line for index, line in enumerate(self.log_lines)
+            if not any(start <= index < end for start, end in ranges)
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
 
     def ensure_plot_dialog(self) -> None:
@@ -16611,11 +17134,12 @@ class LightCurveWindow(QWidget):
     def update_footer_current_status_labels(
         self, target_name: str | None = None
     ) -> None:
-        """Refresh the compact two-line current-target/current-curve footer."""
+        """Show the result site, or active Config site when no result is loaded."""
 
+        location_label = getattr(self, "footer_location_label", None)
         target_label = getattr(self, "footer_current_target_label", None)
         curve_label = getattr(self, "footer_current_curve_label", None)
-        if target_label is None or curve_label is None:
+        if location_label is None or target_label is None or curve_label is None:
             return
 
         if target_name is None:
@@ -16628,11 +17152,20 @@ class LightCurveWindow(QWidget):
             else:
                 target_name = "none"
         target_display_name = str(target_name or "none").strip() or "none"
-        target_prefix = "Current target: "
+        target_prefix = "Target: "
         curve_path = self.loaded_lightcurve_csv
-        curve_prefix = "Current curve: "
+        if curve_path is None:
+            site_metadata = load_optional_observer_result_settings()
+        else:
+            try:
+                site_metadata = read_result_metadata_header(curve_path)
+            except (OSError, UnicodeError):
+                site_metadata = {}
+        location_name = str(site_metadata.get("OBSERVER_SITE", "")).strip() or "none"
+        curve_prefix = "Result file: "
         curve_display_name = "none" if curve_path is None else Path(curve_path).name
         for label, prefix, value, has_current_value in (
+            (location_label, "Location: ", location_name, location_name != "none"),
             (
                 target_label,
                 target_prefix,
@@ -17201,8 +17734,11 @@ class LightCurveWindow(QWidget):
             return False
 
         try:
-            self.append_log("Querying live AAVSO VSX for variable table.")
-            objects = vizier_vsx_objects_for_table(self.reference_frame, self.append_log)
+            limit_mag = app_config.load_config()["vsx"]["limit_magnitude"]
+            self.append_log(f"Querying VSX for variable table (limit magnitude {limit_mag:g}).")
+            objects = vizier_vsx_objects_for_table(
+                self.reference_frame, self.append_log, limit_mag=limit_mag
+            )
         except Exception as exc:
             message = f"VSX catalog unavailable: {exc}"
             self.last_vsx_failure_message = message
@@ -17285,7 +17821,7 @@ class LightCurveWindow(QWidget):
         self.tabs.setCurrentWidget(self.varstar_tab)
         self.append_log(
             f"VSX objects loaded: {len(objects)} from live AAVSO VSX "
-            f"(limit magnitude {DEFAULT_VSX_LIMIT_MAG:g}; "
+            f"(limit magnitude {limit_mag:g}; "
             f"{outside_count} outside the usable reference area filtered out)"
         )
         self.refresh_plugin_tab_views()
@@ -17831,7 +18367,11 @@ class LightCurveWindow(QWidget):
         return single_annulus_mask_candidate(cutout, ring, measurement.background_median)
 
     def confirm_single_annulus_mask(self, candidate: SingleAnnulusMaskCandidate) -> bool:
-        """Offer the only user choice needed for a safely isolated ring source."""
+        """Accept a safe mask automatically in Batch; otherwise ask the user."""
+
+        if self.batch_tab is not None and getattr(self.batch_tab, "running", False):
+            self.append_log("Batch: automatically using cleaned target background.")
+            return True
 
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
@@ -18282,7 +18822,7 @@ class LightCurveWindow(QWidget):
             if precheck_mask_candidate is not None:
                 self.lightcurve_status_label.setText(
                     "Single target selected with maskable annulus contamination. "
-                    "Run Measurement will ask before cleaning the background."
+                    "Run Measurement asks before cleaning the background; Batch accepts automatically."
                 )
             else:
                 self.lightcurve_status_label.setText(
@@ -18900,6 +19440,7 @@ class LightCurveWindow(QWidget):
                 raise ValueError(
                     "Source input fingerprint is missing; run single-frame L/G photometry again."
                 )
+            require_uniform_series_filter_metadata(source_input_files)
             if frame_series_provenance(source_input_files) != "SINGLE_FRAME_LG_SERIES":
                 raise ValueError("Selected source directory is no longer a L/G single-frame series.")
             if input_series_fingerprint(source_input_files) != expected_input_fingerprint:
@@ -19053,12 +19594,39 @@ class LightCurveWindow(QWidget):
                 rows.append(row)
             if not any(str(row.get("valid", "")) == "1" for row in rows):
                 raise ValueError("No binned point meets the existing target quality threshold.")
+            metadata = add_binned_result_airmass(rows, metadata, self.append_log)
+            if metadata.get("AIRMASS_MODEL"):
+                for name in ("airmass", "altitude_deg", "airmass_status", "airmass_eop_status"):
+                    if name not in fieldnames:
+                        fieldnames.append(name)
             metadata = augment_result_metadata_from_rows(metadata, rows)
-            with output_csv.open("w", newline="") as handle:
-                write_result_metadata_header(handle, metadata)
-                writer = csv.DictWriter(handle, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(rows)
+            export_files = local_derived_export_files(
+                output_csv, source_metadata.get("OBJECT_NAME", "Target") or "Target",
+            )
+            if export_files:
+                confirmation = QMessageBox(self)
+                confirmation.setWindowTitle("Regenerate Binned Curve")
+                confirmation.setIcon(QMessageBox.Icon.Warning)
+                confirmation.setText("Existing exports found for this binned result. Regenerate it?")
+                confirmation.setInformativeText(
+                    f"{len(export_files)} local AAVSO/BAV export file(s) belong to this bin variant. "
+                    "They will be deleted only after the new result is saved successfully. "
+                    "Recreate these exports from the new result. Cancel keeps the existing files."
+                )
+                confirmation.setDetailedText(
+                    "Local export files to delete:\n" + "\n".join(str(path) for path in export_files)
+                )
+                regenerate_button = confirmation.addButton("Regenerate", QMessageBox.ButtonRole.AcceptRole)
+                cancel_button = confirmation.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                confirmation.setDefaultButton(cancel_button)
+                confirmation.exec()
+                if confirmation.clickedButton() is not regenerate_button:
+                    self.append_log("Binning regeneration cancelled; previous result and exports kept.")
+                    self.binning_eligibility_label.setText("Binning cancelled; previous result and exports kept.")
+                    return
+            deleted_exports, failed_exports = write_binned_result_with_export_cleanup(
+                output_csv, metadata, fieldnames, rows, export_files,
+            )
         except Exception as exc:
             self.binning_eligibility_label.setText(f"Binning failed: {exc}")
             self.append_log(f"Binning failed: {exc}")
@@ -19069,6 +19637,7 @@ class LightCurveWindow(QWidget):
             source_metadata.get("OBJECT_NAME", "Target") or "Target",
             plot_lightcurve=True,
         )
+        self.reset_export_status()
         self.binning_eligibility_label.setText(f"Created {len(bins)} binned points; raw curve remains unchanged.")
         self.lightcurve_status_label.setText(f"Binned curve created: {output_csv}")
         self.export_status_label.setText(f"Current export source: {output_csv}")
@@ -19076,6 +19645,24 @@ class LightCurveWindow(QWidget):
             f"Binned curve written: {output_csv} ({len(bins)} bins, {len(frames)} eligible inputs, "
             f"{excluded} excluded, {skipped} short rest bins skipped)."
         )
+        if deleted_exports:
+            self.append_log(
+                f"Removed {len(deleted_exports)} old local export file(s) for {output_csv}; "
+                "recreate exports from the new binned result."
+            )
+        if failed_exports:
+            self.set_export_process_status("failed")
+            self.export_status_label.setText(
+                f"Stale exports remain for {output_csv}; recreate them before use."
+            )
+            for path, exc in failed_exports:
+                self.append_log(f"WARNING: Could not remove stale export {path}: {exc}")
+            QMessageBox.warning(
+                self, "Regenerate Binned Curve",
+                "The new binned result was saved, but some old exports could not be deleted. "
+                "These files do not represent the current result. Recreate them before use:\n"
+                + "\n".join(str(path) for path, _exc in failed_exports),
+            )
 
     def activate_raw_curve(self) -> None:
         """Switch an active binned result back to its unmodified source curve."""
@@ -19137,6 +19724,7 @@ class LightCurveWindow(QWidget):
         measurements: list[ApertureMeasurement],
         aperture_settings: ApertureSettings,
         metadata_fits_path: Path,
+        optional_settings: dict[str, str] | None = None,
     ) -> dict[str, object]:
         """Build the general metadata header for a new result CSV."""
 
@@ -19145,7 +19733,8 @@ class LightCurveWindow(QWidget):
         if self.reference_frame is None:
             raise RuntimeError("No solved reference frame available for result metadata.")
 
-        optional_settings = load_optional_observer_result_settings()
+        if optional_settings is None:
+            optional_settings = load_optional_observer_result_settings()
         field_metadata = reference_frame_field_metadata(self.reference_frame)
         try:
             with warnings.catch_warnings():
@@ -19324,6 +19913,7 @@ class LightCurveWindow(QWidget):
 
         self.set_result_display_kind(single=True)
         self.append_log("Run Single Measurement requested.")
+        optional_settings = load_optional_observer_result_settings()
         if self.selected_target is None:
             current_selection = self.current_vsx_selection()
             if current_selection is not None:
@@ -19455,7 +20045,7 @@ class LightCurveWindow(QWidget):
                         (item for item in measurements if item.role == "target"), None
                     )
                     self.append_log(
-                        "Single target background masked after user confirmation: "
+                        "Single target background masked: "
                         f"{mask_candidate.masked_pixel_count} pixel(s) excluded."
                     )
                 else:
@@ -19471,6 +20061,10 @@ class LightCurveWindow(QWidget):
             self.show_single_measurement_warning("Target could not be measured.")
             return
 
+        measurements, airmass_metadata = calculate_result_airmass(
+            measurements, optional_settings, self.append_log
+        )
+        target_measurement = next(item for item in measurements if item.role == "target")
         target_error = (
             target_measurement.inst_mag_error
             if target_measurement.inst_mag_error is not None
@@ -19492,7 +20086,6 @@ class LightCurveWindow(QWidget):
             )
         )
         instrumental_csv = diagnostics_dir / f"{stem}_single_instrumental_photometry.csv"
-        optional_settings = load_optional_observer_result_settings()
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", FITSFixedWarning)
@@ -19529,6 +20122,8 @@ class LightCurveWindow(QWidget):
         metadata = {
             "RESULT_METADATA_VERSION": CURRENT_RESULT_METADATA_VERSION,
             "SINGLE_MEASUREMENT_VERSION": 1,
+            **airmass_metadata,
+            "TIME_SYSTEM": "JD_UTC",
             "SCRIPT_VERSION": SCRIPT_VERSION,
             "MODE": MODE_SINGLE_MEASUREMENT,
             "SINGLE_FIELD_ZP_METHOD": SINGLE_FIELD_ZP_METHOD_ID,
@@ -19581,6 +20176,13 @@ class LightCurveWindow(QWidget):
             aperture_settings.annulus_inner_px,
             aperture_settings.annulus_outer_px,
         )
+        field_zp_measurements, reference_airmass_metadata = calculate_result_airmass(
+            field_zp_measurements, optional_settings, self.append_log
+        )
+        metadata["AIRMASS_WARNINGS"] = json.dumps(list(dict.fromkeys(
+            json.loads(str(metadata["AIRMASS_WARNINGS"])) +
+            json.loads(str(reference_airmass_metadata["AIRMASS_WARNINGS"]))
+        )))
         field_zp_references = single_field_zp_references_from_measurements(field_zp_measurements)
         measured_field_zp_catalog_sources = catalog_source_summary(
             reference.measurement.catalog_source for reference in field_zp_references
@@ -19755,7 +20357,7 @@ class LightCurveWindow(QWidget):
             "BRIGHT_LINEARITY_MARGIN_MAG": format_csv_float(linearity_assessment.margin_mag),
         }
         field_zp_references_csv = diagnostics_dir / f"{stem}_single_field_zp_references.csv"
-        write_instrumental_photometry(instrumental_csv, measurements)
+        write_instrumental_photometry(instrumental_csv, measurements, field_zp_metadata)
         write_single_field_zp_measurement_csv(
             result_csv,
             field_zp_metadata,
@@ -20076,6 +20678,7 @@ class LightCurveWindow(QWidget):
 
         self.set_result_display_kind(single=False)
         self.append_log("Create Light Curve requested.")
+        optional_settings = load_optional_observer_result_settings()
         self.loaded_lightcurve_csv = None
         self.loaded_lightcurve_target_name = "Target"
         self.loaded_lightcurve_source_label = ""
@@ -20089,6 +20692,43 @@ class LightCurveWindow(QWidget):
         if self.reference_frame is None:
             self.fail_lightcurve_run("Run Detect Variables first.")
             self.show_lightcurve_failure_dialog("Run Detect Variables first.")
+            return
+
+        work_dir = self.work_sequence_directory()
+        if work_dir is None:
+            self.fail_lightcurve_run("Select a FITS folder first.")
+            self.show_lightcurve_failure_dialog("Select a FITS folder first.")
+            return
+        sequence_name = WORK_SEQUENCE_NAME
+        all_sequence_files = sequence_fits_files(work_dir, sequence_name)
+        if not all_sequence_files:
+            message = f"No sequence FITS files found for {sequence_name}"
+            self.fail_lightcurve_run(message)
+            self.append_log(f"ERROR: {message}")
+            self.show_lightcurve_failure_dialog(
+                "No prepared FITS files found.\n\nRun Detect Variables first.",
+            )
+            return
+        sequence_files = solved_sequence_fits_files(work_dir, sequence_name)
+        skipped_unsolved = len(all_sequence_files) - len(sequence_files)
+        if not sequence_files:
+            message = f"No plate-solved sequence FITS files found for {sequence_name}"
+            self.fail_lightcurve_run(message)
+            self.append_log(f"ERROR: {message}")
+            self.show_lightcurve_failure_dialog(
+                "No solved FITS files found.\n\nRun Detect Variables again.",
+            )
+            return
+        source_dir = self.current_source_directory()
+        try:
+            image_source, aavso_filter, origin_marker = require_uniform_series_filter_metadata(
+                sequence_files,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            self.fail_lightcurve_run(message)
+            self.append_log(f"ERROR: {message}")
+            self.show_lightcurve_failure_dialog(message)
             return
 
         try:
@@ -20179,50 +20819,11 @@ class LightCurveWindow(QWidget):
             self.show_lightcurve_failure_dialog(str(exc), critical=True)
             return
 
-        work_dir = self.work_sequence_directory()
         output_dir = self.lightcurve_output_directory()
-        if work_dir is None or output_dir is None:
+        if output_dir is None:
             self.fail_lightcurve_run("Select a FITS folder first.")
             self.show_lightcurve_failure_dialog("Select a FITS folder first.")
             return
-        sequence_name = WORK_SEQUENCE_NAME
-        all_sequence_files = sequence_fits_files(work_dir, sequence_name)
-        if not all_sequence_files:
-            message = f"No sequence FITS files found for {sequence_name}"
-            self.fail_lightcurve_run(message)
-            self.append_log(f"ERROR: {message}")
-            self.show_lightcurve_failure_dialog(
-                "No prepared FITS files found.\n\nRun Detect Variables first.",
-            )
-            return
-        sequence_files = solved_sequence_fits_files(work_dir, sequence_name)
-        skipped_unsolved = len(all_sequence_files) - len(sequence_files)
-        if not sequence_files:
-            message = f"No plate-solved sequence FITS files found for {sequence_name}"
-            self.fail_lightcurve_run(message)
-            self.append_log(f"ERROR: {message}")
-            self.show_lightcurve_failure_dialog(
-                "No solved FITS files found.\n\nRun Detect Variables again.",
-            )
-            return
-        source_dir = self.current_source_directory()
-        filter_metadata = infer_image_filter_metadata(
-            source_dir,
-            tuple(sequence_files[:3]),
-        )
-        if filter_metadata is None:
-            message = (
-                "No unambiguous supported FITS FILTER/CHANMODE metadata found. "
-                "Run CFA Channels / Stack first or use FITS files with "
-                "FILTER=L, FILTER=G or FILTER=V."
-            )
-            self.fail_lightcurve_run(message)
-            self.append_log(f"ERROR: {message}")
-            self.show_lightcurve_failure_dialog(
-                "Unsupported FITS filter metadata.\n\nRun CFA Channels / Stack first.",
-            )
-            return
-        image_source, aavso_filter, origin_marker = filter_metadata
         # Registration and plate solving may drop NCOMBINE from their work
         # copies. Provenance must therefore be checked on the selected input
         # source files, never on the temporary sequence files.
@@ -20445,6 +21046,9 @@ class LightCurveWindow(QWidget):
                 f"rejected={local_background_assessment.invalid_count}."
             )
 
+        measurements, airmass_metadata = calculate_result_airmass(
+            measurements, optional_settings, self.append_log
+        )
         measurements_before_target_blend = measurements
         measurements = apply_target_blend_assessment_to_measurements(
             measurements_before_target_blend,
@@ -20477,7 +21081,9 @@ class LightCurveWindow(QWidget):
                 measurements,
                 aperture_settings,
                 sequence_files[0],
+                optional_settings,
             )
+            result_metadata.update(airmass_metadata)
             result_metadata.update(
                 {
                     "SOURCE_PROVENANCE": source_provenance,
@@ -21056,16 +21662,16 @@ class LightCurveWindow(QWidget):
 
         update_browser_status()
 
-        table = QTableWidget(len(candidates), 11 if browser_single else 10)
+        table = QTableWidget(len(candidates), 9 if browser_single else 11)
         table.setHorizontalHeaderLabels(
             (
                 [
-                    "Star", "VSX Type", "Date", "Image folder", "Mag", "Error",
-                    "Status", "Refs", "Check Δ", "AAVSO", "BAV",
+                    "Star", "VSX Type", "Date", "Image folder", "Location", "Mag",
+                    "Status", "AAVSO", "BAV",
                 ]
                 if browser_single
                 else [
-                    "Star", "VSX Type", "Date", "Image folder", "Variant", "Rows",
+                    "Star", "VSX Type", "Date", "Image folder", "Location", "Binning", "Rows",
                     "Check", "PNG", "AAVSO", "BAV",
                 ]
             )
@@ -21076,9 +21682,9 @@ class LightCurveWindow(QWidget):
         table.verticalHeader().setVisible(False)
         table.horizontalHeader().setStretchLastSection(False)
         column_widths = (
-            (170, 90, 95, 270, 90, 70, 150, 55, 75, 65, 55)
+            (170, 90, 95, 270, 150, 90, 150, 65, 55)
             if browser_single else
-            (170, 90, 95, 270, 95, 60, 55, 65, 55, 55)
+            (170, 90, 95, 270, 150, 95, 60, 55, 65, 55, 55)
         )
         for column_index, width in enumerate(column_widths):
             table.setColumnWidth(column_index, width)
@@ -21097,11 +21703,9 @@ class LightCurveWindow(QWidget):
                     candidate.variable_type,
                     candidate.report_date,
                     candidate.source_directory_name,
+                    candidate.location,
                     str(getattr(candidate, "calibrated_mag", "")),
-                    str(getattr(candidate, "calibrated_mag_error", "")),
                     status,
-                    str(getattr(candidate, "field_reference_used", "")),
-                    str(getattr(candidate, "check_delta_mag", "")),
                     "yes" if candidate.aavso_exists else "no",
                     "yes" if candidate.bav_file_count else "no",
                 ]
@@ -21110,6 +21714,7 @@ class LightCurveWindow(QWidget):
                 candidate.variable_type,
                 candidate.report_date,
                 candidate.source_directory_name,
+                candidate.location,
                 str(getattr(candidate, "result_variant_label", "Raw")),
                 str(candidate.row_count),
                 "yes" if candidate.has_calibrated_check else "no",
@@ -21118,7 +21723,7 @@ class LightCurveWindow(QWidget):
                 str(candidate.bav_file_count),
             ]
 
-        numeric_columns = {4, 5, 7, 8} if browser_single else {5, 9}
+        numeric_columns = {5} if browser_single else {6, 10}
 
         def populate_browser_table() -> None:
             sorting_enabled = table.isSortingEnabled()
@@ -21478,47 +22083,31 @@ class LightCurveWindow(QWidget):
             return
         self.append_log(f"AAVSO apps opened: {AAVSO_APPS_URL}")
 
+    def refresh_export_observer_display(self) -> None:
+        """Show shared saved observer/site settings without export overrides."""
+
+        settings = load_optional_observer_result_settings()
+        for key, label in self.export_observer_labels.items():
+            value = settings.get(key, "")
+            if value and key in {"OBSERVER_LATITUDE", "OBSERVER_LONGITUDE"}:
+                coordinate = float(value)
+                ticks = round(abs(coordinate) * 36000)
+                degrees, remainder = divmod(ticks, 36000)
+                minutes, seconds_ticks = divmod(remainder, 600)
+                positive, negative = ("N", "S") if key == "OBSERVER_LATITUDE" else ("E", "W")
+                hemisphere = negative if coordinate < 0 else positive
+                value = f"{hemisphere} {degrees}° {minutes}′ {seconds_ticks / 10:.1f}″"
+            label.setText(value or "—")
+
     def resolved_aavso_observer_code(self) -> tuple[str, str]:
-        """Return the AAVSO observer code and the source used for export."""
+        """Use the current saved Config observer code for AAVSO export."""
 
-        observer_code = validated_aavso_observer_code(
-            self.aavso_observer_code_edit.text()
-        )
-        if self.aavso_observer_code_edit.text() != observer_code:
-            self.aavso_observer_code_edit.setText(observer_code)
-        if observer_code == getattr(self, "_aavso_bav_prefill", ""):
-            return observer_code, "BAV settings"
-        return observer_code, "Export tab"
-
-    def uppercase_aavso_observer_code_input(self, text: str) -> None:
-        """Uppercase AAVSO observer-code text as the user enters it."""
-
-        normalized = text.upper()
-        if normalized == text:
-            return
-        cursor_position = self.aavso_observer_code_edit.cursorPosition()
-        self.aavso_observer_code_edit.setText(normalized)
-        self.aavso_observer_code_edit.setCursorPosition(cursor_position)
-
-    def set_aavso_observer_code_from_bav(self, value: object) -> bool:
-        """Refresh the BAV prefill without replacing a manual Export override."""
-
-        try:
-            observer_code = validated_aavso_observer_code(value)
-        except ValueError:
-            return False
-        current_code = self.aavso_observer_code_edit.text().strip().upper()
-        previous_prefill = getattr(self, "_aavso_bav_prefill", "")
-        use_new_prefill = not current_code or current_code == previous_prefill
-        self._aavso_bav_prefill = observer_code
-        if use_new_prefill:
-            self.aavso_observer_code_edit.setText(observer_code)
-        return use_new_prefill
+        settings = load_optional_observer_result_settings()
+        return validated_aavso_observer_code(settings["OBSERVER_AAVSO"]), "Config tab"
 
     def export_aavso_report(self) -> None:
         """Export the current light curve as an AAVSO Extended Format report."""
 
-        self.set_export_process_status("creating")
         current = self.current_export_lightcurve()
         if current is None:
             self.set_export_process_status("failed")
@@ -21536,6 +22125,38 @@ class LightCurveWindow(QWidget):
             QMessageBox.warning(self, "AAVSO Export", str(exc))
             return
         result_csv, target_name = current
+        try:
+            site = app_config.select_export_site(
+                self, read_result_metadata_header(result_csv),
+                app_config.observer_result_settings(), export_name="AAVSO",
+                append_log=self.append_log,
+            )
+        except (OSError, ValueError) as exc:
+            self.set_export_process_status("failed")
+            QMessageBox.warning(self, "AAVSO Export", str(exc))
+            return
+        if site is None:
+            self.set_export_process_status("none")
+            return
+        try:
+            aavso_export_rows(result_csv)
+        except (OSError, ValueError) as exc:
+            self.set_export_process_status("failed")
+            self.append_log(f"WARNING: AAVSO export rejected: {exc}")
+            QMessageBox.warning(self, "AAVSO Export", str(exc))
+            return
+        self.run_busy_action(
+            "EXPORT_RUNNING", "Exporting AAVSO report.",
+            lambda: self.write_aavso_export(result_csv, target_name, site, observer_code, observer_code_source),
+        )
+
+    def write_aavso_export(
+        self, result_csv: Path, target_name: str, site: dict[str, str],
+        observer_code: str, observer_code_source: str,
+    ) -> None:
+        """Write a report after the handler's site and airmass preflight."""
+
+        self.set_export_process_status("creating")
         output_path = self.current_aavso_export_path(result_csv)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         has_calibrated_check = False
@@ -21548,6 +22169,7 @@ class LightCurveWindow(QWidget):
                 target_name,
                 observer_code,
                 instrument,
+                site_metadata=site,
             )
         except Exception as exc:
             self.set_export_process_status("failed")
@@ -22008,274 +22630,255 @@ class LightCurveWindow(QWidget):
         event.accept()
 
     def build_overview_html(self) -> str:
+        # Content ownership and navigation: doc/user_guidance.md.
         colors = THEME_COLORS
         return f"""
-        <html>
-        <head>
-        <style>
+        <html><head><style>
             body {{ color: {colors['text']}; }}
-            h2 {{ color: {colors['title_text']}; margin-bottom: 4px; }}
-            h3 {{ color: {colors['title_text']}; margin-top: 18px; margin-bottom: 4px; }}
-            h4 {{ color: {colors['title_text']}; margin-top: 10px; margin-bottom: 4px; }}
-            p {{ margin-top: 4px; margin-bottom: 7px; }}
-            ul {{ margin-top: 4px; margin-bottom: 8px; }}
-            li {{ margin-bottom: 3px; }}
-            .tabs {{ background-color: {colors['panel']}; }}
-            .tab {{
-                background-color: {colors['panel']};
-                border: 1px solid {colors['border']};
-                padding: 7px;
-            }}
-            .note {{
-                background-color: {colors['status']};
-                border-left: 3px solid {colors['status_accent']};
-                padding: 8px;
-                margin-top: 7px;
-                margin-bottom: 9px;
-            }}
-            code {{ color: {colors['title_text']}; }}
-        </style>
-        </head>
-        <body>
+            h2, h3 {{ color: {colors['title_text']}; }}
+            h3 {{ margin-top: 16px; margin-bottom: 4px; }}
+            p {{ margin-top: 4px; margin-bottom: 8px; }}
+            a {{ color: {colors['title_text']}; }}
+        </style></head><body>
             <h2>{WINDOW_TITLE}</h2>
-            <h3>Purpose</h3>
-            <p>SeePhot creates light curves for variable stars from prepared FITS image
-            sequences. It finds targets in VSX, measures their brightness against comparison
-            stars, and provides plots and reports for the results.</p>
-
-            <h3>Workflow and navigation</h3>
-            <h4>Using the interface</h4>
-            <p>Work through the tabs from left to right. Within each tab, follow the controls
-            from top to bottom.</p>
-            <p>The lower pane shows progress, warnings, and rejection details.<br>
-            <b>Reset</b> clears the session and temporary SeePhot files.<br>
-            <b>Close</b> exits the window.</p>
-
-            <h4>Workflow</h4>
+            <h3>Your complete photometry workflow</h3>
+            <p>Turn your observations into light curves and calibrated stellar
+            magnitudes. SeePhot brings image preparation, photometry, analysis
+            and reporting together in a guided Siril workflow—from original
+            Seestar images to results you can inspect, export and share.</p>
+            <p>Available as Python scripts for Siril on Windows, macOS and Linux.</p>
+            <h3>What you can do</h3>
             <ul>
-                <li>Prepare original CFA images by extracting channels and, optionally,
-                stacking frames in groups.</li>
-                <li>Choose <b>Light Curve</b> or <b>Single Measurement</b> mode.</li>
-                <li>Detect variable stars in the image using the AAVSO VSX catalog.</li>
-                <li>Select one or more stars for photometry.</li>
-                <li>Perform aperture photometry.</li>
-                <li>Optionally fit a brightness maximum or minimum.</li>
-                <li>Generate AAVSO report files.</li>
+                <li><b>Prepare your images:</b> extract luminance or green channels,
+                optionally stack images, and use image registration and plate solving.</li>
+                <li><b>Find and measure variable stars:</b> identify known variables
+                in your field and benefit from automatic comparison-star selection.</li>
+                <li><b>Inspect your results:</b> view light curves, measurement
+                uncertainties and quality diagnostics; optionally bin suitable
+                light curves or determine minimum/maximum times.</li>
+                <li><b>Use your observations:</b> save measurement tables and plots,
+                create AAVSO reports or use the optional BAV tools.</li>
             </ul>
-
-            <br>
-            <table class="tabs" width="100%" cellspacing="4" cellpadding="5">
-                <tr>
-                    <td class="tab" align="center"><b>Prepare</b></td>
-                    <td class="tab" align="center"><b>Variables</b></td>
-                    <td class="tab" align="center"><b>Photometry</b></td>
-                    <td class="tab" align="center"><b>Export</b></td>
-                    <td class="tab" align="center"><b>Tools</b></td>
-                </tr>
-            </table>
-
-            <h3>Prepare</h3>
-            <ul>
-                <li>Use <b>CFA Channels / Stack</b> to extract the L (luminance) or G
-                (green) channel from the original Seestar CFA images.</li>
-                <li>Optionally, stack the images in suitable groups. Use <b>Tools</b> &gt;
-                <b>Stack Profiling</b> for a grouping recommendation.</li>
-                <li>Set <b>Mode</b> to <b>Light Curve</b> or <b>Single Measurement</b>.</li>
-                <li>Click <b>Browse...</b> and select the prepared FITS folder.</li>
-                <li>Click <b>Run</b>.</li>
-            </ul>
-            <p>SeePhot registers and plate-solves the sequence, selects a reference frame,
-            and queries VSX for variables in the field.</p>
-
-            <h3>Variables</h3>
-            <ul>
-                <li>Filter the VSX list by name, type, or maximum magnitude if required.</li>
-                <li>For variable types, use one of the two Seestar presets or enter your own
-                selection.</li>
-                <li>Choose a target by double-clicking its row.</li>
-                <li>Alternatively, select the row and click <b>Select Target</b>.</li>
-                <li>Click <b>Open VSX</b> to view the selected target's catalog page.</li>
-            </ul>
-
-            <h3>Photometry</h3>
-            <p><b>Light Curve mode</b></p>
-            <ul>
-                <li>Select <b>Light Curve</b> in <b>Mode</b>.</li>
-                <li>Click <b>Create Light Curve</b>.</li>
-                <li>Comparison stars and an independent check star are selected automatically.</li>
-                <li>Click <b>Show Comparison Stars</b> to inspect the selected ensemble.</li>
-            </ul>
-            <p><b>Single Measurement mode</b></p>
-            <ul>
-                <li>Select <b>Single Measurement</b> in <b>Mode</b>.</li>
-                <li>Run the measurement for the selected target. A field zero point is determined
-                automatically; comparison stars are not used.</li>
-            </ul>
-            <p>Measurements can be rejected for:</p>
-            <ul>
-                <li>saturation, excessive high pixels, or non-positive flux;</li>
-                <li>SNR below {MIN_PHOTOMETRY_SNR:g} or magnitude error above
-                {MAX_INSTRUMENTAL_MAG_ERROR:g} mag;</li>
-                <li>a large centroid offset;</li>
-                <li>a completely modeled Gaia neighbor blend in a single measurement with at least
-                {TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag, or in a series with at least
-                {SERIES_TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag, expected target impact;</li>
-                <li>background contamination of a comparison or check star with at least
-                {REFERENCE_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact;</li>
-                <li>target background/annulus contamination with at least
-                {TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact;</li>
-                <li>a large per-series mismatch between the already measured target
-                background and the simultaneous comparison-star backgrounds;</li>
-                <li>inconsistent comparison-star zero points.</li>
-            </ul>
-            <p>Warnings remain usable and stay visible in the CSV and log. In particular,
-            target background/annulus contamination is a warning from
-            {TARGET_ANNULUS_IMPACT_WARNING_MAG:.2f} mag and invalid from
-            {TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag.
-            Missing or ambiguous Gaia evidence is also a warning; the aperture measurement
-            still runs. In a series, a completely modeled Gaia target blend is also a
-            warning from {SERIES_TARGET_BLEND_WARNING_LIMIT_MAG:.2f} mag and invalid from
-            {SERIES_TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag; its flux is not corrected.</p>
-            <div class="note">
-                The result contains only valid calibrated target points.<br>
-                Results: <code>../{RESULTS_DIRECTORY_NAME}/&lt;FITS-folder-name&gt;</code><br>
-                Files: <code>&lt;target&gt;_result_curve.csv</code> and
-                <code>&lt;target&gt;_result_curve.png</code><br>
-                Details: <code>{DIAGNOSTICS_DIRECTORY_NAME}</code>
-            </div>
-
-            <p><b>Open and plot a result</b></p>
-            <ul>
-                <li>Select <b>Light Curve</b> or <b>Single Measurement</b> in <b>Mode</b>
-                before opening results. The CSV picker and <b>Results Folder</b> browser
-                show results for the selected mode only.</li>
-                <li><b>Light Curve CSV</b> opens an existing result for the selected mode.</li>
-                <li><b>Results Folder</b> opens the result browser for the selected mode.</li>
-                <li><b>VSX</b> opens the current target's catalog page.</li>
-                <li><b>Plot Light Curve</b> opens the graph.</li>
-                <li><b>Running mean</b> adds an overlay without changing the CSV.</li>
-                <li>To remove noisy data at the beginning or end, drag the complete
-                range to keep and click <b>Trim to Selection</b>. This permanently
-                rewrites the current result CSV.</li>
-            </ul>
-
-            <div class="note">
-                Trimming clears the current Min/Max fit and deletes existing local
-                AAVSO/BAV export files after confirmation. Recreate those exports from
-                the trimmed result. The instrumental photometry CSV is unchanged.
-            </div>
-
-            <p><b>Fit a minimum or maximum</b></p>
-            <ol>
-                <li>Drag a JD range around one visible extremum.</li>
-                <li>Include both flanks and at least {EXTREMUM_MINIMUM_FIT_POINTS} points.</li>
-                <li>Keep the recommended robust cubic spline, or deliberately choose another curve model.</li>
-                <li>Click <b>Fit Min/Max</b>.</li>
-            </ol>
-            <p>The robust cubic spline chooses its smoothing automatically. A manually
-            selected model is never silently replaced by another one.</p>
-            <p>A fit is rejected if:</p>
-            <ul>
-                <li>the range is too small or unbalanced;</li>
-                <li>the curve is nearly linear;</li>
-                <li>the extremum lies outside the selection or measured magnitude range;</li>
-                <li>the selected range contains no extremum or multiple extrema;</li>
-                <li>the prominence is too weak compared with the scatter.</li>
-            </ul>
-            <p>An accepted fit is marked in the plot and recorded in the run log.
-            <b>Clear Fit</b> removes the annotation.</p>
-
-            <h3>Export</h3>
-            <p>Choose the mode and result to export. SeePhot creates the export files
-            that match the selected mode and result.</p>
-            <ol>
-                <li>Enter your AAVSO observer code.</li>
-                <li>Check the displayed telescope.</li>
-                <li>Click <b>Export AAVSO Report</b>.</li>
-            </ol>
-            <p>The telescope name is read from the Seestar FITS header and should normally be
-            correct. If necessary, correct the FITS <code>TELESCOP</code> value before creating
-            the Light Curve.</p>
-            <ul>
-                <li>Only valid calibrated rows are exported.</li>
-                <li><b>Open Folder</b> shows the report file.</li>
-                <li><b>AAVSO apps</b> opens the web tools, where you can upload the report.</li>
-            </ul>
-
-        </body>
-        </html>
+            <h3>Two measurement modes</h3>
+            <p><b>Light Curve</b> measures an image sequence using an ensemble of
+            comparison stars. <b>Single Measurement</b> determines a calibrated
+            magnitude from one image using a Field Zero Point; it does not
+            determine minimum/maximum times.</p>
+            <p>SeePhot is developed and tested primarily with Seestar images.
+            FITS images from other cameras can also be used where their image
+            format, filter information and headers meet the requirements for
+            photometry, plate solving and accurate observation times.</p>
+            <h3>Find your way</h3>
+            <p><a href="seephot:workflow">General workflow</a> shows the typical
+            Light Curve route and its corresponding tabs. Stacking and
+            minimum/maximum determination are optional; Single Measurement
+            uses a different calibration path.</p>
+            <p><a href="seephot:files">Files and folders</a> shows prepared images,
+            measurement results, diagnostics and AAVSO reports. BAV files are
+            explained separately in the <b>BAV</b> tab’s German Help.</p>
+        </body></html>
         """
 
-    def build_help_html(self) -> str:
-        """Return concise help for the tab that is currently visible."""
+    def build_help_html(self, tab_index: int | None = None) -> str:
+        """Return shared contextual help without changing the selected main tab."""
 
-        tab_index = self.tabs.currentIndex()
+        if tab_index is None:
+            tab_index = self.tabs.currentIndex()
         tab_name = self.tabs.tabText(tab_index) if tab_index >= 0 else "SeePhot"
         help_by_tab = {
             "Prepare": (
                 "<h3>Process single directory</h3>"
-                "<ul><li><b>CFA Channels / Stack</b> prepares original Seestar CFA frames "
-                "from one folder.</li>"
-                "<li>Choose channels and stack groups; see progress in the log.</li></ul>"
+                "<ul><li><b>CFA Channels / Stack</b> extracts <b>L</b> (luminance) or "
+                "<b>G</b> (green) from original Seestar CFA frames. "
+                "Channel selection is limited to L and G because SeePhot currently "
+                "supports only V-band photometry. "
+                "Already prepared FITS images can be used directly.</li>"
+                "<li>Image stacking is optional. Choose channels and stack groups in the "
+                "CFA window; its <b>Help</b> and <b>Overview</b> explain the settings. "
+                "For a grouping recommendation, use <b>Tools</b> &gt; <b>Stack Profiling</b>.</li></ul>"
                 "<h3>Process multiple directories</h3>"
                 "<ul><li><b>Batch Mode</b> prepares several CFA folders with shared settings.</li>"
-                "<li>See the status and log for the batch.</li></ul>"
+                "<li>Follow the batch progress in the status display and log. "
+                "Each run has a separate batch log; its full path appears in the log "
+                "and completion message. The last successful stack folder is selected "
+                "as input without creating a photometry result folder.</li></ul>"
                 "<h3>Detect Variables</h3>"
-                "<ul><li>Choose <b>Mode</b>, then enter an input path or use <b>Browse...</b>.</li>"
-                "<li>Check <b>Status</b> and click <b>Run</b> to prepare the input "
-                "and query VSX.</li></ul>"
+                "<ul><li>Choose <b>Light Curve</b> or <b>Single Measurement</b> in <b>Mode</b> "
+                "before selecting the input with <b>Browse...</b> "
+                "or entering its path.</li>"
+                "<li><b>Light Curve:</b> select a folder of prepared FITS images. "
+                "<b>Run</b> registers and plate-solves the sequence and selects a reference frame.</li>"
+                "<li><b>Single Measurement:</b> select one prepared FITS file.</li>"
+                "<li>Check <b>Status</b>, then click <b>Run</b>. Both modes query VSX "
+                "for variable stars in the field using the <b>VSX Query limit</b> saved in "
+                "<b>Config</b>. After a successful query, select your "
+                "target in <b>Variables</b>.</li>"
+                "<li>If preparation or the VSX query fails, check the status and log "
+                "for the reported cause before retrying.</li></ul>"
             ),
             "Variables": (
+                "<p>Run <b>Detect Variables</b> in <b>Prepare</b> to load VSX variable stars "
+                "in the image field. The <b>VSX Query limit</b> in <b>Config</b> sets the "
+                "faintest catalog maximum brightness included. After saving a change, "
+                "run <b>Detect Variables</b> again to reload the list.</p>"
                 "<h3>Filter the VSX list</h3>"
-                "<ul><li><b>Name</b> finds matching stars; <b>Type</b> limits variable "
-                "types. The preset menu fills the type field.</li>"
-                "<li><b>Mag &le;</b> sets the maximum catalog magnitude. Press Enter "
-                "in a field to update the list.</li></ul>"
+                "<ul><li><b>Name</b> matches all or part of a star's name. "
+                "<b>Type</b> accepts comma-separated types; a trailing * matches a prefix "
+                "(for example, <b>RR*,EA,EB</b>).</li>"
+                "<li><b>Short period</b> and <b>Long period</b> are suggested type filters "
+                "for V-band photometry (TG/CV) from CFA images, such as Seestar frames. "
+                "Choose a preset or enter your own types. The preset fills the Type field "
+                "and applies the filters immediately. <b>Long period</b> excludes "
+                "uncertain or alternative VSX classifications.</li>"
+                "<li><b>Mag &lt;=</b> filters only the already loaded VSX list, which is "
+                "limited by the <b>VSX Query limit</b> used when querying. "
+                "Entering a larger filter value does not load fainter stars. "
+                "Stars without a usable catalog magnitude are excluded.</li>"
+                "<li>Press Enter after editing a filter field. Choose <b>No filter</b> "
+                "to clear all three filters. If no stars are listed, check the filters "
+                "and the query status/log.</li>"
+                "<li>Applying filters clears the current target selection. "
+                "Select your target again afterwards.</li></ul>"
                 "<h3>Select a target</h3>"
-                "<ul><li>Double-click a row or click <b>Select Target</b> to use that star.</li>"
-                "<li><b>Open VSX</b> shows its catalog entry.</li></ul>"
+                "<ul><li>In either mode, double-click a row, or select a row and click "
+                "<b>Select Target</b>. Continue in <b>Photometry</b>.</li>"
+                "<li>In <b>Single Measurement</b>, selection also checks whether the target "
+                "can be measured. If <b>Run Measurement</b> stays disabled, read the "
+                "status and log for the precheck result.</li>"
+                "<li><b>Open VSX</b> opens the highlighted star's catalog page "
+                "in your browser.</li></ul>"
+                "<h3>Add a target — optional, Single Measurement only</h3>"
+                "<ul><li>Use <b>Add Target</b> if you want to measure a target that is "
+                "not, or not yet, listed in VSX. After preparing the field, choose "
+                "<b>SIMBAD identifier</b>, "
+                "<b>Gaia DR3 source ID</b> or <b>Manual RA / Dec</b>, fill in the "
+                "required fields, then click <b>Resolve and Add</b>.</li>"
+                "<li>The target must lie within the usable image area. Added targets "
+                "remain visible regardless of the filters; select the added row for "
+                "measurement. They have no <b>Open VSX</b> entry.</li></ul>"
             ),
             "Photometry": (
-                "<h3>Single target</h3>"
-                "<ul><li>Click <b>Create Light Curve</b> for the selected target.</li>"
-                "<li>Use <b>Show Comparison Stars</b> to inspect the selected stars.</li></ul>"
+                "<p>First select a target in <b>Variables</b>. The measurement action "
+                "depends on the <b>Mode</b> chosen in <b>Prepare</b>.</p>"
+                "<h3>Light Curve</h3>"
+                "<ul><li>Click <b>Create Light Curve</b> to measure the selected target "
+                "through the prepared image sequence.</li>"
+                "<li>All images used for a Light Curve must have one consistent filter/channel. "
+                "Separate mixed-filter images into different folders before preparation. "
+                "Missing or conflicting filter/channel information must be corrected; "
+                "the failure message lists the affected files.</li>"
+                "<li>SeePhot automatically selects comparison stars for calibration and "
+                "an independent check star.</li>"
+                "<li>Use <b>Show Comparison Stars</b> to inspect the selected stars. "
+                "If comparison-star selection fails, read the status and log; no "
+                "Light Curve is created.</li></ul>"
+                "<h3>Single Measurement</h3>"
+                "<ul><li>Click <b>Run Measurement</b> to measure the selected target "
+                "in the prepared FITS image. If the action is disabled, check the "
+                "target precheck status and log.</li>"
+                "<li>SeePhot automatically determines a <b>Field Zero Point</b> from "
+                "suitable catalog reference stars in the field, with an independent "
+                "check star outside the calibration fit.</li>"
+                "<li>If background cleaning is offered, choose <b>Use Cleaned Background</b> "
+                "or <b>Discard Measurement</b>.</li>"
+                "<li>Read the result status and target/check values.</li></ul>"
                 "<h3>Multiple targets</h3>"
-                "<ul><li>Click <b>Select targets</b>, choose VSX targets, and run the batch.</li>"
-                "<li>See each target's status and result CSV; <b>Show</b> opens a result.</li></ul>"
-                "<h3>Result</h3>"
-                "<ul><li>For a single measurement, see its status and target/check values.</li></ul>"
-                "<h3>Measurement quality</h3>"
-                "<ul><li>A fully modeled Gaia target-neighbor blend is invalid from "
-                f"{TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag expected impact for a single "
-                f"measurement, or {SERIES_TARGET_BLEND_ERROR_LIMIT_MAG:.2f} mag in a series. "
-                "Missing or ambiguous Gaia evidence is a warning.</li>"
-                "<li>Comparison and check-star annulus contamination is invalid from "
-                f"{REFERENCE_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact.</li>"
-                "<li>Target annulus contamination warns from "
-                f"{TARGET_ANNULUS_IMPACT_WARNING_MAG:.2f} mag and is invalid from "
-                f"{TARGET_ANNULUS_IMPACT_INVALID_MAG:.2f} mag estimated impact.</li></ul>"
+                "<ul><li>Click <b>Select targets</b> to open the batch selection. It "
+                "automatically lists the VSX stars currently visible in <b>Variables</b>, "
+                "including the selection made with its filters.</li>"
+                "<li>Tick individual stars or click <b>Select All</b>, then click "
+                "<b>Run</b> to measure them in the selected mode.</li>"
+                "<li>In Single Measurement batches, suitable background cleaning is "
+                "accepted automatically without a confirmation dialog and recorded in the log.</li>"
+                "<li>Review each target's status and result CSV. <b>Show</b> loads that "
+                "result as the current result in <b>Photometry</b> and switches to that "
+                "tab; no separate loading step is needed. Continue there with the "
+                "Light Curve plot, optional Min/Max fit or export, as supported by "
+                "the result's mode and validity.</li></ul>"
+                "<h3>Result and measurement quality</h3>"
+                "<ul><li><b>OK:</b> passed the quality checks. <b>WARNING:</b> may still "
+                "be usable; check the reported reason. <b>INVALID:</b> rejected.</li>"
+                "<li>Common rejection reasons include saturation, a weak signal, "
+                "contamination or unsuitable calibration stars.</li>"
+                "<li>Read the <b>status and log</b> for the outcome and reasons; "
+                "measurement details are recorded in the CSV files.</li>"
+                "<li>An <b>Informational Single Measurement</b> or a rejected result "
+                "may show a diagnostic magnitude but cannot be exported to AAVSO or BAV.</li>"
+                "<li>Targets added with <b>Add Target</b> can be measured locally "
+                "but cannot be exported to AAVSO or BAV.</li></ul>"
                 "<h3>Photometric Binning</h3>"
-                "<ul><li>Combine measured fluxes from eligible original images into a separate photometry result.</li>"
-                "<li>Use <b>Use Raw Curve</b> to return to the source result.</li></ul>"
-                "<h3>Plot / Fit</h3>"
-                "<ul><li>Plot the curve and optionally show its running mean.</li>"
-                "<li>Select a JD range to fit a minimum/maximum or permanently trim the CSV.</li></ul>"
+                "<ul><li>Optional, for eligible Light Curve results from unstacked "
+                "L/G images. Single Measurement, stacked inputs and already binned "
+                "results are not eligible.</li>"
+                "<li>Choose <b>N images</b> or <b>Duration</b> (seconds), enter the "
+                "group size and click <b>Create Binned Curve</b>. The measured fluxes "
+                "are combined into a separate result, which becomes active and is plotted. "
+                "The source result is unchanged.</li>"
+                "<li>Binning uses the complete instrumental measurements, even if "
+                "the source curve was trimmed. Keep the source images and instrumental "
+                "CSV available; read the displayed reason if binning is unavailable.</li>"
+                "<li>Recreating a bin variant with existing AAVSO/BAV exports requires confirmation. "
+                "<b>Regenerate</b> saves the new result, then removes that variant's old exports; "
+                "create new exports afterwards. <b>Cancel</b> keeps the previous files. "
+                "A warning identifies any stale exports that could not be removed.</li>"
+                "<li><b>Use Raw Curve</b> returns to the source result. Further plotting, "
+                "fitting and export use the active result.</li></ul>"
+                "<h3>Plot / Fit — Light Curve only</h3>"
+                "<ul><li><b>Plot Light Curve</b> displays the active result. "
+                "<b>Running mean</b> adds an overlay without changing the CSV.</li>"
+                "<li>Drag horizontally in the plot to select a JD range for trimming "
+                "or fitting.</li></ul>"
+                "<h3>Trim to Selection</h3>"
+                "<ul><li>Select the complete range to keep, click <b>Trim to Selection</b> "
+                "and review the confirmation. This permanently rewrites the active "
+                "result CSV and clears the current Min/Max fit.</li>"
+                "<li>Existing local AAVSO/BAV exports are deleted and must be recreated "
+                "from the trimmed result. If deletion fails, read the warning before "
+                "using any old export. The instrumental photometry CSV is unchanged.</li></ul>"
+                "<h3>Optional Min/Max fit</h3>"
+                "<ul><li>Select one visible minimum or maximum with both flanks. "
+                "Keep the recommended <b>Curve model</b> or choose another, then click "
+                "<b>Fit Min/Max</b>. An accepted fit is marked in the plot; read the "
+                "status and log for the result or rejection reason.</li>"
+                "<li><b>Clear Fit</b> removes the current fit and range selection "
+                "without changing the measured points. A fit is not required for "
+                "AAVSO export.</li></ul>"
                 "<h3>Open</h3>"
-                "<ul><li><b>Light Curve CSV</b> opens one result directly.</li>"
-                "<li><b>Results Folder</b> lists the results in the selected folder. "
-                "Select a result and click <b>Load</b>, or double-click its row, to open it.</li>"
+                "<ul><li>Choose <b>Light Curve</b> or <b>Single Measurement</b> in "
+                "<b>Prepare</b> &gt; <b>Mode</b> before opening a saved result. The CSV "
+                "picker and result browser show results for that mode.</li>"
+                "<li><b>Light Curve CSV</b> or <b>Measurement CSV</b> opens a result "
+                "directly.</li>"
+                "<li><b>Results Folder</b> searches the selected folder and its "
+                "subfolders recursively and lists matching results. Select a result "
+                "and click <b>Load</b> or double-click its row.</li>"
                 "<li><b>VSX</b> opens the current target's catalog page.</li></ul>"
             ),
             "Export": (
-                "<h3>Config</h3>"
-                "<ul><li>Enter your AAVSO observer code.</li>"
-                "<li>Check the telescope shown for the current result.</li></ul>"
-                "<h3>Export</h3>"
-                "<ul><li>Click <b>Export AAVSO Report</b> for the selected or opened "
-                "Light Curve result.</li>"
-                "<li>Use <b>Open Folder</b> to see the report. <b>AAVSO apps</b> "
-                "opens the web tools and copies the export folder path to the clipboard. "
-                "Paste it into the upload file chooser, then select the report file.</li></ul>"
+                "<h3>Prepare the export</h3>"
+                "<ul><li>Create or load a Light Curve or an eligible Single Measurement. "
+                "Export uses the active result, including a selected binned curve.</li>"
+                "<li>Save your <b>AAVSO code</b> in <b>Config</b> and check "
+                "the observer and site information shown in <b>Export</b>.</li>"
+                "<li>Only valid calibrated observations can be exported. Informational, "
+                "rejected and Add Target results are excluded.</li></ul>"
+                "<h3>Create the report</h3>"
+                "<ul><li>Click <b>Export AAVSO Report</b>. The report uses the observing "
+                "site saved with the result.</li>"
+                "<li>If that site differs from Config, a dialog asks for confirmation. "
+                "Choose <b>Use result site</b> if it is correct for the observation.</li>"
+                "<li>If the saved site is wrong, click <b>Cancel</b>, select the correct "
+                "site in <b>Config</b> and repeat the measurement. Changing Config does "
+                "not update existing results.</li>"
+                "<li>A failed export leaves an existing report unchanged. Correct the reported "
+                "problem and export again; no partial report is kept as the new output.</li>"
+                "<li>If export is unavailable or fails, check the status and log.</li></ul>"
+                "<h3>Upload the report</h3>"
+                "<ul><li><b>Open Folder</b> opens the report folder.</li>"
+                "<li><b>AAVSO apps</b> opens the AAVSO web tools and copies the report "
+                "folder path to the clipboard. Upload the report manually: paste the path "
+                "into the upload file chooser and select the report. SeePhot does not "
+                "upload automatically.</li></ul>"
             ),
             "QC": (
                 "Use this developer-oriented tab to run or compare focused quality checks for "
@@ -22291,11 +22894,30 @@ class LightCurveWindow(QWidget):
             ),
             "Tools": (
                 "<h3>Photometric linearity</h3>"
-                "<ul><li>Choose a solved FITS image; adjust the BP-RP range if needed.</li>"
-                "<li>See the Gaia V comparison and residual plots.</li></ul>"
+                "<p>Checks how consistently measured star brightness follows catalogue "
+                "brightness across the image's magnitude range.</p>"
+                "<ul><li><b>Choose FITS image...</b> selects an image and starts the "
+                "analysis. If needed, a temporary copy is plate-solved automatically; "
+                "the original image is unchanged.</li>"
+                "<li>Set <b>BP-RP min</b> and <b>max</b> to limit the reference-star "
+                "colour range. Click <b>Refresh</b> to repeat the analysis of the "
+                "selected image with the current settings.</li>"
+                "<li>The separate plot shows instrumental magnitudes against "
+                "Gaia-derived V estimates and their residuals. This is a diagnostic "
+                "check, not a calibrated target measurement. Read the log if no "
+                "suitable stars are available or analysis fails.</li></ul>"
                 "<h3>Stack Profiling</h3>"
-                "<ul><li>Choose an original FITS folder and click <b>Analyze Timing</b>.</li>"
-                "<li>See frame timing, grouping options, and a recommendation when available.</li></ul>"
+                "<p>Checks the timing of an image sequence to help you choose a stacking group size.</p>"
+                "<ul><li>Use <b>Browse...</b> to choose an original Seestar FITS folder.</li>"
+                "<li>Choose a <b>Mode</b>: <b>Continuous</b> groups images strictly by image "
+                "count or maximum elapsed time, without a separate break at observation gaps. "
+                "With a fixed image count, a group can span a gap of any length. "
+                "With a time limit, gaps count towards that limit.</li>"
+                "<li><b>Gap-aware</b> first splits the sequence at large observation gaps, "
+                "then applies the same grouping rules within each section. "
+                "A stack never combines images from both sides of such a gap.</li>"
+                "<li>Click <b>Analyze Timing</b> to compare grouping options and "
+                "their resulting time spacing.</li></ul>"
             ),
         }
         body = help_by_tab.get(
@@ -22303,7 +22925,7 @@ class LightCurveWindow(QWidget):
             "Use the controls on this tab from top to bottom. Progress, warnings, and errors "
             "appear in the log below.",
         )
-        tab = self.tabs.currentWidget()
+        tab = self.tabs.widget(tab_index)
         if tab is not None:
             body = tab.property("context_help_body") or body
         footer = (
@@ -22326,21 +22948,85 @@ class LightCurveWindow(QWidget):
         </body></html>
         """
 
-    def show_overview(self) -> None:
+    def build_overview_dialog(self) -> QDialog:
         dialog = QDialog(self)
         dialog.setWindowTitle(f"{APP_DISPLAY_NAME} Overview")
-        dialog.resize(780, 620)
-
+        dialog.resize(1000, 780)
         layout = QVBoxLayout(dialog)
-        text_view = QTextEdit()
-        text_view.setReadOnly(True)
+        tabs = QTabWidget()
+        text_view = QTextBrowser()
+        text_view.setOpenLinks(False)
+        text_view.setOpenExternalLinks(False)
         text_view.setHtml(self.build_overview_html())
-        layout.addWidget(text_view)
+        overview_panel = QSplitter(Qt.Orientation.Vertical)
+        overview_panel.setChildrenCollapsible(False)
+        overview_panel.addWidget(text_view)
+        help_tabs = QTabWidget()
+        help_tabs.setObjectName("overview_help_tabs")
+        help_tabs.setUsesScrollButtons(True)
+        for index in range(self.tabs.count()):
+            source_tab = self.tabs.widget(index)
+            if source_tab is getattr(self, "archive_tab", None):
+                continue
+            help_view = QTextBrowser()
+            help_view.setOpenLinks(False)
+            help_view.setOpenExternalLinks(False)
+            help_view.setHtml(self.build_help_html(index))
+            help_tabs.addTab(help_view, self.tabs.tabText(index))
+        help_panel = QWidget()
+        help_panel.setAutoFillBackground(True)
+        help_layout = QVBoxLayout(help_panel)
+        help_layout.setContentsMargins(0, 0, 0, 0)
+        help_intro = QLabel(
+            "<b>Explore the tabs</b><br>"
+            "In the main window, select a tab and click <b>Help</b> for instructions "
+            "specific to that tab. You can also preview the same Help here by "
+            "clicking a tab below.<br>"
+            "Work through each main tab from top to bottom. The lower pane shows "
+            "progress, warnings and rejection reasons. <b>Config</b> holds shared "
+            "observer and site settings."
+        )
+        help_intro.setWordWrap(True)
+        help_layout.addWidget(help_intro)
+        help_layout.addWidget(help_tabs)
+        overview_panel.addWidget(help_panel)
+        overview_panel.setStretchFactor(0, 0)
+        overview_panel.setStretchFactor(1, 1)
+        tabs.addTab(overview_panel, "Overview")
 
+        def fit_initial_overview_split() -> None:
+            # Run after the visible layout has established the text width.
+            text_view.document().setTextWidth(text_view.viewport().width())
+            text_height = (
+                int(text_view.document().size().height())
+                + 2 * text_view.frameWidth() + 4
+            )
+            available = overview_panel.height() - overview_panel.handleWidth()
+            help_minimum = max(help_panel.minimumSizeHint().height(), 180)
+            top_height = min(text_height, max(80, available - help_minimum))
+            overview_panel.setSizes([top_height, max(help_minimum, available - top_height)])
+
+        QTimer.singleShot(0, fit_initial_overview_split)
+
+        def select_image_tab(url: QUrl) -> None:
+            index = {"seephot:workflow": 1, "seephot:files": 2}.get(url.toString())
+            if index is not None:
+                tabs.setCurrentIndex(index)
+
+        text_view.anchorClicked.connect(select_image_tab)
+        for title, filename in (
+            ("General workflow", "seephot_workflow.png"),
+            ("Files and folders", "seephot_files_and_folders.png"),
+        ):
+            tabs.addTab(OverviewImagePanel(SCRIPT_DIRECTORY / filename), title)
+        layout.addWidget(tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        dialog.exec()
+        return dialog
+
+    def show_overview(self) -> None:
+        self.build_overview_dialog().exec()
 
     def show_help(self) -> None:
         tab_index = self.tabs.currentIndex()
@@ -22513,6 +23199,7 @@ def run_app() -> None:
     window.destroyed.connect(single_instance_lock.unlock)
     window.destroyed.connect(loop.quit)
     window.show()
+    QTimer.singleShot(0, window.start_version_check)
     loop.exec()
 
 

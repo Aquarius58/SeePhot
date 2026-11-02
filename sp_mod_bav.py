@@ -12,7 +12,6 @@ from __future__ import annotations
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import csv
-import json
 import math
 import os
 import re
@@ -29,6 +28,8 @@ if str(_SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIRECTORY))
 
 import sp_mod_results as _RESULT_CONTRACT
+import sp_mod_config as app_config
+import sp_mod_airmass as airmass_tools
 
 warnings.filterwarnings(
     "ignore",
@@ -38,22 +39,40 @@ warnings.filterwarnings(
 
 PLUGIN_TAB_LABEL = "BAV"
 PLUGIN_HELP_BODY = (
-    "<h3>Konfiguration</h3>"
-    "<ul><li>BAV-Kürzel, Beobachter und Standort mit Koordinaten eintragen; dann "
-    "<b>Speichern</b>.</li>"
-    "<li>Den angezeigten Teleskopwert und Konfigurationsstatus prüfen.</li></ul>"
-    "<h3>Export</h3>"
-    "<ul><li>Für das aktuelle Ergebnis <b>BAV-Dateien erzeugen</b>.</li>"
-    "<li>Die Ausgabeart sehen und die Dateien mit <b>Ordner öffnen</b> "
-    "aufrufen.</li>"
-    "<li><b>BAV Web</b> öffnet die Webseite und kopiert den Pfad zum "
-    "BAV-Dateienordner in die Zwischenablage. Den Pfad im Dateiauswahldialog "
-    "einfügen und dort die gewünschte BAV-Datei auswählen.</li></ul>"
+    "<h3>Vorbereitung</h3>"
+    "<ul><li>Das gewünschte Ergebnis in <b>Photometry</b> erzeugen oder laden. "
+    "Für eine Lichtkurve ist ein aktueller Min/Max-Fit erforderlich; "
+    "für eine gültige Einzelmessung nicht.</li>"
+    "<li>BAV- und AAVSO-Kürzel, Beobachtername sowie Standort und Koordinaten "
+    "in <b>Config</b> eintragen und mit <b>Save</b> speichern. Die im BAV-Reiter "
+    "angezeigten Beobachterdaten und die Teleskopangabe prüfen.</li>"
+    "<li>Informative oder verworfene Ergebnisse sowie mit <b>Add Target</b> "
+    "hinzugefügte Ziele können nicht exportiert werden.</li></ul>"
+    "<h3>BAV-Dateien erzeugen</h3>"
+    "<ul><li>Auf <b>BAV-Dateien erzeugen</b> klicken. Für eine Lichtkurve entstehen "
+    "Lichtkurvenblatt, MiniMax-Datei und Report; für eine Einzelmessung eine "
+    "Einzelhelligkeit-Datei. Für das Lichtkurvenblatt kann ein Kommentar "
+    "eingegeben werden.</li>"
+    "<li>Sind für den aktuellen Min/Max-Fit bereits BAV-Dateien vorhanden, werden "
+    "diese aufgelistet. Erst nach Bestätigung werden sie gelöscht und neu erzeugt.</li>"
+    "<li>Der Export verwendet den Beobachtungsstandort, der in der Ergebnisdatei "
+    "enthalten ist. Weicht dieser vom aktuell in <b>Config</b> gewählten Standort "
+    "ab, erscheint eine Bestätigungsabfrage.</li>"
+    "<li>Ist der Standort in der Ergebnisdatei falsch, den Export abbrechen, "
+    "den richtigen Standort in <b>Config</b> wählen und die Messung wiederholen. "
+    "Eine Änderung in Config korrigiert bestehende Ergebnisdateien nicht.</li>"
+    "<li>Ist der Export nicht verfügbar oder schlägt er fehl, Status und Log prüfen.</li></ul>"
+    "<h3>Dateien aufrufen und übermitteln</h3>"
+    "<ul><li><b>Ordner öffnen</b> öffnet den Ordner mit den erzeugten BAV-Dateien.</li>"
+    "<li><b>BAV Web</b> öffnet die Webseite und kopiert den Pfad des Ausgabeordners "
+    "in die Zwischenablage. Die Dateien dort manuell übermitteln. Den kopierten "
+    "Pfad bei Bedarf in den Dateiauswahldialog einfügen. SeePhot lädt keine Dateien "
+    "automatisch hoch.</li></ul>"
 )
-PLUGIN_HELP_FOOTER = "Den vollständigen Ablauf finden Sie unter <b>Overview</b>."
+PLUGIN_HELP_FOOTER = "Die allgemeine Orientierung steht unter <b>Overview</b>."
 BAV_PLUGIN_VERSION = "0.4"
 APP_NAME = "SeePhot"
-CONFIG_NAME = "bav_report.json"
+CONFIG_NAME = "config.json"
 REPORT_TABLE_HEADER_BACKGROUND = "#4472C4"
 REPORT_TABLE_HEADER_TEXT = "#FFFFFF"
 REPORT_LINK_COLOR = "#0563C1"
@@ -119,70 +138,16 @@ LIGHTCURVE_SHEET_REQUIRED_METADATA = (
 
 
 def user_config_dir() -> Path:
-    """Return an OS-appropriate per-user config directory without extra deps."""
-
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / APP_NAME
-    if os.name == "nt":
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            return Path(appdata) / APP_NAME
-        return Path.home() / "AppData" / "Roaming" / APP_NAME
-
-    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
-    if xdg_config_home:
-        return Path(xdg_config_home) / APP_NAME
-    return Path.home() / ".config" / APP_NAME
+    return app_config.user_config_dir()
 
 
 def config_path() -> Path:
-    """Return the BAV plugin config file path."""
-
-    return user_config_dir() / CONFIG_NAME
+    return app_config.config_path()
 
 
 def load_config() -> dict[str, str]:
-    """Load persisted BAV settings, falling back to defaults."""
-
-    path = config_path()
-    config = dict(DEFAULT_CONFIG)
-    if not path.exists():
-        return config
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return config
-    if not isinstance(data, dict):
-        return config
-
-    for key, default_value in DEFAULT_CONFIG.items():
-        value = data.get(key, default_value)
-        config[key] = str(value) if value is not None else ""
-    config["aavso_code"] = config["aavso_code"].strip().upper()
-    if config["telescope"] not in TELESCOPE_CHOICES:
-        config["telescope"] = DEFAULT_CONFIG["telescope"]
-    return config
-
-
-def save_config(config: dict[str, str]) -> Path:
-    """Persist BAV settings and return the written path."""
-
-    clean_config = dict(DEFAULT_CONFIG)
-    for key in DEFAULT_CONFIG:
-        clean_config[key] = str(config.get(key, "")).strip()
-    clean_config["bav_code"] = clean_config["bav_code"].upper()
-    clean_config["aavso_code"] = clean_config["aavso_code"].upper()
-    if clean_config["telescope"] not in TELESCOPE_CHOICES:
-        clean_config["telescope"] = DEFAULT_CONFIG["telescope"]
-
-    path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(clean_config, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    return path
+    """Read the shared global configuration as BAV export settings."""
+    return app_config.bav_settings()
 
 
 class BavConfigValidationError(ValueError):
@@ -194,17 +159,13 @@ class BavConfigValidationError(ValueError):
 
 
 def config_file_issue(path: Path | None = None) -> str | None:
-    """Return a user-facing problem with the persisted BAV config, if any."""
-
     path = path or config_path()
     if not path.exists():
         return f"Konfigurationsdatei fehlt: {path}"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
+        app_config.load_config(path)
+    except (OSError, ValueError) as exc:
         return f"Konfigurationsdatei kann nicht gelesen werden: {path} ({exc})"
-    if not isinstance(data, dict):
-        return f"Konfigurationsdatei hat kein gültiges Objektformat: {path}"
     return None
 
 
@@ -239,7 +200,7 @@ def _seconds_config_value(config: dict[str, str], key: str, label: str) -> float
 
 
 def _format_seconds_config(value: float) -> str:
-    return f"{value:.1f}"
+    return str(value)
 
 
 def _dms_config_to_decimal(
@@ -1408,8 +1369,8 @@ def bav_config_problem_text(
     if issues:
         parts.append("Fehlende oder ungültige Angaben:\n" + "\n".join(f"• {issue}" for issue in issues))
     parts.append(
-        "Bitte die Angaben im Bereich „Konfiguration“ ergänzen und anschließend "
-        "mit „Speichern“ sichern."
+        "Bitte die Angaben im Reiter „Config“ ergänzen und anschließend "
+        "mit „Save“ sichern."
     )
     return "\n\n".join(parts)
 
@@ -1421,17 +1382,12 @@ def persisted_config_validation_issues(path: Path | None = None) -> tuple[str, .
     if config_file_issue(path) is not None:
         return ()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return ()
-    persisted = {
-        key: str(data.get(key, "") if data.get(key, "") is not None else "")
-        for key in DEFAULT_CONFIG
-    }
-    try:
+        persisted = app_config.bav_settings(app_config.load_config(path))
         validate_config(persisted)
     except BavConfigValidationError as exc:
         return exc.issues
+    except (OSError, ValueError) as exc:
+        return (str(exc),)
     return ()
 
 
@@ -1445,9 +1401,9 @@ def bav_export_metadata(
         try:
             config = validate_config(load_config())
         except Exception:
-            # Preserve the standalone helper contract for older result CSVs
-            # that already contain complete observer metadata. The interactive
-            # BAV action always passes its current settings explicitly.
+            # Optional observer enrichment must not invalidate current result
+            # metadata. The interactive export preflights shared settings and
+            # always passes them explicitly.
             return dict(metadata)
     else:
         config = validate_config(settings)
@@ -1857,12 +1813,8 @@ def create_single_magnitudes_file(
     return output_path
 
 
-def create_single_measurement_bav_file(
-    context: dict[str, object],
-    settings: dict[str, str] | None = None,
-) -> Path:
-    """Create the BAV single-measurement file."""
-
+def single_measurement_export_data(context):
+    """Preflight the BAV single row without creating files or recalculating geometry."""
     result_csv, _target_name = _current_result_csv(context)
     if result_csv_kind(result_csv) != RESULT_KIND_SINGLE_FIELD_ZP:
         raise RuntimeError("Current result is not a Single Measurement Field-ZP CSV.")
@@ -1879,9 +1831,27 @@ def create_single_measurement_bav_file(
     row = data_rows[0]
     jd = _optional_float(row.get("jd"))
     mag = _optional_float(row.get("calibrated_mag"))
-    mag_error = _optional_float(row.get("calibrated_mag_error"))
     if not math.isfinite(jd) or not math.isfinite(mag):
         raise RuntimeError("Single Measurement CSV has no valid JD/calibrated magnitude.")
+
+    required = airmass_tools.validate_export_metadata(metadata, source=result_csv.name, export_name="BAV")
+    try:
+        luft = airmass_tools.saved_export_airmass(row, required=required)
+    except ValueError as exc:
+        raise ValueError(f"{result_csv.name}: BAV row (JD {jd:.8f}) {exc}") from exc
+    return result_csv, metadata, row, luft
+
+
+def create_single_measurement_bav_file(
+    context: dict[str, object],
+    settings: dict[str, str] | None = None,
+) -> Path:
+    """Create the BAV single-measurement file."""
+
+    result_csv, metadata, row, luft = single_measurement_export_data(context)
+    jd = _optional_float(row.get("jd"))
+    mag = _optional_float(row.get("calibrated_mag"))
+    mag_error = _optional_float(row.get("calibrated_mag_error"))
 
     settings = settings or load_config()
     bav_code = settings.get("bav_code", "").strip().upper()
@@ -1942,7 +1912,7 @@ def create_single_measurement_bav_file(
                 "na",
                 field(kname),
                 mag_text(kmag),
-                "na",
+                luft,
                 "na",
                 "na",
                 field(remark),
@@ -1960,8 +1930,6 @@ def create_bav_tab(context: dict[str, object]) -> object:
     from PyQt6.QtGui import QDesktopServices
     from PyQt6.QtWidgets import (
         QApplication,
-        QComboBox,
-        QDoubleSpinBox,
         QFormLayout,
         QGroupBox,
         QHBoxLayout,
@@ -1970,7 +1938,6 @@ def create_bav_tab(context: dict[str, object]) -> object:
         QLineEdit,
         QMessageBox,
         QPushButton,
-        QSpinBox,
         QVBoxLayout,
         QWidget,
     )
@@ -1978,191 +1945,32 @@ def create_bav_tab(context: dict[str, object]) -> object:
     tab = QWidget()
     layout = QVBoxLayout(tab)
 
-    config = load_config()
-    config_group = QGroupBox("Konfiguration")
+    config_group = QGroupBox("Beobachter und Standort")
     config_layout = QVBoxLayout(config_group)
-    form_row = QHBoxLayout()
-    left_form_layout = QFormLayout()
-    left_form_layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-    left_form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-    right_form_layout = QFormLayout()
-    right_form_layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-    right_form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-    compact_width = 190
-    medium_width = 280
-    limit_fields = sys.platform.startswith("win")
-
-    bav_code_edit = QLineEdit()
-    bav_code_edit.setAlignment(Qt.AlignmentFlag.AlignLeft)
-    bav_code_edit.setPlaceholderText("BAV-Kuerzel")
-    bav_code_edit.setText(config["bav_code"])
-    if limit_fields:
-        bav_code_edit.setFixedWidth(compact_width)
-    left_form_layout.addRow("BAV-Kuerzel:", bav_code_edit)
-
-    observer_name_edit = QLineEdit()
-    observer_name_edit.setAlignment(Qt.AlignmentFlag.AlignLeft)
-    observer_name_edit.setPlaceholderText("Name")
-    observer_name_edit.setText(config["observer_name"])
-    if limit_fields:
-        observer_name_edit.setFixedWidth(medium_width)
-    left_form_layout.addRow("Beobachter:", observer_name_edit)
-
-    aavso_code_edit = QLineEdit()
-    aavso_code_edit.setAlignment(Qt.AlignmentFlag.AlignLeft)
-    aavso_code_edit.setPlaceholderText("AAVSO-Kuerzel")
-    aavso_code_edit.setToolTip(
-        "Erforderlich: 1 bis 5 Zeichen, nur A–Z oder 0–9."
-    )
-    aavso_code_edit.setText(config["aavso_code"])
-
-    def uppercase_aavso_code_input(text: str) -> None:
-        normalized = text.upper()
-        if normalized == text:
-            return
-        cursor_position = aavso_code_edit.cursorPosition()
-        aavso_code_edit.setText(normalized)
-        aavso_code_edit.setCursorPosition(cursor_position)
-
-    aavso_code_edit.textEdited.connect(uppercase_aavso_code_input)
-    if limit_fields:
-        aavso_code_edit.setFixedWidth(compact_width)
-    left_form_layout.addRow("AAVSO-Kuerzel:", aavso_code_edit)
-
-    site_name_edit = QLineEdit()
-    site_name_edit.setAlignment(Qt.AlignmentFlag.AlignLeft)
-    site_name_edit.setPlaceholderText("Standort")
-    site_name_edit.setText(config["site_name"])
-    if limit_fields:
-        site_name_edit.setFixedWidth(medium_width)
-    left_form_layout.addRow("Standort:", site_name_edit)
-
-    def safe_config_number(
-        key: str,
-        *,
-        decimal: bool,
-        minimum: float,
-        maximum: float,
-    ) -> float:
-        fallback = float(_normalized_decimal(DEFAULT_CONFIG[key]))
-        try:
-            value = float(_normalized_decimal(config[key]))
-        except (KeyError, TypeError, ValueError):
-            return fallback
-        if not math.isfinite(value) or not minimum <= value <= maximum:
-            return fallback
-        if not decimal and not value.is_integer():
-            return fallback
-        return value
-
-    def build_coordinate_row(
-        prefix: str,
-        hemispheres: tuple[str, str],
-        max_degrees: int,
-    ) -> tuple[QHBoxLayout, QComboBox, QSpinBox, QSpinBox, QDoubleSpinBox]:
-        row = QHBoxLayout()
-        hemisphere_combo = QComboBox()
-        hemisphere_combo.addItems(hemispheres)
-        hemisphere_combo.setCurrentText(config[f"{prefix}_hemisphere"])
-        hemisphere_combo.setFixedWidth(56)
-
-        degrees_spin = QSpinBox()
-        degrees_spin.setRange(0, max_degrees)
-        degrees_spin.setValue(
-            int(
-                safe_config_number(
-                    f"{prefix}_degrees",
-                    decimal=False,
-                    minimum=0,
-                    maximum=max_degrees,
-                )
-            )
-        )
-        degrees_spin.setSuffix("°")
-        degrees_spin.setFixedWidth(70)
-
-        minutes_spin = QSpinBox()
-        minutes_spin.setRange(0, 59)
-        minutes_spin.setValue(
-            int(
-                safe_config_number(
-                    f"{prefix}_minutes",
-                    decimal=False,
-                    minimum=0,
-                    maximum=59,
-                )
-            )
-        )
-        minutes_spin.setSuffix("'")
-        minutes_spin.setFixedWidth(64)
-
-        seconds_spin = QDoubleSpinBox()
-        seconds_spin.setRange(0.0, 59.9)
-        seconds_spin.setDecimals(1)
-        seconds_spin.setSingleStep(0.1)
-        seconds_spin.setValue(
-            safe_config_number(
-                f"{prefix}_seconds",
-                decimal=True,
-                minimum=0.0,
-                maximum=59.9,
-            )
-        )
-        seconds_spin.setSuffix('"')
-        seconds_spin.setFixedWidth(82)
-
-        def sync_limits() -> None:
-            at_limit = degrees_spin.value() == max_degrees
-            minutes_spin.setMaximum(0 if at_limit else 59)
-            seconds_spin.setMaximum(0.0 if at_limit else 59.9)
-
-        degrees_spin.valueChanged.connect(sync_limits)
-        sync_limits()
-
-        row.addWidget(hemisphere_combo)
-        row.addWidget(degrees_spin)
-        row.addWidget(minutes_spin)
-        row.addWidget(seconds_spin)
-        row.addStretch(1)
-        return row, hemisphere_combo, degrees_spin, minutes_spin, seconds_spin
-
-    (
-        latitude_row,
-        latitude_hemisphere_combo,
-        latitude_degrees_spin,
-        latitude_minutes_spin,
-        latitude_seconds_spin,
-    ) = build_coordinate_row("latitude", ("N", "S"), LATITUDE_MAX_DEGREES)
-    right_form_layout.addRow("Breite:", latitude_row)
-
-    (
-        longitude_row,
-        longitude_hemisphere_combo,
-        longitude_degrees_spin,
-        longitude_minutes_spin,
-        longitude_seconds_spin,
-    ) = build_coordinate_row("longitude", ("O", "W"), LONGITUDE_MAX_DEGREES)
-    right_form_layout.addRow("Länge:", longitude_row)
-
-    telescope_label = QLabel("none")
-    telescope_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    right_form_layout.addRow("Teleskop:", telescope_label)
-    form_row.addLayout(left_form_layout)
-    form_row.addLayout(right_form_layout)
-    form_row.addStretch(1)
-    config_layout.addLayout(form_row)
-
-    action_row = QHBoxLayout()
-    save_button = QPushButton("Speichern")
-    refresh_button = QPushButton("Änd. verwerfen")
+    display_row = QHBoxLayout()
+    observer_form = QFormLayout()
+    site_form = QFormLayout()
+    display_labels = {}
+    for key, title, form in (("observer_name", "Beobachter:", observer_form),
+                             ("bav_code", "BAV-Kürzel:", observer_form),
+                             ("aavso_code", "AAVSO-Kürzel:", observer_form),
+                             ("site_name", "Standort:", observer_form),
+                             ("latitude", "Breite:", site_form),
+                             ("longitude", "Länge:", site_form)):
+        label = QLabel("—")
+        label.setObjectName("bav_display_" + key)
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        display_labels[key] = label
+        form.addRow(title, label)
+    display_row.addLayout(observer_form)
+    display_row.addLayout(site_form)
+    display_row.addStretch(1)
+    config_layout.addLayout(display_row)
     status_label = QLabel()
+    status_label.setObjectName("bav_config_status")
     status_label.setWordWrap(True)
     config_layout.addWidget(status_label)
-    config_layout.addStretch(1)
-    action_row.addStretch(1)
-    action_row.addWidget(save_button)
-    action_row.addWidget(refresh_button)
-    config_layout.addLayout(action_row)
     layout.addWidget(config_group)
 
     export_group = QGroupBox("Export")
@@ -2178,6 +1986,10 @@ def create_bav_tab(context: dict[str, object]) -> object:
     report_action_row.addWidget(bav_web_button)
     export_layout.addLayout(report_action_row)
     export_layout.addWidget(bav_files_label)
+    telescope_label = QLabel()
+    telescope_label.setObjectName("bav_export_telescope")
+    telescope_label.setVisible(False)
+    export_layout.addWidget(telescope_label)
     layout.addWidget(export_group)
 
     layout.addStretch(1)
@@ -2196,32 +2008,8 @@ def create_bav_tab(context: dict[str, object]) -> object:
             bav_files_label.setText("Lichtkurvenblatt, MiniMax-Datei, Report")
 
     def current_config() -> dict[str, str]:
-        return {
-            "bav_code": bav_code_edit.text().strip().upper(),
-            "observer_name": observer_name_edit.text().strip(),
-            "aavso_code": aavso_code_edit.text().strip().upper(),
-            "site_name": site_name_edit.text().strip(),
-            "latitude_hemisphere": latitude_hemisphere_combo.currentText().strip(),
-            "latitude_degrees": str(latitude_degrees_spin.value()),
-            "latitude_minutes": str(latitude_minutes_spin.value()),
-            "latitude_seconds": _format_seconds_config(latitude_seconds_spin.value()),
-            "longitude_hemisphere": longitude_hemisphere_combo.currentText().strip(),
-            "longitude_degrees": str(longitude_degrees_spin.value()),
-            "longitude_minutes": str(longitude_minutes_spin.value()),
-            "longitude_seconds": _format_seconds_config(longitude_seconds_spin.value()),
-            # Retain the legacy persisted value only as an instrument fallback
-            # for old/malformed FITS files. It is deliberately not editable:
-            # actual BAV outputs use TELESCOPE from the current result CSV.
-            "telescope": config["telescope"],
-        }
+        return load_config()
 
-    try:
-        initial_saved_settings: dict[str, str] | None = validate_config(config)
-    except BavConfigValidationError:
-        initial_saved_settings = None
-    saved_settings: dict[str, dict[str, str] | None] = {
-        "value": initial_saved_settings,
-    }
     config_warning_state: dict[str, str | None] = {"message": None}
 
     def checked_config(
@@ -2237,41 +2025,21 @@ def create_bav_tab(context: dict[str, object]) -> object:
         try:
             settings = validate_config(current_config())
             current_issues: tuple[str, ...] = ()
-        except BavConfigValidationError as exc:
+        except (OSError, ValueError) as exc:
             settings = None
-            current_issues = exc.issues
+            current_issues = exc.issues if isinstance(exc, BavConfigValidationError) else (str(exc),)
         issues = tuple(dict.fromkeys((*persisted_issues, *current_issues)))
         if file_problem or issues:
             return None, bav_config_problem_text(file_problem, issues)
         return settings, None
 
     def show_config_problem(message: str, *, modal: bool) -> None:
-        status_label.setText(message)
+        status_label.setText("BAV-Konfiguration unvollständig. Verwaltung im Reiter Config.")
         if config_warning_state["message"] != message:
             append_log("WARNING: BAV-Konfiguration unvollständig: " + message.replace("\n", " "))
             config_warning_state["message"] = message
         if modal:
             QMessageBox.warning(tab, "BAV-Konfiguration unvollständig", message)
-
-    def save_settings() -> None:
-        settings, problem = checked_config(require_saved_file=False)
-        if settings is None:
-            assert problem is not None
-            show_config_problem(problem, modal=True)
-            return
-
-        config_file = save_config(settings)
-        saved_settings["value"] = settings
-        bav_code_edit.setText(settings["bav_code"])
-        aavso_code_edit.setText(settings["aavso_code"])
-        update_main_observer_code = context.get(
-            "set_aavso_observer_code_from_bav"
-        )
-        if callable(update_main_observer_code):
-            update_main_observer_code(settings["aavso_code"])
-        status_label.setText(f"Gespeichert: {config_file.name}")
-        append_log(f"BAV settings saved: {config_file}")
-        refresh()
 
     def refresh() -> None:
         source_dir = _context_path(context, "get_source_directory")
@@ -2281,24 +2049,30 @@ def create_bav_tab(context: dict[str, object]) -> object:
         target_name = getattr(selected_target, "name", None) or getattr(selected_target, "identifier", None) or "-"
         current_result = _current_lightcurve(context)
         result_csv = current_result[0] if current_result is not None else None
-        telescope_label.setText(result_telescope_display_text(result_csv))
-        settings = current_config()
-        append_log(
-            "BAV tab refreshed: "
-            f"config={config_path()}, "
-            f"code={settings['bav_code'] or '-'}, "
-            f"observer={settings['observer_name'] or '-'}, "
-            f"aavso={settings['aavso_code'] or '-'}, "
-            f"site={settings['site_name'] or '-'}, "
-            f"lat={settings['latitude_hemisphere']} {settings['latitude_degrees']}° "
-            f"{settings['latitude_minutes']}' {settings['latitude_seconds']}\" , "
-            f"lon={settings['longitude_hemisphere']} {settings['longitude_degrees']}° "
-            f"{settings['longitude_minutes']}' {settings['longitude_seconds']}\" , "
-            f"telescope={telescope_label.text()}, "
-            f"source={source_dir or '-'}, "
-            f"results={results_dir or '-'}, "
-            f"target={target_name}"
-        )
+        # Show valid saved partial profiles as well; completeness is checked
+        # separately and must not hide the values already entered by the user.
+        for label in display_labels.values():
+            label.setText("—")
+        try:
+            shared = app_config.load_config()
+            bav = app_config.validate_bav_section(shared["bav"])
+            for key, value in (("observer_name", shared["observer"]["name"]),
+                               ("bav_code", bav["observer_code"]),
+                               ("aavso_code", shared["observer"]["aavso_code"]),
+                               ("site_name", app_config.current_site(shared)["name"])):
+                display_labels[key].setText(value or "—")
+            for prefix, positive, negative in (("latitude", "N", "S"), ("longitude", "O", "W")):
+                value = app_config.current_site(shared)[prefix + "_deg"]
+                if value is None:
+                    continue
+                ticks = round(abs(value) * 36000)
+                degrees, remainder = divmod(ticks, 36000)
+                minutes, seconds_ticks = divmod(remainder, 600)
+                hemisphere = negative if value < 0 else positive
+                display_labels[prefix].setText(f"{hemisphere} {degrees}° {minutes}′ {seconds_ticks / 10:.1f}″")
+        except (OSError, ValueError):
+            pass  # The config preflight below reports the full file problem.
+        append_log(f"BAV tab refreshed: config={config_path()}, telescope={result_telescope_display_text(result_csv)}, target={target_name}")
         try:
             kind = current_result_kind(context)
         except Exception:
@@ -2311,7 +2085,7 @@ def create_bav_tab(context: dict[str, object]) -> object:
             show_config_problem(problem, modal=False)
         else:
             config_warning_state["message"] = None
-            status_label.setText(f"BAV-Konfiguration vollständig: {config_path().name}")
+            status_label.setText("BAV-Konfiguration vollständig. Verwaltung im Reiter Config.")
         refresh_action_availability()
 
     def bav_export_available() -> bool:
@@ -2331,20 +2105,32 @@ def create_bav_tab(context: dict[str, object]) -> object:
                 return False
 
         settings, problem = checked_config(require_saved_file=True)
-        if problem is not None or settings != saved_settings["value"]:
+        if problem is not None:
             return False
         try:
             kind = current_result_kind(context)
-            if kind != RESULT_KIND_SINGLE_FIELD_ZP:
+            if kind == RESULT_KIND_SINGLE_FIELD_ZP:
+                single_measurement_export_data(context)
+            else:
                 _current_extremum_fit(context)
-        except Exception:
+        except Exception as exc:
+            bav_files_button.setToolTip(str(exc))
             return False
+        bav_files_button.setToolTip("")
         return True
 
     def refresh_action_availability() -> None:
         """Apply the shared app state plus BAV-specific export prerequisites."""
 
-        bav_files_button.setEnabled(bav_export_available())
+        export_available = bav_export_available()
+        bav_files_button.setEnabled(export_available)
+        telescope_label.setVisible(export_available)
+        if export_available:
+            current = _current_lightcurve(context)
+            result_csv = current[0] if current is not None else None
+            telescope_label.setText(f"Teleskop: {result_telescope_display_text(result_csv)}")
+        else:
+            telescope_label.clear()
         output_path = last_output["path"]
         folder = output_path.parent if output_path is not None else _current_output_directory(context)
         open_folder_button.setEnabled(folder is not None and folder.is_dir())
@@ -2431,6 +2217,27 @@ def create_bav_tab(context: dict[str, object]) -> object:
         result_kind = validate_bav_output_context("BAV-Dateien")
         if result_kind is None:
             return
+        try:
+            result_csv, _target_name = _current_result_csv(context)
+            metadata, _rows = read_result_curve_with_metadata(result_csv)
+            site = app_config.select_export_site(
+                tab, metadata, app_config.observer_result_settings(),
+                export_name="BAV", append_log=append_log,
+            )
+            if site is None:
+                return
+            settings = validate_config(app_config.bav_settings_with_export_site(settings, site))
+        except (OSError, ValueError, RuntimeError) as exc:
+            append_log(f"WARNING: BAV export site rejected: {exc}")
+            QMessageBox.warning(tab, "BAV", str(exc))
+            return
+        if result_kind == RESULT_KIND_SINGLE_FIELD_ZP:
+            try:
+                single_measurement_export_data(context)
+            except (OSError, ValueError, RuntimeError) as exc:
+                append_log(f"WARNING: BAV export rejected: {exc}")
+                QMessageBox.warning(tab, "BAV", str(exc))
+                return
         update_export_description(result_kind)
         pdf_comment = ""
         if result_kind != RESULT_KIND_SINGLE_FIELD_ZP:
@@ -2525,6 +2332,13 @@ def create_bav_tab(context: dict[str, object]) -> object:
             assert problem is not None
             show_config_problem(problem, modal=True)
             return
+        try:
+            if current_result_kind(context) == RESULT_KIND_SINGLE_FIELD_ZP:
+                single_measurement_export_data(context)
+        except (OSError, ValueError, RuntimeError) as exc:
+            append_log(f"WARNING: BAV export rejected: {exc}")
+            QMessageBox.warning(tab, "BAV", str(exc))
+            return
         run_busy_action = context.get("run_busy_action")
         if callable(run_busy_action):
             run_busy_action(
@@ -2585,29 +2399,14 @@ def create_bav_tab(context: dict[str, object]) -> object:
 
     def reset_plugin_view() -> bool:
         last_output["path"] = None
-        telescope_label.setText("none")
+        telescope_label.clear()
         status_label.setText("")
         refresh_action_availability()
         return True
 
-    save_button.clicked.connect(save_settings)
-    refresh_button.clicked.connect(refresh)
     bav_files_button.clicked.connect(run_bav_files_action)
     open_folder_button.clicked.connect(open_output_folder)
     bav_web_button.clicked.connect(open_bav_website)
-    for edit in (bav_code_edit, observer_name_edit, aavso_code_edit, site_name_edit):
-        edit.textChanged.connect(refresh_action_availability)
-    for combo in (latitude_hemisphere_combo, longitude_hemisphere_combo):
-        combo.currentTextChanged.connect(refresh_action_availability)
-    for spin in (
-        latitude_degrees_spin,
-        latitude_minutes_spin,
-        latitude_seconds_spin,
-        longitude_degrees_spin,
-        longitude_minutes_spin,
-        longitude_seconds_spin,
-    ):
-        spin.valueChanged.connect(refresh_action_availability)
     setattr(tab, "reset_plugin_view", reset_plugin_view)
     setattr(tab, "refresh_plugin_view", refresh)
     setattr(tab, "refresh_action_availability", refresh_action_availability)

@@ -155,14 +155,8 @@ def read_frame_timing(path: Path) -> FrameTiming:
     exposure, estimated = read_exposure_seconds(header)
     if "DATE-EXP" in header:
         start_time = parse_fits_datetime(header.get("DATE-OBS"), path, "DATE-OBS")
-        end_time = parse_fits_datetime(header.get("DATE-EXP"), path, "DATE-EXP")
-        header_exposure = (end_time - start_time).total_seconds()
-        tolerance = max(TIMING_INTERVAL_TOLERANCE_SECONDS, exposure * 0.01)
-        if header_exposure <= 0 or abs(header_exposure - exposure) > tolerance:
-            raise ValueError(
-                f"inconsistent DATE-OBS/DATE-EXP interval "
-                f"({header_exposure:g}s; EXPTIME={exposure:g}s)"
-            )
+        parse_fits_datetime(header.get("DATE-EXP"), path, "DATE-EXP")
+        end_time = start_time + timedelta(seconds=exposure)
         timing_source = "date_obs_date_exp"
     else:
         end_time = parse_fits_datetime(header.get("DATE-OBS"), path)
@@ -184,7 +178,7 @@ def timing_summary(frames: tuple[FrameTiming, ...]) -> str:
     legacy = sum(frame.timing_source == "legacy_date_obs_end" for frame in frames)
     parts: list[str] = []
     if modern:
-        parts.append(f"{modern} modern DATE-OBS start + DATE-EXP end")
+        parts.append(f"{modern} modern DATE-OBS start + EXPTIME duration")
     if legacy:
         parts.append(f"{legacy} legacy DATE-OBS end (start derived from EXPTIME)")
     return "FITS timing: " + "; ".join(parts) + "."
