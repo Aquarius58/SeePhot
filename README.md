@@ -14,6 +14,27 @@ series, while **Single Measurement** measures targets in an individual image.
 The included **SeePhot CFA** companion extracts CFA channels and stacks
 images. It can be opened from SeePhot or used independently in Siril.
 
+## Screenshots
+
+<table>
+  <tr>
+    <th width="50%" align="center" style="text-align: center;">Prepare</th>
+    <th width="50%" align="center" style="text-align: center;">Photometry</th>
+  </tr>
+  <tr>
+    <td><a href="screenshots/prepare.png"><img src="screenshots/prepare.png" alt="SeePhot Prepare tab" width="100%"></a></td>
+    <td><a href="screenshots/photometry.png"><img src="screenshots/photometry.png" alt="SeePhot Photometry tab" width="100%"></a></td>
+  </tr>
+  <tr>
+    <th align="center" style="text-align: center;">Tools</th>
+    <th align="center" style="text-align: center;">Config</th>
+  </tr>
+  <tr>
+    <td><a href="screenshots/tools.png"><img src="screenshots/tools.png" alt="SeePhot Tools tab" width="100%"></a></td>
+    <td><a href="screenshots/config.png"><img src="screenshots/config.png" alt="SeePhot Config tab" width="100%"></a></td>
+  </tr>
+</table>
+
 ## Current Release
 
 - SeePhot Main: `1.0.0`
