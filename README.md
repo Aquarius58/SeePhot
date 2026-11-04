@@ -34,7 +34,7 @@ images. It can be opened from SeePhot or used independently in Siril.
 
 ## Current Release
 
-- SeePhot Main: `1.0.0`
+- SeePhot Main: `1.0.1`
 - SeePhot CFA: `1.0.0`
 
 ## Release Bundle

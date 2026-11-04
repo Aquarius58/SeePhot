@@ -50,7 +50,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Aquarius58/SeePhot/releases/latest"
@@ -1593,16 +1593,36 @@ def read_float_header_value(header: fits.Header, keys: tuple[str, ...], label: s
 def read_plate_solve_center_deg(header: fits.Header) -> tuple[float, float]:
     """Return the approximate image center in decimal degrees.
 
+    OBJCTRA/OBJCTDEC sexagesimal strings use hours/degrees respectively.
+    Numeric values retain their existing decimal-degree interpretation.
     AstroDrive/OSL headers store ``RA`` in decimal hours while also supplying
     the same telescope position as ``RA-TEL`` in decimal degrees.  Recognize
     that relationship explicitly; otherwise retain SeePhot's established
     interpretation of numeric ``RA``/``DEC`` values as decimal degrees.
     """
 
-    ra_value = read_float_header_value(header, ("RA", "OBJCTRA"), "right ascension")
-    dec_value = read_float_header_value(header, ("DEC", "OBJCTDEC"), "declination")
+    def read_coordinate(primary_key: str, object_key: str, label: str, unit) -> float:
+        if primary_key in header:
+            return read_float_header_value(header, (primary_key,), label)
+        if object_key not in header:
+            raise KeyError(
+                f"Missing FITS header value for {label}: tried {primary_key}, {object_key}"
+            )
+        value = header[object_key]
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            try:
+                return float(Angle(value, unit=unit).degree)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Header key {object_key} is not a valid {label}: {value!r}"
+                ) from exc
 
-    if "RA-TEL" in header and "DEC-TEL" in header:
+    ra_value = read_coordinate("RA", "OBJCTRA", "right ascension", u.hourangle)
+    dec_value = read_coordinate("DEC", "OBJCTDEC", "declination", u.deg)
+
+    if all(key in header for key in ("RA", "DEC", "RA-TEL", "DEC-TEL")):
         try:
             telescope_ra_deg = float(header["RA-TEL"])
             telescope_dec_deg = float(header["DEC-TEL"])

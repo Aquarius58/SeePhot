@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 - 2026-11-04
+
+- Fixed plate-solving coordinate hints for FITS headers containing
+  sexagesimal OBJCTRA and OBJCTDEC values.
+- Adjusted Config observer field widths to keep labels readable.
+- Updated the Config screenshot in the README.
+
 ## 1.0.0 - 2026-11-02
 
 - Added shared observer and multi-site configuration, including site

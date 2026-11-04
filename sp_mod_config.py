@@ -504,14 +504,17 @@ def create_config_tab(context: dict | None = None):
         if section == "site":
             edit.setFixedWidth(280)
         elif key == "name":
-            edit.setFixedWidth(180)
+            edit.setFixedWidth(140)
         else:
-            edit.setFixedWidth(edit.fontMetrics().horizontalAdvance("MMMMMM") + 20)
+            code_sample = "MMMMM" if section == "observer" else "MMM"
+            edit.setFixedWidth(edit.fontMetrics().horizontalAdvance(code_sample) + 20)
         edits[section, key] = edit
         if section == "site":
             coordinates_form.addRow(label, edit)
         else:
-            observer_row.addWidget(QLabel(label))
+            field_label = QLabel(label)
+            field_label.setMinimumWidth(field_label.sizeHint().width())
+            observer_row.addWidget(field_label)
             observer_row.addWidget(edit)
     observer_row.addStretch(1)
     site_selector = QComboBox()
