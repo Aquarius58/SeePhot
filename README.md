@@ -92,6 +92,12 @@ Run SeePhot inside Siril's Python environment.
 
 ## Installation
 
+> [!IMPORTANT]
+> **You should definitely install the local Gaia DR3 catalog required for plate solving.**
+> Siril normally retrieves this star catalog from the **VizieR online database**. These queries currently time out, blocking plate solving and the SeePhot workflow.
+>
+> In Siril: **Scripts → Python Scripts → Core → Siril_Catalog_Installer.py → Astrometry Catalog → Install**. The installer configures Siril automatically.
+
 1. Download **Source code (zip)** from the **Latest** release on the
    [SeePhot releases page](https://github.com/Aquarius58/SeePhot/releases)
    and extract the archive.
