@@ -92,24 +92,27 @@ Run SeePhot inside Siril's Python environment.
 
 ## Installation
 
+1. Download and install [Siril](https://siril.org/download/), available for
+   **Windows, macOS, and Linux**.
+2. Download **Source code (zip)** from the **Latest** release on the
+   [SeePhot releases page](https://github.com/Aquarius58/SeePhot/releases)
+   and extract the archive.
+3. Create a separate folder on your drive for the SeePhot scripts,
+   for example `SeePhot`.
+4. Copy all `.py` files and both `.png` images from the archive into
+   that folder.
+5. In Siril's settings, add this folder as an additional Python script
+   directory.
+6. The folder name you chose, for example **SeePhot**, then appears
+   automatically in Siril's **Python Scripts** menu. Open it and start
+   `SeePhot_Main.py`.
+7. Install the local catalog as described below.
+
 > [!IMPORTANT]
 > **You should definitely install the local Gaia DR3 catalog required for plate solving.**
 > Siril normally retrieves this star catalog from the **VizieR online database**. These queries currently time out, blocking plate solving and the SeePhot workflow.
 >
 > In Siril: **Scripts → Python Scripts → Core → Siril_Catalog_Installer.py → Astrometry Catalog → Install**. The installer configures Siril automatically.
-
-1. Download **Source code (zip)** from the **Latest** release on the
-   [SeePhot releases page](https://github.com/Aquarius58/SeePhot/releases)
-   and extract the archive.
-2. Create a separate folder on your drive for the SeePhot scripts,
-   for example `SeePhot`.
-3. Copy all `.py` files and both `.png` images from the archive into
-   that folder.
-4. In Siril's settings, add this folder as an additional Python script
-   directory.
-5. The folder name you chose, for example **SeePhot**, then appears
-   automatically in Siril's **Python Scripts** menu. Open it and start
-   `SeePhot_Main.py`.
 
 `SeePhot_Main.py` and `SeePhot_CFA.py` are the executable applications.
 Files beginning with `sp_mod_` are support modules and should not be
