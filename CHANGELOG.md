@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0 - 2026-11-17
+
+- Added pattern-based selection of direct subfolders for CFA/stack batches,
+  with a preview and selectable matches.
+- Recognized IRCUT and Luminance FITS filter names as L (CV), and Green
+  as G (TG).
+- Kept Single Measurement results, diagnostics, and exports separate
+  for each target, source FITS, and filter.
+- Added confirmation before replacing an existing Single Measurement,
+  recovery of previous measurement files on replacement errors, and
+  cleanup of outdated local exports after successful replacement.
+- Skipped existing Single Measurement results in multi-target batches.
+- Added HJD (UTC) to fresh and loaded Single Measurement summaries.
+- Added observation date/time, filter, and full-path tooltips to the
+  Single Measurement result browser.
+- Enforced the selected measurement mode when loading results and hid
+  light-curve plotting and binning controls for Single Measurement results.
+- Updated contextual Help and the Files and folders Overview image.
+
 ## 1.0.1 - 2026-11-04
 
 - Fixed plate-solving coordinate hints for FITS headers containing

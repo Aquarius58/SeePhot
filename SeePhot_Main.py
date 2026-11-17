@@ -50,7 +50,7 @@ warnings.filterwarnings(
 import sirilpy as s  # noqa: E402
 
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.2.0"
 SIRILPY_REQUIRES = ">=1.0.13"
 APP_DISPLAY_NAME = "SeePhot"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Aquarius58/SeePhot/releases/latest"
@@ -474,7 +474,7 @@ ensure_importable_module("pyvo")
 import astropy.units as u  # noqa: E402
 import numpy as np  # noqa: E402
 import pyvo  # noqa: E402
-from astropy.coordinates import Angle, SkyCoord  # noqa: E402
+from astropy.coordinates import Angle, EarthLocation, SkyCoord  # noqa: E402
 from astropy.io import fits  # noqa: E402
 from astropy.io.fits.verify import VerifyWarning  # noqa: E402
 from astropy.time import Time  # noqa: E402
@@ -1361,13 +1361,16 @@ def scan_fits_directory(directory: Path) -> InputScan:
 
 
 def normalize_image_source(value: object) -> str:
-    """Return canonical source channel L/G/V from FITS header metadata."""
+    """Return canonical L/G/V, including explicit mono filter names."""
 
     text = str(value or "").strip().upper()
     if not text:
         return ""
     if text in IMAGE_SOURCE_TO_AAVSO_FILTER:
         return text
+    mono_filter_sources = {"IRCUT": "L", "LUMINANCE": "L", "GREEN": "G"}
+    if text in mono_filter_sources:
+        return mono_filter_sources[text]
     if "CFA_L" in text:
         return "L"
     if "CFA_G" in text:
@@ -6247,6 +6250,7 @@ def local_derived_export_files(
                 path.suffix.casefold() == ".pdf"
                 or path.name.casefold().endswith("_minimax.txt")
                 or path.name.casefold().endswith("_report.txt")
+                or path.name.casefold().endswith("_einzelhelligkeit.txt")
             )
         )
 
@@ -14656,6 +14660,7 @@ class LightCurveWindow(QWidget):
         self.loaded_lightcurve_target_name = "Target"
         self.loaded_lightcurve_source_label = ""
         self.current_result_origin = "none"
+        self.result_display_single = False
         self.varstars_status = "none"
         self.last_vsx_failure_message = ""
         self.comp_status = "none"
@@ -14971,6 +14976,7 @@ class LightCurveWindow(QWidget):
 
         open_lightcurve_layout.addStretch(1)
         binning_group = QGroupBox("Photometric Binning")
+        self.binning_group = binning_group
         binning_layout = QHBoxLayout(binning_group)
         self.binning_mode_combo = QComboBox()
         self.binning_mode_combo.addItem("N images", "count")
@@ -15701,14 +15707,15 @@ class LightCurveWindow(QWidget):
             ),
             "export_aavso": not busy and has_result and not aavso_problem,
             "open_aavso_folder": not busy and has_aavso_folder,
-            "create_binned_curve": not busy and can_create_binned_curve,
-            "use_raw_curve": not busy and can_use_raw_curve,
+            "create_binned_curve": not busy and not self.result_display_single and can_create_binned_curve,
+            "use_raw_curve": not busy and not self.result_display_single and can_use_raw_curve,
             "bav_export_base": not busy and has_result,
         }
 
     def refresh_action_availability(self) -> None:
         """Apply the central availability state to main and opted-in module actions."""
 
+        self.refresh_result_display()
         state = self.action_availability()
         buttons = {
             "prepare_button": "prepare",
@@ -16579,6 +16586,27 @@ class LightCurveWindow(QWidget):
         self.single_result_status_label.setText(text)
         self.single_result_status_label.setStyleSheet(style)
 
+    def single_result_hjd_text(self, jd: float | None, metadata: dict[str, str]) -> str:
+        """Format HJD_UTC using the result's position/site, as in BAV reports."""
+
+        try:
+            if jd is None or not np.isfinite(jd) or jd <= 0:
+                raise ValueError("measurement JD is missing or invalid")
+            latitude = float(metadata["OBSERVER_LATITUDE"])
+            longitude = float(metadata["OBSERVER_LONGITUDE"])
+            if not (np.isfinite(latitude) and np.isfinite(longitude)
+                    and -90 <= latitude <= 90 and -180 <= longitude <= 180):
+                raise ValueError("observer latitude/longitude are invalid")
+            location = EarthLocation(lat=latitude * u.deg, lon=longitude * u.deg, height=0 * u.m)
+            target = SkyCoord(metadata["OBJECT_RA"], metadata["OBJECT_DEC"],
+                              unit=(u.hourangle, u.deg), frame="icrs")
+            time_utc = Time(jd, format="jd", scale="utc", location=location)
+            hjd = time_utc.utc + time_utc.light_travel_time(target, "heliocentric")
+            return f"{hjd.jd:.6f}"
+        except Exception as exc:
+            self.append_log(f"Single Measurement HJD unavailable: {exc}")
+            return "n/a"
+
     def set_loaded_single_result_summary(self, result_csv: Path, rows: list[dict[str, str]]) -> None:
         """Show a compact summary for a loaded Single Measurement result CSV."""
 
@@ -16609,8 +16637,12 @@ class LightCurveWindow(QWidget):
             quality_status = QUALITY_STATUS_INVALID
         self.set_single_result_quality_banner(quality_status, quality_flag)
         target_prefix = "Target: " if row_valid else "Diagnostic value only: "
+        hjd = self.single_result_hjd_text(
+            first_result_row_float(row, "jd"), read_result_metadata_header(result_csv)
+        )
         self.single_result_target_label.setText(
-            f"{target_prefix}{mag} +/- {err} mag, SNR={target_snr}, refs={references}, "
+            f"{target_prefix}{mag} +/- {err} mag, HJD={hjd}\n"
+            f"SNR={target_snr}, refs={references}, "
             f"ZP scatter={zp_scatter} mag, filter={aavso_filter} ({image_source})"
         )
 
@@ -16636,6 +16668,7 @@ class LightCurveWindow(QWidget):
         check_delta_mag: float | None,
         zero_point_scatter: float,
         valid_comp_count: int,
+        metadata: dict[str, str],
         reference_label: str = "comps",
     ) -> None:
         """Show the important single-measurement result values in the GUI."""
@@ -16659,6 +16692,7 @@ class LightCurveWindow(QWidget):
 
         self.single_result_target_label.setText(
             f"{target_prefix}{calibrated_mag:.4f} +/- {calibrated_error:.4f} mag, "
+            f"HJD={self.single_result_hjd_text(target.jd, metadata)}\n"
             f"SNR={target.snr:.1f}, {reference_label}={valid_comp_count}, "
             f"ZP scatter={zero_point_scatter:.4f} mag, "
             f"B-V={format_optional_float(target_bv)}, g-r={format_optional_float(target_gr)}"
@@ -16904,10 +16938,20 @@ class LightCurveWindow(QWidget):
     def set_result_display_kind(self, *, single: bool) -> None:
         """Show controls for the loaded/created result without changing acquisition mode."""
 
-        if hasattr(self, "single_result_group"):
-            self.single_result_group.setVisible(single)
-        if hasattr(self, "plot_lightcurve_group"):
-            self.plot_lightcurve_group.setVisible(not single)
+        self.result_display_single = single
+        self.refresh_result_display()
+
+    def refresh_result_display(self) -> None:
+        """Apply the stored result context, independently of acquisition mode/busy state."""
+
+        for name, visible in (
+            ("single_result_group", self.result_display_single),
+            ("plot_lightcurve_group", not self.result_display_single),
+            ("binning_group", not self.result_display_single),
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setVisible(visible)
 
     def clear_comparison_star_state(self) -> None:
         """Clear series-only comparison/check-star state."""
@@ -16973,6 +17017,7 @@ class LightCurveWindow(QWidget):
         self.lightcurve_span_selector = None
         self.lightcurve_fit_artists = []
         self.lightcurve_canvas.draw()
+        self.set_result_display_kind(single=self.photometry_mode == MODE_SINGLE_MEASUREMENT)
         self.refresh_action_availability()
         self.update_overall_status()
 
@@ -19336,7 +19381,38 @@ class LightCurveWindow(QWidget):
             return None
         if self.lightcurve_results_module is None:
             self.lightcurve_results_module = load_lightcurve_results_module()
-        return Path(self.lightcurve_results_module.single_measurement_result_path(output_dir, stem))
+        source_file = self.current_source_fits_file()
+        if source_file is None:
+            return None
+        filter_metadata = infer_image_filter_metadata(source_file.parent, (source_file,))
+        if filter_metadata is None:
+            return None
+        return Path(self.lightcurve_results_module.single_measurement_result_path(
+            output_dir, stem, source_file, filter_metadata[1],
+        ))
+
+    def confirm_single_measurement_replacement(self, result_csv: Path) -> bool:
+        """Require an explicit decision before replacing the same observation."""
+
+        if not result_csv.exists():
+            return True
+        if self.batch_tab is not None and getattr(self.batch_tab, "running", False):
+            self.show_single_measurement_warning(
+                f"Single Measurement already exists; unchanged: {result_csv}. "
+                "Rerun this measurement individually to confirm replacement."
+            )
+            return False
+        answer = QMessageBox.question(
+            self, "Replace Single Measurement?",
+            "A result for this star, source FITS and filter already exists.\n\n"
+            f"{result_csv}\n\n"
+            "Replace the measurement and its diagnostics? Existing local AAVSO/BAV "
+            "exports for this measurement will be removed after a successful replacement "
+            "and must be exported again.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def show_single_measurement_warning(
         self,
@@ -19985,15 +20061,31 @@ class LightCurveWindow(QWidget):
             message = (
                 "No unambiguous supported FITS FILTER/CHANMODE metadata found. "
                 "Run CFA Channels / Stack first or use a FITS file with "
-                "FILTER=L, FILTER=G or FILTER=V."
+                "FILTER=L, IRCUT or Luminance (CV), G or Green (TG), or V (Johnson V)."
             )
             self.set_result_status("failed")
             self.append_log(f"ERROR: {message}")
             self.show_single_measurement_warning(
-                "Unsupported FITS filter metadata.\n\nRun CFA Channels / Stack first."
+                "Unsupported FITS filter metadata.\n\n" + message
             )
             return
         image_source, aavso_filter, origin_marker = filter_metadata
+        if source_file is None:
+            self.set_result_status("failed")
+            self.show_single_measurement_warning("Select a source FITS file first.")
+            return
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        result_csv = Path(self.lightcurve_results_module.single_measurement_result_path(
+            output_dir, stem, source_file, aavso_filter,
+        ))
+        if not self.confirm_single_measurement_replacement(result_csv):
+            self.set_result_status("failed")
+            self.append_log("Single Measurement replacement cancelled; existing files unchanged.")
+            return
+        replaced_exports = local_derived_export_files(
+            result_csv, self.selected_target.catalog_object.name
+        ) if result_csv.exists() else ()
         self.append_log(
             f"Single photometry source/filter: image_source={image_source}, "
             f"AAVSO filter={aavso_filter}."
@@ -20096,16 +20188,7 @@ class LightCurveWindow(QWidget):
         calibrated_error: float
         check_calibrated_mag: float | None = None
         check_delta_mag: float | None = None
-        diagnostics_dir = diagnostics_directory_for_results_dir(output_dir)
-        if self.lightcurve_results_module is None:
-            self.lightcurve_results_module = load_lightcurve_results_module()
-        result_csv = Path(
-            self.lightcurve_results_module.single_measurement_result_path(
-                output_dir,
-                stem,
-            )
-        )
-        instrumental_csv = diagnostics_dir / f"{stem}_single_instrumental_photometry.csv"
+        instrumental_csv = self.lightcurve_results_module.instrumental_csv_for_result_csv(result_csv)
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", FITSFixedWarning)
@@ -20376,25 +20459,44 @@ class LightCurveWindow(QWidget):
             "BRIGHT_LINEARITY_TARGET_MAG": format_csv_float(linearity_assessment.target_catalog_mag),
             "BRIGHT_LINEARITY_MARGIN_MAG": format_csv_float(linearity_assessment.margin_mag),
         }
-        field_zp_references_csv = diagnostics_dir / f"{stem}_single_field_zp_references.csv"
-        write_instrumental_photometry(instrumental_csv, measurements, field_zp_metadata)
-        write_single_field_zp_measurement_csv(
-            result_csv,
-            field_zp_metadata,
-            target_measurement,
-            check_measurement,
-            field_zp_fit,
-            calibrated_mag,
-            calibrated_error,
-            check_calibrated_mag,
-            check_delta_mag,
-        )
-        write_single_field_zp_references_csv(
-            field_zp_references_csv,
-            field_zp_metadata,
-            field_zp_references,
-            field_zp_fit,
-        )
+        field_zp_references_csv = self.lightcurve_results_module.single_references_csv_for_result_csv(result_csv)
+        # Finish all three CSVs before replacing any previous measurement files.
+        with tempfile.TemporaryDirectory(prefix=".single-", dir=output_dir) as staging_name:
+            staging_dir = Path(staging_name)
+            staged_instrumental = staging_dir / instrumental_csv.name
+            staged_result = staging_dir / result_csv.name
+            staged_references = staging_dir / field_zp_references_csv.name
+            write_instrumental_photometry(staged_instrumental, measurements, field_zp_metadata)
+            write_single_field_zp_measurement_csv(
+                staged_result,
+                field_zp_metadata,
+                target_measurement,
+                check_measurement,
+                field_zp_fit,
+                calibrated_mag,
+                calibrated_error,
+                check_calibrated_mag,
+                check_delta_mag,
+            )
+            write_single_field_zp_references_csv(
+                staged_references,
+                field_zp_metadata,
+                field_zp_references,
+                field_zp_fit,
+            )
+            self.lightcurve_results_module.commit_single_measurement_files((
+                (staged_instrumental, instrumental_csv),
+                (staged_references, field_zp_references_csv),
+                (staged_result, result_csv),
+            ))
+        for export_path in replaced_exports:
+            try:
+                export_path.unlink(missing_ok=True)
+            except OSError as exc:
+                self.append_log(f"WARNING: Could not remove outdated export {export_path}: {exc}")
+                self.show_single_measurement_warning(
+                    f"Could not remove outdated export:\n{export_path}\n{exc}", title="Outdated export"
+                )
         if informational_only:
             self.current_result_origin = "single"
             self.loaded_lightcurve_csv = result_csv
@@ -20413,6 +20515,7 @@ class LightCurveWindow(QWidget):
                 check_delta_mag,
                 zero_point_scatter,
                 field_zp_fit.used_count,
+                field_zp_metadata,
                 "refs",
             )
             self.lightcurve_status_label.setText(
@@ -20447,6 +20550,7 @@ class LightCurveWindow(QWidget):
                 check_delta_mag,
                 zero_point_scatter,
                 field_zp_fit.used_count,
+                field_zp_metadata,
                 "refs",
             )
             self.lightcurve_status_label.setText(
@@ -20506,6 +20610,7 @@ class LightCurveWindow(QWidget):
             check_delta_mag,
             zero_point_scatter,
             reference_count,
+            field_zp_metadata,
             "refs",
         )
         self.lightcurve_status_label.setText(
@@ -21337,6 +21442,7 @@ class LightCurveWindow(QWidget):
         if busy_message is not None:
             raise RuntimeError(busy_message)
         path = Path(result_csv)
+        self.validate_result_mode(path)
         result_metadata = read_result_metadata_header(path)
         if self.lightcurve_results_module is None:
             self.lightcurve_results_module = load_lightcurve_results_module()
@@ -21349,6 +21455,7 @@ class LightCurveWindow(QWidget):
         self.set_selected_target_labels(target_name)
         self.loaded_lightcurve_source_label = path.parent.name
         self.current_result_origin = "loaded"
+        self.set_result_display_kind(single=False)
         self.current_exports.clear()
         self.set_result_status("loaded")
         self.export_status_label.setText(f"Current export source: {path}")
@@ -21416,12 +21523,11 @@ class LightCurveWindow(QWidget):
         if self.photometry_mode == MODE_SINGLE_MEASUREMENT:
             title = "Open Single Measurement CSV"
             file_filter = (
-                "Single Measurement CSV (*_single_field_zp_measurement.csv *.csv);;"
-                "All CSV Files (*.csv)"
+                "Single Measurement CSV (*_single_field_zp_measurement.csv)"
             )
         else:
             title = "Open Light Curve CSV"
-            file_filter = "Light Curve CSV (*_result_curve*.csv result_curve.csv *.csv)"
+            file_filter = "Light Curve CSV (*_result_curve*.csv result_curve.csv *_diagnostic_curve.csv)"
         selected, _ = QFileDialog.getOpenFileName(
             self,
             title,
@@ -21466,6 +21572,15 @@ class LightCurveWindow(QWidget):
     def _open_result_browser(self, *, bav_only: bool) -> None:
         """Select a result CSV from a scanned folder, optionally requiring BAV files."""
 
+        if bav_only and self.selected_photometry_mode() != MODE_LIGHTCURVE:
+            QMessageBox.information(
+                self,
+                "BAV Results",
+                "The BAV result browser lists Light Curve results. "
+                "Select Light Curve in Prepare > Mode before opening it. "
+                "For Single Measurement results, use Photometry > Results Folder.",
+            )
+            return
         browser_single = (
             not bav_only and self.selected_photometry_mode() == MODE_SINGLE_MEASUREMENT
         )
@@ -21682,11 +21797,11 @@ class LightCurveWindow(QWidget):
 
         update_browser_status()
 
-        table = QTableWidget(len(candidates), 9 if browser_single else 11)
+        table = QTableWidget(len(candidates), 10 if browser_single else 11)
         table.setHorizontalHeaderLabels(
             (
                 [
-                    "Star", "VSX Type", "Date", "Image folder", "Location", "Mag",
+                    "Star", "VSX Type", "Date / time (UTC)", "Image folder", "Location", "Filter", "Mag",
                     "Status", "AAVSO", "BAV",
                 ]
                 if browser_single
@@ -21701,8 +21816,9 @@ class LightCurveWindow(QWidget):
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.verticalHeader().setVisible(False)
         table.horizontalHeader().setStretchLastSection(False)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         column_widths = (
-            (170, 90, 95, 270, 150, 90, 150, 65, 55)
+            (150, 80, 170, 210, 120, 55, 90, 130, 65, 55)
             if browser_single else
             (170, 90, 95, 270, 150, 95, 60, 55, 65, 55, 55)
         )
@@ -21721,9 +21837,10 @@ class LightCurveWindow(QWidget):
                 return [
                     candidate.target_name,
                     candidate.variable_type,
-                    candidate.report_date,
+                    candidate.observation_utc or candidate.report_date,
                     candidate.source_directory_name,
                     candidate.location,
+                    candidate.aavso_filter,
                     str(getattr(candidate, "calibrated_mag", "")),
                     status,
                     "yes" if candidate.aavso_exists else "no",
@@ -21743,7 +21860,7 @@ class LightCurveWindow(QWidget):
                 str(candidate.bav_file_count),
             ]
 
-        numeric_columns = {5} if browser_single else {6, 10}
+        numeric_columns = {6} if browser_single else {6, 10}
 
         def populate_browser_table() -> None:
             sorting_enabled = table.isSortingEnabled()
@@ -21755,6 +21872,10 @@ class LightCurveWindow(QWidget):
                         value, numeric=column_index in numeric_columns
                     )
                     item.setData(Qt.ItemDataRole.UserRole, row_index)
+                    item.setToolTip(
+                        f"Source FITS: {candidate.source_fits or 'unavailable'}\n"
+                        f"Result CSV: {candidate.result_csv}"
+                    )
                     table.setItem(row_index, column_index, item)
             table.setSortingEnabled(sorting_enabled)
 
@@ -21881,6 +22002,23 @@ class LightCurveWindow(QWidget):
         )
         dialog.show()
 
+    def validate_result_mode(self, result_csv: Path) -> None:
+        """Reject results outside the selected measurement mode before changing UI state."""
+
+        if self.lightcurve_results_module is None:
+            self.lightcurve_results_module = load_lightcurve_results_module()
+        result_kind = self.lightcurve_results_module.result_kind_for_csv(result_csv)
+        if result_kind is None and result_metadata_is_diagnostic(read_result_metadata_header(result_csv)):
+            result_kind = MODE_LIGHTCURVE
+        if result_kind not in {MODE_LIGHTCURVE, MODE_SINGLE_MEASUREMENT}:
+            raise ValueError("CSV is neither a Light Curve nor a Single Measurement result")
+        if result_kind != self.selected_photometry_mode():
+            required_mode = "Single Measurement" if result_kind == MODE_SINGLE_MEASUREMENT else "Light Curve"
+            raise ValueError(
+                f"This CSV is a {required_mode} result. "
+                f"Select {required_mode} in Prepare > Mode before loading it."
+            )
+
     def set_current_lightcurve_from_plugin(
         self,
         result_csv: Path | str,
@@ -21897,6 +22035,7 @@ class LightCurveWindow(QWidget):
         path = Path(result_csv).expanduser()
         if not path.exists():
             raise RuntimeError(f"Result CSV not found: {path}")
+        self.validate_result_mode(path)
         name = str(target_name or "").strip()
         result_metadata = read_result_metadata_header(path)
         if self.lightcurve_results_module is None:
@@ -22718,6 +22857,13 @@ class LightCurveWindow(QWidget):
                 "For a grouping recommendation, use <b>Tools</b> &gt; <b>Stack Profiling</b>.</li></ul>"
                 "<h3>Process multiple directories</h3>"
                 "<ul><li><b>Batch Mode</b> prepares several CFA folders with shared settings.</li>"
+                "<li>Use <b>Add Folder</b> for individual folders or <b>Add by Pattern</b> "
+                "for several direct subfolders of a base folder. Enter a folder name pattern "
+                "such as <b>M31*</b> or <b>*</b> for all, then click <b>Find Folders</b>. "
+                "Matching ignores letter case; <b>*</b> matches any number of characters "
+                "and <b>?</b> matches one. Check the desired matches and click "
+                "<b>Add Selected</b>; folders already listed are skipped. "
+                "Review channels and stack groups before clicking <b>Start All</b>.</li>"
                 "<li>Follow the batch progress in the status display and log. "
                 "Each run has a separate batch log; its full path appears in the log "
                 "and completion message. The last successful stack folder is selected "
@@ -22780,6 +22926,10 @@ class LightCurveWindow(QWidget):
             "Photometry": (
                 "<p>First select a target in <b>Variables</b>. The measurement action "
                 "depends on the <b>Mode</b> chosen in <b>Prepare</b>.</p>"
+                "<p>FITS filter names <b>IRCUT</b> and <b>Luminance</b> are treated as "
+                "<b>L</b> (AAVSO <b>CV</b>); <b>Green</b> is treated as <b>G</b> "
+                "(AAVSO <b>TG</b>). Unknown or conflicting filter/channel values "
+                "and missing filter/channel information are rejected.</p>"
                 "<h3>Light Curve</h3>"
                 "<ul><li>Click <b>Create Light Curve</b> to measure the selected target "
                 "through the prepared image sequence.</li>"
@@ -22801,7 +22951,13 @@ class LightCurveWindow(QWidget):
                 "check star outside the calibration fit.</li>"
                 "<li>If background cleaning is offered, choose <b>Use Cleaned Background</b> "
                 "or <b>Discard Measurement</b>.</li>"
-                "<li>Read the result status and target/check values.</li></ul>"
+                "<li>Read the result status and target/check values. The target summary "
+                "includes the measurement time as <b>HJD (UTC)</b>; <b>n/a</b> means "
+                "it could not be calculated (see the log).</li>"
+                "<li>Results are kept separately for each star, source FITS and filter "
+                "(TG, CV or V). Measuring the same combination again asks before replacing "
+                "its result and diagnostics. Cancel keeps the existing files. Successful "
+                "replacement removes its local AAVSO/BAV exports; export them again.</li></ul>"
                 "<h3>Multiple targets</h3>"
                 "<ul><li>Click <b>Select targets</b> to open the batch selection. It "
                 "automatically lists the VSX stars currently visible in <b>Variables</b>, "
@@ -22809,7 +22965,9 @@ class LightCurveWindow(QWidget):
                 "<li>Tick individual stars or click <b>Select All</b>, then click "
                 "<b>Run</b> to measure them in the selected mode.</li>"
                 "<li>In Single Measurement batches, suitable background cleaning is "
-                "accepted automatically without a confirmation dialog and recorded in the log.</li>"
+                "accepted automatically without a confirmation dialog and recorded in the log. "
+                "Existing Single Measurement results are skipped; rerun individually "
+                "to confirm replacement.</li>"
                 "<li>Review each target's status and result CSV. <b>Show</b> loads that "
                 "result as the current result in <b>Photometry</b> and switches to that "
                 "tab; no separate loading step is needed. Continue there with the "
@@ -22829,7 +22987,8 @@ class LightCurveWindow(QWidget):
                 "<h3>Photometric Binning</h3>"
                 "<ul><li>Optional, for eligible Light Curve results from unstacked "
                 "L/G images. Single Measurement, stacked inputs and already binned "
-                "results are not eligible.</li>"
+                "results are not eligible. The binning controls are hidden while "
+                "a Single Measurement is displayed, including in a batch.</li>"
                 "<li>Choose <b>N images</b> or <b>Duration</b> (seconds), enter the "
                 "group size and click <b>Create Binned Curve</b>. The measured fluxes "
                 "are combined into a separate result, which becomes active and is plotted. "
@@ -22868,10 +23027,14 @@ class LightCurveWindow(QWidget):
                 "<b>Prepare</b> &gt; <b>Mode</b> before opening a saved result. The CSV "
                 "picker and result browser show results for that mode.</li>"
                 "<li><b>Light Curve CSV</b> or <b>Measurement CSV</b> opens a result "
-                "directly.</li>"
+                "directly. A result of the other mode is rejected; select its "
+                "mode in <b>Prepare</b> before loading it.</li>"
                 "<li><b>Results Folder</b> searches the selected folder and its "
                 "subfolders recursively and lists matching results. Select a result "
-                "and click <b>Load</b> or double-click its row.</li>"
+                "and click <b>Load</b> or double-click its row. Single Measurement rows show "
+                "the observation date/time in UTC and filter (TG, CV or V). Hover over any "
+                "cell for the full source FITS and result CSV paths. Resize columns or "
+                "scroll horizontally when needed.</li>"
                 "<li><b>VSX</b> opens the current target's catalog page.</li></ul>"
             ),
             "Export": (

@@ -51,7 +51,8 @@ PLUGIN_HELP_BODY = (
     "<h3>BAV-Dateien erzeugen</h3>"
     "<ul><li>Auf <b>BAV-Dateien erzeugen</b> klicken. Für eine Lichtkurve entstehen "
     "Lichtkurvenblatt, MiniMax-Datei und Report; für eine Einzelmessung eine "
-    "Einzelhelligkeit-Datei. Für das Lichtkurvenblatt kann ein Kommentar "
+    "Einzelhelligkeit-Datei je Stern, Quell-FITS und Filter. Der Objektname im "
+    "Bericht bleibt unverändert. Für das Lichtkurvenblatt kann ein Kommentar "
     "eingegeben werden.</li>"
     "<li>Sind für den aktuellen Min/Max-Fit bereits BAV-Dateien vorhanden, werden "
     "diese aufgelistet. Erst nach Bestätigung werden sie gelöscht und neu erzeugt.</li>"
@@ -1632,9 +1633,8 @@ def existing_bav_output_files(
 def bav_single_measurement_path(result_csv: Path, metadata: dict[str, str]) -> Path:
     """Return the BAV output path for one Single Measurement result."""
 
-    object_name = bav_filename_object_name(_metadata_value(metadata, "OBJECT_NAME"), result_csv.stem)
     output_dir = Path(_RESULT_CONTRACT.bav_output_directory(result_csv))
-    return output_dir / f"{object_name}_Einzelhelligkeit.txt"
+    return output_dir / _RESULT_CONTRACT.single_measurement_bav_filename(result_csv)
 
 
 def ensure_valid_cwd(preferred_directory: Path) -> None:

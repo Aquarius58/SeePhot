@@ -34,7 +34,7 @@ images. It can be opened from SeePhot or used independently in Siril.
 
 ## Current Release
 
-- SeePhot Main: `1.0.1`
+- SeePhot Main: `1.2.0`
 - SeePhot CFA: `1.0.0`
 
 ## Release Bundle
@@ -68,9 +68,12 @@ Siril script directory:
   quality, with diagnostic results.
 - AAVSO photometry reports and BAV extrema reports, including multiple
   extrema and optional period information.
-- Multi-target photometry batches and multi-folder CFA/stack batches.
+- Multi-target photometry batches and multi-folder CFA/stack batches,
+  including folder selection by name pattern.
 - Additional Single Measurement targets from SIMBAD, Gaia DR3, or entered
   coordinates, with clearly marked informational results when needed.
+- Separate Single Measurement results for each target, source FITS, and
+  filter, with HJD (UTC) summaries and confirmation before replacement.
 - CFA channel extraction, including single-frame processing without stacking.
 - Continuous and Gap-aware stacking, with stack profiling and grouping
   recommendations.

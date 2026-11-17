@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
 from pathlib import Path
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -16,7 +17,9 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -27,6 +30,125 @@ from PyQt6.QtWidgets import (
 
 PLUGIN_BUTTON_LABEL = "Configure..."
 AUTOMATIC_PLUGIN_VERSION = "0.4"
+
+
+def matching_source_directories(base: Path, pattern: str) -> list[Path]:
+    """Match direct child directory names with identical casing rules on every OS."""
+    if not pattern or "/" in pattern or "\\" in pattern:
+        raise ValueError("Enter a folder name pattern without path separators (for example M31*).")
+    return sorted(
+        (path for path in base.expanduser().absolute().iterdir()
+         if path.is_dir() and fnmatchcase(path.name.casefold(), pattern.casefold())),
+        key=lambda path: (path.name.casefold(), path.name),
+    )
+
+
+class PatternDirectoryDialog(QDialog):
+    """Preview and select direct child directories before adding them to a batch."""
+
+    def __init__(self, base: Path, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add by Pattern")
+        self.resize(660, 460)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Base folder"))
+        base_row = QHBoxLayout()
+        self.base_edit = QLineEdit(str(base))
+        self.browse_button = QPushButton("Choose Folder...")
+        self.browse_button.clicked.connect(self.choose_base)
+        base_row.addWidget(self.base_edit)
+        base_row.addWidget(self.browse_button)
+        layout.addLayout(base_row)
+        layout.addWidget(QLabel("Folder name pattern"))
+        pattern_row = QHBoxLayout()
+        self.pattern_edit = QLineEdit("*")
+        self.find_button = QPushButton("Find Folders")
+        self.find_button.clicked.connect(self.find_folders)
+        pattern_row.addWidget(self.pattern_edit)
+        pattern_row.addWidget(self.find_button)
+        layout.addLayout(pattern_row)
+        hint = QLabel(
+            "Examples: M31*, *2026-11*, or * for all folders. "
+            "* matches any number of characters; ? matches one character. "
+            "Matching ignores letter case. Only direct subfolders are searched."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.matches = QListWidget()
+        self.matches.itemChanged.connect(self.update_selection)
+        layout.addWidget(self.matches)
+        selection_row = QHBoxLayout()
+        self.select_all_button = QPushButton("Select All")
+        self.select_none_button = QPushButton("Select None")
+        self.select_all_button.clicked.connect(lambda: self.set_all_checked(True))
+        self.select_none_button.clicked.connect(lambda: self.set_all_checked(False))
+        selection_row.addWidget(self.select_all_button)
+        selection_row.addWidget(self.select_none_button)
+        selection_row.addStretch(1)
+        layout.addLayout(selection_row)
+        self.status_label = QLabel("Choose a base folder and find matching folders.")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.add_button = buttons.addButton("Add Selected", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.add_button.setEnabled(False)
+        self.add_button.clicked.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.base_edit.textChanged.connect(self.invalidate_matches)
+        self.pattern_edit.textChanged.connect(self.invalidate_matches)
+        self.find_button.setDefault(True)
+
+    def choose_base(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Choose Base Folder", self.base_edit.text())
+        if selected:
+            self.base_edit.setText(selected)
+
+    def invalidate_matches(self) -> None:
+        self.matches.clear()
+        self.add_button.setEnabled(False)
+        self.status_label.setText("Click Find Folders to update the results.")
+
+    def find_folders(self) -> None:
+        self.invalidate_matches()
+        base_text = self.base_edit.text().strip()
+        if not base_text:
+            self.status_label.setText("Choose a base folder first.")
+            return
+        try:
+            paths = matching_source_directories(Path(base_text), self.pattern_edit.text().strip())
+        except (OSError, ValueError) as exc:
+            self.status_label.setText(f"Could not find folders: {exc}")
+            return
+        for path in paths:
+            item = QListWidgetItem(path.name)
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            item.setToolTip(str(path))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.matches.addItem(item)
+        self.update_selection()
+
+    def selected_paths(self) -> list[Path]:
+        return [
+            Path(self.matches.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.matches.count())
+            if self.matches.item(index).checkState() == Qt.CheckState.Checked
+        ]
+
+    def set_all_checked(self, checked: bool) -> None:
+        self.matches.blockSignals(True)
+        for index in range(self.matches.count()):
+            self.matches.item(index).setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+        self.matches.blockSignals(False)
+        self.update_selection()
+
+    def update_selection(self) -> None:
+        selected = len(self.selected_paths())
+        self.add_button.setEnabled(selected > 0)
+        self.status_label.setText(f"{self.matches.count()} matching folder(s), {selected} selected.")
 
 
 class AutomaticDialog(QDialog):
@@ -63,13 +185,16 @@ class AutomaticDialog(QDialog):
         sources_layout.addWidget(self.source_list)
 
         source_buttons = QHBoxLayout()
-        self.add_source_button = QPushButton("Add Folder...")
+        self.add_source_button = QPushButton("Add Folder")
         self.add_source_button.clicked.connect(self.choose_source_directory)
+        self.add_pattern_button = QPushButton("Add by Pattern")
+        self.add_pattern_button.clicked.connect(self.choose_sources_by_pattern)
         self.remove_source_button = QPushButton("Remove Selected")
         self.remove_source_button.clicked.connect(self.remove_selected_sources)
         self.clear_sources_button = QPushButton("Clear")
         self.clear_sources_button.clicked.connect(self.clear_sources)
         source_buttons.addWidget(self.add_source_button)
+        source_buttons.addWidget(self.add_pattern_button)
         source_buttons.addWidget(self.remove_source_button)
         source_buttons.addWidget(self.clear_sources_button)
         source_buttons.addStretch(1)
@@ -189,6 +314,17 @@ class AutomaticDialog(QDialog):
         )
         if selected:
             self.add_source_path(Path(selected))
+
+    def choose_sources_by_pattern(self) -> None:
+        dialog = PatternDirectoryDialog(self.last_source_dialog_directory, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_paths()
+        added = sum(self.add_source_path(path) for path in selected)
+        self.set_status(
+            f"Added {added} source folder(s); {len(selected) - added} already listed or unavailable. "
+            f"{self.source_list.count()} source folder(s) selected."
+        )
 
     def add_source_path(self, path: Path) -> bool:
         source_path = path.expanduser().absolute()

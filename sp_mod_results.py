@@ -5,9 +5,11 @@ from __future__ import annotations
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import csv
+import hashlib
 import math
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -73,6 +75,9 @@ class LightcurveResultCandidate:
     bav_file_count: int
     location: str = ""
     result_kind: str = RESULT_KIND_LIGHTCURVE
+    observation_utc: str = ""
+    aavso_filter: str = ""
+    source_fits: str = ""
     quality_status: str = ""
     quality_flag: str = ""
     calibrated_mag: str = ""
@@ -326,10 +331,83 @@ def raw_lightcurve_result_path(output_dir: Path, target_stem: str) -> Path:
     return Path(output_dir) / f"{target_stem}_result_curve.csv"
 
 
-def single_measurement_result_path(output_dir: Path, target_stem: str) -> Path:
-    """Return the canonical Single Measurement result path."""
+def single_measurement_stem(target_stem: str, source_file: Path, aavso_filter: str) -> str:
+    """Identify target/source/filter without unsafe or unbounded filename components."""
 
-    return Path(output_dir) / f"{target_stem}_single_field_zp_measurement.csv"
+    if aavso_filter not in {"TG", "CV", "V"}:
+        raise ValueError("Single Measurement requires filter TG, CV or V.")
+    source_name = Path(source_file).name
+    if not source_name or not target_stem:
+        raise ValueError("Single Measurement requires a target and source FITS filename.")
+
+    def component(value: str, byte_limit: int) -> str:
+        safe = re.sub(r'[^\w.+-]', "_", value).strip(" ._")
+        return safe.encode("utf-8")[:byte_limit].decode("utf-8", errors="ignore") or "image"
+
+    # The digest distinguishes names that sanitize/truncate alike, extensions and
+    # case-only differences even on case-insensitive filesystems. Keep room for
+    # the longest derivative suffix and temporary-write prefixes (255 bytes).
+    digest = hashlib.sha256(
+        "\0".join((target_stem, source_name, aavso_filter)).encode("utf-8")
+    ).hexdigest()[:12]
+    return (f"{component(target_stem, 48)}__{component(Path(source_name).stem, 72)}"
+            f"__{aavso_filter}__{digest}")
+
+
+def single_measurement_result_path(
+    output_dir: Path, target_stem: str, source_file: Path, aavso_filter: str,
+) -> Path:
+    """Return the result path for one target in one source FITS and filter."""
+
+    stem = single_measurement_stem(target_stem, source_file, aavso_filter)
+    return Path(output_dir) / f"{stem}_single_field_zp_measurement.csv"
+
+
+def commit_single_measurement_files(staged_files: tuple[tuple[Path, Path], ...]) -> None:
+    """Publish fully written Single files, restoring previous files on a replace error."""
+
+    backups: dict[Path, Path] = {}
+    for staged, destination in staged_files:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            backup = staged.with_name(staged.name + ".previous")
+            shutil.copy2(destination, backup)
+            backups[destination] = backup
+    committed: list[Path] = []
+    try:
+        for staged, destination in staged_files:
+            os.replace(staged, destination)
+            committed.append(destination)
+    except OSError:
+        for destination in reversed(committed):
+            if destination in backups:
+                os.replace(backups[destination], destination)
+            else:
+                destination.unlink()
+        raise
+
+
+def single_measurement_bav_filename(result_csv: Path) -> str:
+    """Use the same complete measurement identity for BAV and local results."""
+
+    parsed = parse_result_filename(result_csv)
+    if parsed is None or parsed.result_kind != RESULT_KIND_SINGLE:
+        raise ValueError("BAV Single Measurement requires a single-result CSV.")
+    return f"{parsed.target_stem}_Einzelhelligkeit.txt"
+
+
+def single_observation_utc(row: dict[str, str]) -> str:
+    """Display the stored observation JD as UTC, never the processing time."""
+
+    try:
+        jd = float(row["jd"])
+        if not math.isfinite(jd) or jd <= 0:
+            return ""
+        return datetime.fromtimestamp(
+            (jd - 2440587.5) * 86400.0, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S")
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return ""
 
 
 def binned_result_path(source_result_csv: Path, mode: str, value: int) -> Path:
@@ -448,7 +526,7 @@ def target_name_matches_path(
     )
     expected_object = bav_filename_object_text(object_name)
     if parsed.result_kind == RESULT_KIND_SINGLE:
-        return path.name.casefold() == f"{expected_object}_Einzelhelligkeit.txt".casefold()
+        return path.name.casefold() == single_measurement_bav_filename(result_csv).casefold()
 
     match = re.fullmatch(
         r"(?P<constellation>[A-Za-z]{3})_(?P<object>.+)_"
@@ -584,6 +662,9 @@ def lightcurve_result_candidate_from_csv(
         aavso_exists=aavso_report_path(result_csv).exists(),
         bav_file_count=len(matching_bav_files),
         result_kind=result_kind,
+        observation_utc=single_observation_utc(first_row) if result_kind == RESULT_KIND_SINGLE else "",
+        aavso_filter=first_row.get("aavso_filter", "").strip(),
+        source_fits=metadata.get("SOURCE_FILE", "").strip(),
         quality_status=quality_status,
         quality_flag=first_row.get("quality_flag", "").strip(),
         calibrated_mag=(
